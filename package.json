@@ -1,11 +1,12 @@
 {
   "name": "trading-bot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "main": "index.js",
   "scripts": {
-  "dev": "ts-node src/apps/live-bot.ts"
+    "dev": "ts-node src/apps/live-bot.ts",
+    "test:hard": "ts-node src/tests/hard-test.ts",
+    "test:hard:loop": "bash -lc 'for i in {1..10}; do echo RUN $i; npm run -s test:hard || exit 1; done'"
   },
-  
   "keywords": [],
   "author": "",
   "license": "ISC",
