@@ -5,7 +5,11 @@
   "scripts": {
     "dev": "ts-node src/apps/live-bot.ts",
     "test:hard": "ts-node src/tests/hard-test.ts",
-    "test:hard:loop": "bash -lc 'for i in {1..10}; do echo RUN $i; npm run -s test:hard || exit 1; done'"
+    "test:hard:loop": "bash -lc 'for i in {1..10}; do echo RUN $i; npm run -s test:hard || exit 1; done'",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "typecheck": "tsc --noEmit",
+    "typecheck:tests": "tsc --noEmit -p tsconfig.vitest.json"
   },
   "keywords": [],
   "author": "",
@@ -19,6 +23,7 @@
     "@types/node": "^24.10.1",
     "@types/ws": "^8.18.1",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^1.6.0"
   }
 }
