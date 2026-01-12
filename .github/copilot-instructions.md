@@ -1,4 +1,4 @@
-# Trading Bot / Trading Platform — Canon Instructions (for Copilot GPT-5.1-Codex-Max)
+# Trading Bot / Trading Platform — Canon Instructions (vNext)
 
 > This repo is an event-driven trading system (bot now, platform later).  
 > Architecture is **Planes + EventBus**. No direct cross-module calls.  
@@ -15,31 +15,47 @@
 
 ### 0.2 Typed Events (no “any payload”)
 - Every topic has a strict payload type.
-- Every event payload includes `meta: EventMeta` (source + timestamp).
-- Never cast payloads to `as any` to “fix” typing.
-- If typing gets hard, improve the type layer instead.
+- Every event payload includes `meta: EventMeta`:
+  - `source` (who emitted)
+  - `ts` (timestamp, unix ms)
+  - optional `correlationId`
+- Do not weaken types to “make it compile”.
+- If typing gets hard: improve types/contracts, add helper types, or refactor event maps.
 
-### 0.3 Separation of responsibility
-- Market Data plane: fetch/stream raw data and publish normalized events.
-- Analytics plane: compute indicators/features, publish computed events.
-- Strategy plane: decide intents (not orders), publish intents.
-- Risk plane: validate/size/deny intents, publish approved/rejected decisions.
-- Execution/Trading plane: translate approved intents into exchange actions, publish execution results.
-- Storage/State plane: persist state, event snapshots, and recovery.
-- Control plane: operator commands and bot lifecycle control.
+> Note: EventBus implementation may contain an internal cast due to emitter library tuple typing edge-cases.  
+> **Do not spread `as any` into business modules.**
+
+### 0.3 Separation of responsibility (Planes)
+- **Control Plane**: operator commands + bot lifecycle control.
+- **Market Data Plane**: stream/fetch raw exchange data → publish normalized market events.
+- **Analytics Plane**: compute indicators/features/context → publish computed events.
+- **Strategy Plane (Production)**: decide **intents**, not orders → publish intents.
+- **Risk Plane**: validate/size/deny intents → publish approved/rejected.
+- **Execution/Trading Plane**: translate approved intents into exchange actions → publish execution results.
+- **Storage/State Plane**: persist state, snapshots, recovery, journal.
+- **Observability Plane**: logs, metrics, alerts.
+- **Research/ML Plane (Discovery)**: drift detection, labeling/outcomes, discovery, candidates, backtests, safe promotion.
 
 ### 0.4 Reliability (24/7)
 - WebSocket client must handle:
   - reconnect (with backoff + jitter)
   - idempotent disconnect
-  - heartbeat/watchdog based on **incoming activity** (not “pong only” assumptions)
+  - heartbeat/watchdog based on **incoming activity**
   - clean shutdown without duplicated cleanup logs
 - Logging must be operator-friendly: prompt usable, logs manageable, history available.
 
 ### 0.5 Pause semantics (professional)
-- Pause is not a “fake mode”.
-- `paused` is a state flag. `lifecycle` indicates RUNNING/PAUSED/STOPPING/etc.
-- While paused: **no trading actions**, but monitoring continues (market data stays live).
+- Pause is a state flag: `paused: boolean`.
+- `lifecycle` indicates RUNNING/PAUSED/STOPPING/etc.
+- While paused:
+  - **NO trading actions**
+  - monitoring continues (market + analytics + research can stay live)
+
+### 0.6 Two-contour safety model (Discovery vs Production)
+We run two loops:
+- **Production (battle)**: trades only approved strategies/models.
+- **Discovery (research)**: explores, tests, proposes.
+- Discovery **never trades real money directly**.
 
 ---
 
@@ -49,18 +65,19 @@
 Purpose: accept operator commands (CLI now, later Telegram/API/UI) and drive lifecycle.
 
 **Modules**
-- `CLI App`:
+- `CLI App`
   - reads user commands
   - publishes `control:command`
   - subscribes to `control:state` to render status
-  - does not call orchestrator directly
-- `Orchestrator`:
+  - never calls orchestrator directly
+- `Orchestrator`
   - central lifecycle coordinator
   - subscribes to `control:command`
   - publishes `control:state`
-  - controls subscriptions and runtime components via event topics (not direct calls)
+  - initiates Market plane via `market:*` events (connect/subscribe)
+  - owns startup/shutdown transitions
 
-**Key invariants**
+**Invariants**
 - Orchestrator is the only owner of lifecycle transitions.
 - CLI is a client, not a coordinator.
 
@@ -70,127 +87,110 @@ Purpose: accept operator commands (CLI now, later Telegram/API/UI) and drive lif
 Purpose: connect to exchange streams/APIs, normalize raw messages, publish market events.
 
 **Modules**
-- `BybitPublicWsClient`:
+- `MarketGateway` (adapter / lifecycle controller for market plane)
+  - subscribes to:
+    - `market:connect`
+    - `market:disconnect`
+    - `market:subscribe`
+  - orchestrates exchange client(s) and emits:
+    - `market:connected`
+    - `market:disconnected`
+    - `market:error`
+- `BybitPublicWsClient` (exchange WS client)
   - connect/disconnect (idempotent)
   - subscriptions (store + resubscribe)
-  - heartbeat ping + watchdog by **incoming data**
+  - heartbeat ping + watchdog by **incoming activity**
   - parses Bybit messages
-  - publishes `market:ticker` (and later trades, orderbook, kline, OI, etc.)
-  - never touches strategy/risk/execution
-- (future) `BybitRestClient`:
-  - fetch initial snapshots (orderbook snapshot, symbol info, etc.)
-  - publish `market:snapshot:*`
+  - publishes normalized market events:
+    - `market:ticker` (now)
+    - later: `market:trade`, `market:orderbook_delta`, `market:kline`, `market:oi`, `market:funding`
 
-**Key invariants**
-- WS client does not emit domain decisions, only normalized market data.
-- Reconnect policy is inside WS client, not outside.
+**Invariants**
+- Exchange modules emit **only normalized market data**, no decisions.
+- Reconnect policy lives inside WS client, not outside.
+- Orchestrator does not call WS client directly: only emits `market:*` requests.
 
 ---
 
-### 1.3 Analytics Plane
-Purpose: convert market stream into indicators/features.
+### 1.3 Analytics Plane (planned / future)
+Purpose: convert market stream into indicators/features and market context.
 
 **Modules**
-- `FeatureEngine`:
-  - subscribes to market events
-  - computes indicators: EMA, RSI, Stoch, ATR, CVD, OI deltas etc.
+- `FeatureEngine` (planned)
+  - subscribes to `market:*`
+  - computes indicators/features
   - publishes `analytics:features`
-- `MarketContextBuilder`:
-  - maintains market regime context (volatility, trend, liquidity, session, etc.)
+- `MarketContextBuilder` (planned)
+  - builds regime context
   - publishes `analytics:context`
 
-**Key invariants**
-- Analytics modules are pure-ish: no side effects besides publishing.
-- Keep derived state internal + optionally snapshot via storage plane.
+**Invariants**
+- Analytics does no trading and has no side effects besides publishing events.
+- Derived state may be snapshotted via Storage plane.
 
 ---
 
-### 1.4 Strategy Plane
-Purpose: interpret features/context into intents.
+### 1.4 Strategy Plane (Production) (planned / future)
+Purpose: interpret features/context into **intents**.
 
 **Modules**
-- `StrategyManager`:
-  - loads active strategy configuration
+- `StrategyManager` (planned)
   - subscribes to `analytics:*`
-  - runs strategy state machine
-  - publishes `strategy:intent` (BUY/SELL/LONG/SHORT/CLOSE/etc.)
-- (future) multi-strategy routing:
-  - multiple strategies can run simultaneously
-  - intents must be tagged with strategyId
+  - runs strategy state machines
+  - publishes `strategy:intent`
 
-**Key invariants**
+**Invariants**
 - Strategy produces **Intent**, not Order.
 - Intent is declarative: “I want exposure X with constraints”, not “place order now”.
 
 ---
 
-### 1.5 Risk Plane
+### 1.5 Risk Plane (planned / future)
 Purpose: gatekeeper between strategy intent and execution.
 
 **Modules**
-- `RiskManager`:
+- `RiskManager` (planned)
   - subscribes to `strategy:intent`
-  - checks:
-    - paused state
-    - exposure limits
-    - max drawdown
-    - max open positions
-    - volatility constraints
-    - cooldowns
-    - slippage expectations
-  - outputs:
-    - `risk:approved_intent` (with position size, order constraints)
-    - `risk:rejected_intent` (with reason)
+  - checks paused/lifecycle, exposure limits, dd, volatility, cooldowns, etc.
+  - outputs `risk:approved_intent` / `risk:rejected_intent`
 
-**Key invariants**
+**Invariants**
 - Execution may only act on approved intents.
-- RiskManager is authoritative for sizing.
+- RiskManager is authoritative for sizing and blocking.
 
 ---
 
-### 1.6 Trading / Execution Plane
+### 1.6 Trading / Execution Plane (planned / future)
 Purpose: translate approved intents into exchange execution.
 
 **Modules**
-- `ExecutionEngine`:
+- `ExecutionEngine` (planned)
   - subscribes to `risk:approved_intent`
-  - decides execution tactics (market/limit, laddering, post-only, etc.)
   - uses exchange REST/private WS (future)
-  - publishes:
-    - `exec:order_submitted`
-    - `exec:order_filled`
-    - `exec:order_cancelled`
-    - `exec:error`
-- `PositionManager`:
+  - publishes `exec:order_event` and/or `error:event`
+- `PositionManager` (planned)
   - subscribes to exec events
-  - maintains current positions
   - publishes `portfolio:position_update`
 
-**Key invariants**
+**Invariants**
 - Execution is the only layer that calls exchange trading endpoints.
-- Must be idempotent and state-aware (avoid duplicate orders on reconnect).
+- Must be idempotent and state-aware.
 
 ---
 
-### 1.7 Storage / State Plane
-Purpose: persistence, recovery, auditability.
+### 1.7 Storage / State Plane (planned, partially present via Research)
+Purpose: persistence, recovery, auditability, replay.
 
 **Modules**
-- `StateStore` (initially in-memory, later durable):
-  - stores:
-    - last known control state
-    - last market context/features snapshot
-    - strategy state snapshots
-    - open positions/orders
-- (future) `EventJournal`:
-  - append-only event log
-  - enables replay/backtest consistency
-- (future) `Postgres/Redis`:
-  - Redis for fast state, Postgres for durable history
+- `StateStore` (planned)
+- `EventJournal` (planned)
+- `FeatureStore` (implemented in Research plane)
+  - stores feature vectors (timestamped + versioned)
+  - feeds DriftDetector / Discovery / Backtests
 
-**Key invariants**
+**Invariants**
 - Storage is passive: subscribes to events and persists.
-- Recovery boot sequence is controlled by orchestrator.
+- Recovery boot sequence is orchestrator-owned.
 
 ---
 
@@ -198,206 +198,180 @@ Purpose: persistence, recovery, auditability.
 Purpose: logs, metrics, monitoring, alerts.
 
 **Modules**
-- `logger.ts`:
-  - structured logger with:
-    - timestamps with timezone
-    - levels
-    - controllable display (logs on/off)
-    - tail history
-    - CLI-friendly output
-- (future) `Telemetry`:
-  - metrics counters (reconnect count, tick rate, latency, errors)
-- (future) notifications:
-  - Telegram alerts for errors and signals
-  - Pause mode disables trading but keeps monitoring + alerting
-
-**Key invariants**
-- Operator must be able to control noise without losing history.
+- `logger.ts`
+  - structured logging, CLI-friendly output
+  - tail history
+  - log level control
+  - logs on/off
 
 ---
 
-## 2) EventBus Contract (Topics + Payload Rules)
+## 2) Research / ML Plane (Discovery Loop)
 
-### 2.1 Mandatory Event Meta
-All payloads include:
-- `meta.source` (who emitted): e.g. `market`, `cli`, `orchestrator`, `strategy`, `risk`, `exec`, `system`
-- `meta.ts` number (Date.now)
+> Discovery modules produce research outputs and proposals.  
+> They **never** place real-money orders directly.
 
-### 2.2 Naming convention
-- Plane prefix: `market:*`, `analytics:*`, `strategy:*`, `risk:*`, `exec:*`, `control:*`, `error:*`
-- Keep topics stable. Breaking changes require migration.
+**Implemented modules (current repo)**
+- `DriftDetector`
+- `FeatureStore`
+- `OutcomeEngine`
+- `ResearchOrchestrator`
+- `ResearchRunner`
 
-### 2.3 Core control topics
+### 2.1 Drift Detector
+- compares recent window vs baseline
+- emits `analytics:marketDriftDetected`
+
+### 2.2 Feature capture
+- emits `research:featureVectorRecorded` (dataset / feature store writes)
+
+### 2.3 Outcomes / labeling
+- emits `research:outcomeRecorded`
+
+### 2.4 Discovery / candidates / backtests (pipeline events)
+- emits:
+  - `research:newClusterFound`
+  - `research:candidateScenarioBuilt`
+  - `research:backtestCompleted`
+  - `research:scenarioApproved`
+  - `research:scenarioRejected`
+
+### 2.5 Production hooks + kill switch events
+- `strategy:scenarioEnabled`
+- `strategy:scenarioDisabled`
+- `control:rollbackModel` (payload is `RollbackRequested`)
+
+---
+
+## 3) EventBus Contract (Topics + Payload Rules)
+
+### 3.1 Mandatory meta
+All event payloads include:
+- `meta.source` (emitter): `cli | telegram | system | market | analytics | strategy | risk | trading | storage | research`
+- `meta.ts` unix ms
+- optional `meta.correlationId`
+
+### 3.2 Naming convention
+- Plane prefix: `market:*`, `analytics:*`, `strategy:*`, `risk:*`, `exec:*`, `portfolio:*`, `control:*`, `state:*`, `error:*`, `research:*`
+- Topics should remain stable. Breaking changes require migration.
+
+---
+
+## 4) BotEventMap — Current (Implemented) vs Planned
+
+### 4.1 Implemented (current repo)
 - `control:command` → `ControlCommand`
 - `control:state` → `ControlState`
-- `control:error` → `BotErrorEvent` (if used)
+- `market:ticker` → `TickerEvent`
 
-### 2.4 Market topics (current)
-- `market:ticker` → `TickerEvent` (normalized)
+**Market lifecycle (implemented)**
+- `market:connect` → `MarketConnectRequest`
+- `market:disconnect` → `MarketDisconnectRequest`
+- `market:subscribe` → `MarketSubscribeRequest`
+- `market:connected` → `MarketConnected`
+- `market:disconnected` → `MarketDisconnected`
+- `market:error` → `MarketErrorEvent`
 
-### 2.5 Future topics (planned)
-- `market:trade`
-- `market:orderbook_delta`
-- `market:kline`
-- `market:oi`
+**Research / Discovery (implemented)**
+- `analytics:marketDriftDetected` → `MarketDriftDetected`
+- `research:featureVectorRecorded` → `FeatureVectorRecorded`
+- `research:outcomeRecorded` → `OutcomeRecorded`
+- `research:newClusterFound` → `NewClusterFound`
+- `research:candidateScenarioBuilt` → `CandidateScenarioBuilt`
+- `research:backtestCompleted` → `BacktestCompleted`
+- `research:scenarioApproved` → `ScenarioApproved`
+- `research:scenarioRejected` → `ScenarioRejected`
+- `strategy:scenarioEnabled` → `ScenarioEnabled`
+- `strategy:scenarioDisabled` → `ScenarioDisabled`
+- `control:rollbackModel` → `RollbackRequested`
+
+### 4.2 Planned (future)
 - `analytics:features`
 - `analytics:context`
 - `strategy:intent`
 - `risk:approved_intent`
 - `risk:rejected_intent`
-- `exec:*` (order lifecycle)
+- `exec:order_event`
+- `portfolio:position_update`
+- `state:snapshot`
+- `state:recovery`
+- `error:event`
+
+> When adding topics:
+> - add topic entry in `BotEventMap`
+> - add payload interface/type with `meta`
+> - implement publisher and at least one subscriber
+> - add minimal logs/tests
 
 ---
 
-## 3) Control Plane — Behavior & State Machine
+## 5) WebSocket Client Requirements (Bybit)
 
-### 3.1 ControlCommand
-Commands include:
-- `pause`
-- `resume`
-- `set_mode` (LIVE/PAPER/BACKTEST)
-- `shutdown` (optional reason)
-- `status` (request/response if needed, but current design pushes state continuously)
+### 5.1 Heartbeat & Watchdog policy
+- send ping on interval
+- track `lastIncomingAt` updated on any incoming message (system ack, data, etc.)
+- watchdog triggers reconnect if `now - lastIncomingAt > timeout`
+- keep backoff + jitter
 
-All commands contain `meta`.
+### 5.2 Cleanup ownership
+- only `on('close')` performs cleanup (single-owned, guarded)
+- `disconnect()` triggers close and awaits completion; no duplicated cleanup logs
 
-### 3.2 ControlState
-State includes:
-- `mode: BotMode`
-- `paused: boolean`
-- `lifecycle: STARTING | RUNNING | PAUSED | STOPPING | STOPPED | ERROR`
-- `startedAt`
-- `lastCommandAt`
-- `lastCommand`
-
-### 3.3 Pause behavior
-When paused:
-- Market data continues
-- Analytics continues
-- Strategy may continue computing but must not produce actionable intents OR RiskManager must deny them
-- Execution must never place orders while paused
-
-Preferred: both Strategy and Risk honor pause defensively.
+### 5.3 Subscriptions
+- store topics in Set
+- on open: resubscribe all
+- subscribe() safe even if socket not open: store + log
 
 ---
 
-## 4) WebSocket Client Requirements (Bybit)
-
-### 4.1 Problem we solved
-Bybit v5 may not reliably produce `pong` the way a naive client expects.
-We must not assume “no pong in 60s = dead”.
-Instead:
-- heartbeat ping is fine
-- liveness watchdog should rely on **incoming traffic** (any message) with a reasonable timeout.
-
-### 4.2 Heartbeat & Watchdog policy
-- Send `{ op: 'ping' }` every 20s (silent send)
-- Track:
-  - `lastIncomingAt` (updated on any message, including system acks and market data)
-- Watchdog:
-  - if `now - lastIncomingAt > 120s`, consider connection stale and reconnect
-- Keep backoff + jitter for reconnect.
-
-### 4.3 Cleanup ownership
-- Only `on('close')` performs cleanup (single-owned, guarded).
-- `disconnect()` triggers close and awaits completion; it must not duplicate cleanup logs.
-- connect-timeout path must not cause double cleanup when close fires after.
-
-### 4.4 Subscriptions
-- Store topics in Set
-- On open: resubscribe all
-- subscribe() is safe even when socket not open: store + log.
+## 6) CLI / Operator UX Rules
+- commands publish `control:command` only
+- prompt must remain usable
+- throttle noisy outputs (don’t print every tick)
 
 ---
 
-## 5) CLI / Operator UX Rules
+## 7) Development Rules for Copilot / Contributors
 
-### 5.1 Commands supported
-- help
-- status
-- pause
-- resume
-- mode live|paper|backtest
-- logs on|off
-- logs tail <N>
-- level debug|info|warn|error
-- exit
+### 7.1 Do not break architecture
+- never call Market WS client directly from strategy/risk/execution
+- never import orchestrator into CLI or exchange modules
+- orchestrator initiates market plane via `market:*` events
+- use EventBus topics
 
-### 5.2 Output rules
-- Prompt must remain usable.
-- Logs should not corrupt typed input.
-- Prefer throttled ticker output (2–5s) instead of every tick.
+### 7.2 Do not “solve” errors by weakening types
+- no `any`, no unsafe casts for payloads
+- if typing is complex, introduce helper types (e.g. `EventPayload<Topic>`)
 
----
-
-## 6) Development Rules for Copilot (Very Important)
-
-### 6.1 Do not break architecture
-- Never call Market WS client directly from strategy/risk/execution.
-- Never import orchestrator into CLI or exchange modules.
-- Use EventBus topics.
-
-### 6.2 Do not “solve” errors by weakening types
-- No `any`, no unsafe casts for payloads.
-- If typing is complex, introduce helper types (e.g. EventPayload<Topic>).
-
-### 6.3 Additions must include:
-- new topic typed in EventBus map
-- payload type with `meta`
-- publisher + subscriber updates
-- minimal logging
-
-### 6.4 Future readiness
-Assume we will add:
-- Telegram control + alerts
-- Paper trading simulator
-- Backtesting (replay from journal)
-- AI/ML modules (strategy suggestions), but they still must publish intents only
+### 7.3 Definition of Done for changes
+- TypeScript clean
+- tests green
+- no duplicated cleanup logs
+- no direct cross-plane calls
+- every new event has meta + typed topic entry
+- logs readable, timestamps consistent
 
 ---
 
-## 7) Boot Sequence (Orchestrator-owned)
+## 8) Boot Sequence (Orchestrator-owned, event-driven)
 
 1) App starts
 2) Orchestrator publishes initial `control:state` (STARTING)
-3) WS client connect
-4) Subscribe market topics
-5) Orchestrator sets lifecycle RUNNING
-6) CLI runs and listens
-7) Shutdown:
-   - publish shutdown command
-   - orchestrator transitions STOPPING
-   - ws disconnect
-   - final STOPPED
-   - process exit
+3) Orchestrator emits `market:connect`
+4) Orchestrator emits `market:subscribe` (topics)
+5) `MarketGateway` handles connect/subscribe and reports:
+   - `market:connected` / `market:error`
+6) Orchestrator reaches readiness and sets lifecycle RUNNING
+7) CLI runs and listens
+
+Shutdown:
+- publish shutdown command
+- orchestrator transitions STOPPING
+- orchestrator emits `market:disconnect`
+- gateway/ws disconnect
+- final STOPPED
+- process exit
 
 ---
 
-## 8) Definition of Done (for any PR)
-
-- TypeScript clean
-- No duplicated cleanup logs
-- Reconnect stable
-- Commands work under heavy logging
-- No direct cross-plane calls
-- Every new event has meta + typed topic entry
-- Logging readable, timestamps consistent with timezone
-
----
-
-## 9) Current Known Baseline (what is already implemented)
-
-- Typed EventBus with ControlCommand/ControlState/EventMeta/EventSource
-- CLI publishes typed control commands and subscribes to control state
-- Orchestrator owns lifecycle and pause semantics
-- Logger supports operator-friendly CLI UX
-- Bybit public WS client:
-  - ping heartbeat
-  - watchdog based on incoming activity (120s)
-  - reconnect backoff+jitter
-  - idempotent manual disconnect
-  - cleanup single-owned by onClose
-
----
-
-End of instructions.
+END.
