@@ -1,7 +1,14 @@
 import { logger } from '../infra/logger';
 import { createMeta, eventBus } from '../core/events/EventBus';
 import { m } from '../core/logMarkers';
-import type { ControlCommand, ControlState, EventSource, TickerEvent } from '../core/events/EventBus';
+import type {
+  ControlCommand,
+  ControlState,
+  EventSource,
+  MarketConnectRequest,
+  MarketSubscribeRequest,
+  TickerEvent,
+} from '../core/events/EventBus';
 
 type CleanupFn = () => Promise<void> | void;
 
@@ -58,6 +65,19 @@ export class Orchestrator {
     this.readinessUnsub = () => eventBus.unsubscribe('market:ticker', tickerHandler);
 
     this.publishState('system', 'status');
+    // Автоматически запрашиваем подключение к market plane (минимально, без изменения текущего поведения)
+    const connectPayload: MarketConnectRequest = {
+      meta: createMeta('system'),
+    };
+    eventBus.publish('market:connect', connectPayload);
+
+    // Базовая подписка на тикер BTCUSDT (равно текущему поведению live-bot)
+    const subscribePayload: MarketSubscribeRequest = {
+      meta: createMeta('system'),
+      topics: ['tickers.BTCUSDT'],
+    };
+    eventBus.publish('market:subscribe', subscribePayload);
+
     logger.info(m('lifecycle', '[Orchestrator] started (STARTING)'));
   }
 

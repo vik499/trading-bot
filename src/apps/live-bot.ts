@@ -4,7 +4,15 @@ import path from 'path';
 import { logger } from '../infra/logger';
 import { BybitPublicWsClient } from '../exchange/bybit/wsClient';
 import { Orchestrator } from '../control/orchestrator';
-import { createMeta, eventBus, type ControlCommand, type ControlState, type EventSource, type TickerEvent } from '../core/events/EventBus';
+import {
+    createMeta,
+    eventBus,
+    type ControlCommand,
+    type ControlState,
+    type EventSource,
+    type TickerEvent,
+} from '../core/events/EventBus';
+import { MarketGateway } from '../exchange/marketGateway';
 import { startCli } from '../cli/cliApp';
 import { m } from '../core/logMarkers';
 
@@ -99,6 +107,7 @@ class LiveBotApp {
     private paused = false;
 
     private wsClient?: BybitPublicWsClient;
+    private marketGateway?: MarketGateway;
     private healthInterval?: NodeJS.Timeout;
     private orchestrator?: Orchestrator;
 
@@ -124,11 +133,13 @@ class LiveBotApp {
 
         // 1) Поднимаем Market Data Plane (пока только public WS)
         this.wsClient = new BybitPublicWsClient('wss://stream.bybit.com/v5/public/linear');
+        this.marketGateway = new MarketGateway(this.wsClient);
+        this.marketGateway.start();
 
         // 1.5) Поднимаем Control Plane (Orchestrator), регистрируем cleanup
         this.orchestrator = new Orchestrator();
         this.orchestrator.registerCleanup(async () => {
-            if (this.wsClient) await this.wsClient.disconnect();
+            if (this.marketGateway) await this.marketGateway.shutdown('orchestrator cleanup');
         });
         this.orchestrator.start();
 
@@ -138,12 +149,7 @@ class LiveBotApp {
         // Запрашиваем актуальное состояние, чтобы синхронизироваться после подписки
         emitControlCommand({ type: 'status', source: 'system' });
 
-        // 3) Подключаемся
-        await this.wsClient.connect();
-        logger.info(m('ok', `${APP_TAG} Подключение к Bybit WebSocket успешно, продолжаем работу бота`));
-
-        // 4) Подписка на минимальный стрим
-        this.wsClient.subscribeTicker('BTCUSDT');
+        // 3) Подключение и подписка теперь делаются через orchestrator->market events (см. orchestrator.start())
 
         // 5) Health-пульс. Позже это станет частью Control Plane: health/status.
         this.healthInterval = setInterval(() => {

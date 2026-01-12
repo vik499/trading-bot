@@ -15,7 +15,17 @@ import { randomUUID } from 'node:crypto';
 // ---------------------------------------------------------------------------
 
 // Откуда пришло событие/команда (помогает понимать, кто инициировал действие)
-export type EventSource = 'cli' | 'telegram' | 'system' | 'market' | 'analytics' | 'strategy' | 'risk' | 'trading' | 'storage';
+export type EventSource =
+    | 'cli'
+    | 'telegram'
+    | 'system'
+    | 'market'
+    | 'analytics'
+    | 'strategy'
+    | 'risk'
+    | 'trading'
+    | 'storage'
+    | 'research';
 
 export interface EventMeta {
     source: EventSource;
@@ -206,6 +216,39 @@ export interface PositionEvent extends BaseEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Market lifecycle (event-driven connect/disconnect/subscribe)
+// ---------------------------------------------------------------------------
+
+export interface MarketConnectRequest extends BaseEvent {
+    url?: string;
+    subscriptions?: string[]; // например: ['tickers.BTCUSDT']
+}
+
+export interface MarketDisconnectRequest extends BaseEvent {
+    reason?: string;
+}
+
+export interface MarketSubscribeRequest extends BaseEvent {
+    topics: string[]; // например: ['tickers.BTCUSDT']
+}
+
+export interface MarketConnected extends BaseEvent {
+    url?: string;
+    details?: Record<string, unknown>;
+}
+
+export interface MarketDisconnected extends BaseEvent {
+    reason?: string;
+    details?: Record<string, unknown>;
+}
+
+export interface MarketErrorEvent extends BaseEvent {
+    phase: 'connect' | 'disconnect' | 'subscribe' | 'unknown';
+    message: string;
+    error?: unknown;
+}
+
+// ---------------------------------------------------------------------------
 // Analytics: признаки (features) и контекст рынка
 // ---------------------------------------------------------------------------
 
@@ -236,6 +279,87 @@ export interface BotErrorEvent extends BaseEvent {
     message: string;
     error?: unknown;
     details?: Record<string, unknown>;
+}
+
+// ---------------------------------------------------------------------------
+// Research / Discovery plane
+// ---------------------------------------------------------------------------
+
+export type DriftSeverity = 'low' | 'medium' | 'high';
+
+export interface MarketDriftDetected extends BaseEvent {
+    symbol: string;
+    window: {
+        currentSize: number;
+        baselineSize: number;
+    };
+    stats: Record<string, { meanDelta?: number; varDelta?: number }>;
+    severity: DriftSeverity;
+}
+
+export interface FeatureVectorRecorded extends BaseEvent {
+    symbol: string;
+    timeframe?: string;
+    featureVersion?: string;
+    features: Record<string, number>;
+}
+
+export interface OutcomeRecorded extends BaseEvent {
+    symbol: string;
+    horizonMs: number;
+    outcome: {
+        pnl?: number;
+        mae?: number;
+        mfe?: number;
+        hit?: boolean;
+    };
+    context?: Record<string, unknown>;
+}
+
+export interface NewClusterFound extends BaseEvent {
+    clusterId: string;
+    summary?: Record<string, unknown>;
+}
+
+export interface CandidateScenarioBuilt extends BaseEvent {
+    scenarioId: string;
+    source?: { clusterId?: string; ruleId?: string };
+    entry: Record<string, unknown>;
+    exit: Record<string, unknown>;
+    riskDefaults?: Record<string, unknown>;
+}
+
+export interface BacktestCompleted extends BaseEvent {
+    scenarioId: string;
+    period: { from: number; to: number };
+    metrics: { sharpe?: number; ddMax?: number; ev?: number; hitRate?: number; trades?: number };
+    verdict: 'pass' | 'fail';
+    notes?: string;
+}
+
+export interface ScenarioApproved extends BaseEvent {
+    scenarioId: string;
+    constraints?: Record<string, unknown>;
+}
+
+export interface ScenarioRejected extends BaseEvent {
+    scenarioId: string;
+    reason: string;
+}
+
+export interface ScenarioEnabled extends BaseEvent {
+    scenarioId: string;
+    reason?: string;
+}
+
+export interface ScenarioDisabled extends BaseEvent {
+    scenarioId: string;
+    reason?: string;
+}
+
+export interface RollbackRequested extends BaseEvent {
+    reason?: string;
+    targetScenarioId?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -272,18 +396,39 @@ export type BotEventMap = {
     'exec:order_event': [payload: OrderEvent];
     'portfolio:position_update': [payload: PositionEvent];
 
+    // Market lifecycle (commands + signals)
+    'market:connect': [payload: MarketConnectRequest];
+    'market:disconnect': [payload: MarketDisconnectRequest];
+    'market:subscribe': [payload: MarketSubscribeRequest];
+    'market:connected': [payload: MarketConnected];
+    'market:disconnected': [payload: MarketDisconnected];
+    'market:error': [payload: MarketErrorEvent];
+
     // Storage / Recovery
     'state:snapshot': [payload: StateSnapshot];
     'state:recovery': [payload: StateSnapshot];
 
     // Errors
     'error:event': [payload: BotErrorEvent];
+
+    // Research / Discovery
+    'analytics:marketDriftDetected': [payload: MarketDriftDetected];
+    'research:featureVectorRecorded': [payload: FeatureVectorRecorded];
+    'research:outcomeRecorded': [payload: OutcomeRecorded];
+    'research:newClusterFound': [payload: NewClusterFound];
+    'research:candidateScenarioBuilt': [payload: CandidateScenarioBuilt];
+    'research:backtestCompleted': [payload: BacktestCompleted];
+    'research:scenarioApproved': [payload: ScenarioApproved];
+    'research:scenarioRejected': [payload: ScenarioRejected];
+    'strategy:scenarioEnabled': [payload: ScenarioEnabled];
+    'strategy:scenarioDisabled': [payload: ScenarioDisabled];
+    'control:rollbackModel': [payload: RollbackRequested];
 };
 
 export type BotEventName = keyof BotEventMap;
 
 // Типизированный EventBus (EventEmitter3 поддерживает generic map)
-class EventBus extends EventEmitter<BotEventMap> {
+export class EventBus extends EventEmitter<BotEventMap> {
     /**
      * Явный alias для emit, чтобы в коде читалось как pub/sub.
      *
