@@ -17,3 +17,8 @@ yarn-error.log*
 
 # System files
 .DS_Store
+
+# Local runtime artifacts
+data/journal/
+tmp/
+tmp-journal/
