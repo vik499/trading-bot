@@ -1,0 +1,136 @@
+# Data Contracts
+
+This document defines canonical measurement contracts for market data events.
+
+## Canonical price
+
+Topic: `market:price_canonical`
+
+Fields:
+- `indexPrice`: preferred normalization price when present.
+- `markPrice`: fallback for normalization when index is missing.
+- `lastPrice`: last-traded price for diagnostics only.
+- `priceTypeUsed`: `index` | `mark` | `last`.
+- `fallbackReason`: `NO_INDEX` | `INDEX_STALE` | `NO_MARK` | `MARK_STALE`.
+- `sourcesUsed`: sources contributing to the canonical selection.
+- `freshSourcesCount`: count of fresh sources used.
+- `staleSourcesDropped`: sources excluded due to TTL.
+- `mismatchDetected`: whether venue divergence exceeds the mismatch threshold.
+- `confidenceScore`: 0-1 score derived from freshness and mismatch penalties.
+
+Rules:
+- Prefer `indexPrice` for USD normalization.
+- Use `markPrice` only when index is missing or stale.
+- Use `lastPrice` only when both index and mark are missing or stale.
+- Never use raw trade price for notional conversions without explicit labeling.
+
+## Open interest
+
+Topic: `market:oi` (raw), `market:oi_agg` (aggregate)
+
+Fields:
+- `openInterest`
+- `openInterestUnit`: `base` | `contracts` | `usd` | `quote` | `unknown`
+- `openInterestValueUsd` (optional)
+- `priceTypeUsed` (optional, only when USD value derived from canonical price)
+
+Rules:
+- Aggregators must not mix units.
+- USD conversion is only allowed with a fresh canonical price.
+- If multiple units are present in the same aggregate, emit the dominant unit and set `qualityFlags.consistentUnits=false` + `mismatchDetected=true`.
+- Raw feeds must set the correct unit (for example, contract-based OI should use `contracts`).
+
+## CVD
+
+Topics: `market:cvd_spot`, `market:cvd_futures`, `market:cvd_*_agg`
+
+Fields:
+- `cvdDelta`
+- `cvdTotal`
+- `unit`: `base` | `usd`
+- `bucketSizeMs`
+- `bucketStartTs` / `bucketEndTs` (bucket close timestamp)
+
+Rules:
+- Spot and futures are emitted separately.
+- USD normalization must be explicit via `unit`.
+
+## Liquidations
+
+Topic: `market:liquidations_agg`
+
+Fields:
+- `liquidationCount`
+- `liquidationNotional`
+- `unit`: `base` | `usd`
+- `sideBreakdown`
+- `bucketStartTs` / `bucketEndTs` (bucket close timestamp)
+
+Rules:
+- If USD notional is not available for all sources, emit `unit=base`.
+
+## Liquidity
+
+Topic: `market:liquidity_agg`
+
+Fields:
+- `spread`
+- `midPrice`
+- `depthBid`
+- `depthAsk`
+- `imbalance`
+- `depthMethod`: `levels` | `usd_band` | `bps_band`
+- `depthLevels`
+- `depthUnit`: `base` | `usd`
+- `priceTypeUsed` (optional): `index` | `mark` | `last`
+- `bucketStartTs` / `bucketEndTs` (bucket close timestamp)
+
+Rules:
+- Depth metrics must always declare a method.
+
+## Quality fields (all aggregates)
+
+All aggregated events include:
+- `sourcesUsed`
+- `freshSourcesCount`
+- `staleSourcesDropped`
+- `mismatchDetected`
+- `qualityFlags.sequenceBroken` when L2 sequence integrity is violated.
+- `confidenceScore`
+
+Confidence is derived from freshness and deterministic penalties and is stable across replay.
+
+## Deterministic bucket close
+
+For any bucketed aggregate, compute:
+
+$$
+	ext{bucketCloseTs} = \left\lfloor \frac{\text{exchangeTs}}{\text{bucketMs}} \right\rfloor \cdot \text{bucketMs} + \text{bucketMs}
+$$
+
+`bucketStartTs = bucketCloseTs - bucketMs`.
+
+## Determinism requirements
+
+- `sourcesUsed` and `staleSourcesDropped` are emitted in deterministic lexicographic order.
+- `degradedReasons` are emitted in a fixed priority order.
+- Replay must use deterministic ordering by `exchangeTs`, then `sequenceId`, then `streamId`.
+
+## Market data readiness
+
+Topic: `system:market_data_status`
+
+Fields:
+- `overallConfidence`
+- `blockConfidence`: `price` | `flow` | `liquidity` | `derivatives`
+- `degraded` / `degradedReasons`
+- `warmingUp` / `warmingProgress` / `warmingWindowMs`
+- `activeSources` / `expectedSources`
+- `lastBucketTs`
+
+Rules:
+- Deterministic buckets (no wall clock).
+- Reasons are emitted in a fixed order.
+- Missing inputs in a bucket lower confidence deterministically.
+- Readiness degradation uses critical blocks (default: price, flow, liquidity). Derivatives can be non-critical.
+- Critical blocks are configurable; derivatives can be treated as non-blocking when desired.
