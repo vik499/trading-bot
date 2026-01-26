@@ -1,5 +1,5 @@
 import readline from 'node:readline';
-import { createMeta, eventBus } from '../core/events/EventBus';
+import { createMeta, eventBus, type RecoveryRequested, type SnapshotRequested } from '../core/events/EventBus';
 import { logger } from '../infra/logger';
 import { m } from '../core/logMarkers';
 import type { ControlCommand, ControlState, EventMeta } from '../control/types';
@@ -86,7 +86,7 @@ export function startCli() {
 
   const printHelp = () => {
     logger.info(
-      'Commands: help | status | pause | resume | mode live|paper|backtest | logs on|off | logs tail <N> | level <debug|info|warn|error> | exit',
+      'Commands: help | status | pause | resume | snapshot [path] | recover [path] | mode live|paper|backtest | logs on|off | logs tail <N> | level <debug|info|warn|error> | exit',
     );
   };
 
@@ -122,6 +122,26 @@ export function startCli() {
       case 'resume':
         publish({ type: 'resume' });
         break;
+
+      case 'snapshot': {
+        const req: SnapshotRequested = {
+          meta: createMeta('cli'),
+          pathOverride: arg,
+        };
+        eventBus.publish('state:snapshot_requested', req);
+        logger.info('[CLI] snapshot requested');
+        break;
+      }
+
+      case 'recover': {
+        const req: RecoveryRequested = {
+          meta: createMeta('cli'),
+          pathOverride: arg,
+        };
+        eventBus.publish('state:recovery_requested', req);
+        logger.info('[CLI] recovery requested');
+        break;
+      }
 
       case 'mode': {
         const v = (arg ?? '').toLowerCase();
@@ -178,7 +198,7 @@ export function startCli() {
         break;
 
       default:
-        logger.error(m('error', 'Unknown command. Use: status | pause | resume | mode live|paper|backtest | exit'));
+        logger.error(m('error', 'Unknown command. Use: status | pause | resume | snapshot [path] | recover [path] | mode live|paper|backtest | exit'));
     }
 
     rl.prompt();

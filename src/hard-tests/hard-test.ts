@@ -1,6 +1,6 @@
 /*
  * HARD TEST MODE — lifecycle/reconnect/shutdown invariants
- * Запуск: npx ts-node src/tests/hard-test.ts
+ * Запуск: npx ts-node src/hard-tests/hard-test.ts
  * Цель: смоделировать жёсткие сценарии без реального биржевого подключения.
  */
 

@@ -1,10 +1,12 @@
 import { logger } from '../infra/logger';
-import { createMeta, eventBus } from '../core/events/EventBus';
+import { createMeta, eventBus, newCorrelationId } from '../core/events/EventBus';
 import { m } from '../core/logMarkers';
 import type {
   ControlCommand,
   ControlState,
   EventSource,
+  KlineInterval,
+  KlineBootstrapRequested,
   MarketConnectRequest,
   MarketSubscribeRequest,
   TickerEvent,
@@ -65,18 +67,99 @@ export class Orchestrator {
     this.readinessUnsub = () => eventBus.unsubscribe('market:ticker', tickerHandler);
 
     this.publishState('system', 'status');
-    // Автоматически запрашиваем подключение к market plane (минимально, без изменения текущего поведения)
-    const connectPayload: MarketConnectRequest = {
-      meta: createMeta('system'),
-    };
-    eventBus.publish('market:connect', connectPayload);
+    const bootCorrelationId = newCorrelationId();
 
-    // Базовая подписка на тикер BTCUSDT (равно текущему поведению live-bot)
-    const subscribePayload: MarketSubscribeRequest = {
-      meta: createMeta('system'),
-      topics: ['tickers.BTCUSDT'],
+    const symbols = readSymbols();
+    const enableTrades = readFlag('BOT_TRADES_ENABLED', true);
+    const enableOrderbook = readFlag('BOT_ORDERBOOK_ENABLED', true);
+    const enableOi = readFlag('BOT_OI_ENABLED', true);
+    const enableFunding = readFlag('BOT_FUNDING_ENABLED', true);
+    const enableLiquidations = readFlag('BOT_LIQUIDATIONS_ENABLED', false);
+    const enableKlines = readFlag('BOT_KLINES_ENABLED', true);
+    const targetMarketType = readTargetMarketType();
+    const enableSpot = targetMarketType ? targetMarketType === 'spot' : readFlag('BOT_SPOT_ENABLED', true);
+    const orderbookDepthRaw = process.env.BOT_ORDERBOOK_DEPTH;
+    const orderbookDepth = orderbookDepthRaw ? Number(orderbookDepthRaw) : undefined;
+
+    const tfs = readKlineTfs();
+    const buildTopics = (marketType: 'spot' | 'futures') => {
+      const topics = new Set<string>();
+      for (const symbol of symbols) {
+        topics.add(`tickers.${symbol}`);
+        if (enableTrades) topics.add(`trades.${symbol}`);
+        if (enableOrderbook) {
+          topics.add(orderbookDepth && Number.isFinite(orderbookDepth) ? `orderbook.${orderbookDepth}.${symbol}` : `orderbook.${symbol}`);
+        }
+        if (marketType !== 'spot') {
+          if (enableOi) topics.add(`oi.${symbol}`);
+          if (enableFunding) topics.add(`funding.${symbol}`);
+          if (enableLiquidations) topics.add(`liquidations.${symbol}`);
+        }
+      }
+
+      if (enableKlines) {
+        for (const symbol of symbols) {
+          for (const tf of tfs) {
+            const interval = tfToInterval(tf);
+            if (!interval) continue;
+            topics.add(`kline.${interval}.${symbol}`);
+          }
+        }
+      }
+
+      return Array.from(topics);
     };
-    eventBus.publish('market:subscribe', subscribePayload);
+
+    const targets: Array<{ venue: MarketSubscribeRequest['venue']; marketType: MarketSubscribeRequest['marketType'] }> = [];
+    if (!targetMarketType || targetMarketType === 'futures') {
+      targets.push(
+        { venue: 'bybit', marketType: 'futures' },
+        { venue: 'binance', marketType: 'futures' },
+        { venue: 'okx', marketType: 'futures' }
+      );
+    }
+    if (!targetMarketType || targetMarketType === 'spot') {
+      if (enableSpot) {
+        targets.push(
+          { venue: 'binance', marketType: 'spot' },
+          { venue: 'okx', marketType: 'spot' }
+        );
+      }
+    }
+
+    for (const target of targets) {
+      const connectPayload: MarketConnectRequest = {
+        meta: createMeta('system', { correlationId: bootCorrelationId }),
+        venue: target.venue,
+        marketType: target.marketType,
+      };
+      eventBus.publish('market:connect', connectPayload);
+
+      const marketTypeForTopics: 'spot' | 'futures' = target.marketType === 'spot' ? 'spot' : 'futures';
+      const subscribePayload: MarketSubscribeRequest = {
+        meta: createMeta('system', { correlationId: bootCorrelationId }),
+        topics: buildTopics(marketTypeForTopics),
+        venue: target.venue,
+        marketType: target.marketType,
+      };
+      eventBus.publish('market:subscribe', subscribePayload);
+    }
+
+    const klineLimit = readKlineLimit();
+    for (const symbol of symbols) {
+      for (const tf of tfs) {
+        const interval = tfToInterval(tf);
+        if (!interval) continue;
+        const bootstrapPayload: KlineBootstrapRequested = {
+          meta: createMeta('system', { correlationId: bootCorrelationId }),
+          symbol,
+          interval,
+          tf,
+          limit: klineLimit,
+        };
+        eventBus.publish('market:kline_bootstrap_requested', bootstrapPayload);
+      }
+    }
 
     logger.info(m('lifecycle', '[Orchestrator] started (STARTING)'));
   }
@@ -182,4 +265,72 @@ export class Orchestrator {
       }
     }
   }
+}
+
+const DEFAULT_TFS = ['1m', '5m', '15m', '1h', '4h', '1d'];
+const ALLOWED_INTERVALS: Set<KlineInterval> = new Set([
+  '1',
+  '3',
+  '5',
+  '15',
+  '30',
+  '60',
+  '120',
+  '240',
+  '360',
+  '720',
+  '1440',
+]);
+
+function readKlineTfs(): string[] {
+  const raw = process.env.BOT_KLINE_TF ?? process.env.BOT_KLINE_INTERVALS;
+  if (!raw) return DEFAULT_TFS;
+  const list = raw
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+  return list.length ? list : DEFAULT_TFS;
+}
+
+function readSymbols(): string[] {
+  const raw = process.env.BOT_SYMBOLS ?? process.env.BOT_SYMBOL ?? 'BTCUSDT';
+  const list = raw
+    .split(',')
+    .map((entry) => entry.trim().toUpperCase())
+    .filter(Boolean);
+  return list.length ? list : ['BTCUSDT'];
+}
+
+function readFlag(name: string, fallback = true): boolean {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === '0' || normalized === 'false' || normalized === 'off') return false;
+  if (normalized === '1' || normalized === 'true' || normalized === 'on') return true;
+  return fallback;
+}
+
+function readTargetMarketType(): 'spot' | 'futures' | undefined {
+  const raw = process.env.BOT_TARGET_MARKET_TYPE?.trim().toLowerCase();
+  if (raw === 'spot' || raw === 'futures') return raw;
+  return undefined;
+}
+
+function readKlineLimit(): number {
+  const raw = process.env.BOT_KLINE_LIMIT;
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+  if (!Number.isFinite(parsed) || parsed <= 0) return 200;
+  return parsed;
+}
+
+function tfToInterval(tf: string): KlineInterval | undefined {
+  const match = tf.match(/^(\d+)([mhd])$/i);
+  if (!match) return undefined;
+  const value = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  const unit = match[2].toLowerCase();
+  const minutes = unit === 'm' ? value : unit === 'h' ? value * 60 : value * 1440;
+  const interval = String(minutes) as KlineInterval;
+  if (!ALLOWED_INTERVALS.has(interval)) return undefined;
+  return interval;
 }
