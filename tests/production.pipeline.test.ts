@@ -1,5 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { createMeta, inheritMeta, type BotEventMap, type FeaturesComputed, type TradeIntent, type ApprovedIntent, type TickerEvent, EventBus } from '../src/core/events/EventBus';
+import {
+  createMeta,
+  inheritMeta,
+  type AnalyticsFeaturesEvent,
+  type BotEventMap,
+  type RiskApprovedIntentEvent,
+  type StrategyIntentEvent,
+  type TickerEvent,
+  EventBus,
+} from '../src/core/events/EventBus';
 import { createTestEventBus } from '../src/core/events/testing';
 import { InMemoryFeatureStore } from '../src/core/research/FeatureStore';
 
@@ -24,8 +33,8 @@ describe('Production-like pipeline market -> analytics -> strategy -> risk', () 
   let bus: EventBus;
   let store: InMemoryFeatureStore;
   let featureHandler: ((t: TickerEvent) => void) | undefined;
-  let strategyHandler: ((f: FeaturesComputed) => void) | undefined;
-  let riskHandler: ((i: TradeIntent) => void) | undefined;
+  let strategyHandler: ((f: AnalyticsFeaturesEvent) => void) | undefined;
+  let riskHandler: ((i: StrategyIntentEvent) => void) | undefined;
 
   beforeEach(() => {
     bus = createTestEventBus();
@@ -34,35 +43,47 @@ describe('Production-like pipeline market -> analytics -> strategy -> risk', () 
 
     // FeatureEngine stub
     featureHandler = (ticker: TickerEvent) => {
-      const features: FeaturesComputed = {
+      const price = Number(ticker.lastPrice ?? 0);
+      const features: AnalyticsFeaturesEvent = {
         symbol: ticker.symbol,
-        timeframe: '1m',
-        features: { price: Number(ticker.lastPrice ?? 0) },
-        meta: inheritMeta(ticker.meta, 'analytics'),
+        ts: ticker.meta.ts,
+        lastPrice: price,
+        sma20: price,
+        volatility: 0,
+        momentum: 0,
+        return1: 0,
+        sampleCount: 1,
+        featuresReady: true,
+        windowSize: 1,
+        smaPeriod: 1,
+        meta: inheritMeta(ticker.meta, 'analytics', { ts: ticker.meta.ts }),
       };
       bus.publish('analytics:features', features);
     };
     bus.subscribe('market:ticker', featureHandler);
 
     // StrategyManager stub
-    strategyHandler = (features: FeaturesComputed) => {
-      const intent: TradeIntent = {
-        id: `intent-${features.symbol}`,
+    strategyHandler = (features: AnalyticsFeaturesEvent) => {
+      const intent: StrategyIntentEvent = {
+        intentId: `intent-${features.symbol}-${features.meta.ts}`,
         symbol: features.symbol,
-        action: 'OPEN_LONG',
-        details: { price: features.features.price },
-        meta: inheritMeta(features.meta, 'strategy'),
+        side: 'LONG',
+        targetExposureUsd: 10,
+        reason: 'test',
+        ts: features.meta.ts,
+        meta: inheritMeta(features.meta, 'strategy', { ts: features.meta.ts }),
       };
       bus.publish('strategy:intent', intent);
     };
     bus.subscribe('analytics:features', strategyHandler);
 
     // RiskManager stub
-    riskHandler = (intent: TradeIntent) => {
-      const approved: ApprovedIntent = {
+    riskHandler = (intent: StrategyIntentEvent) => {
+      const approved: RiskApprovedIntentEvent = {
         intent,
-        details: { ok: true },
-        meta: inheritMeta(intent.meta, 'risk'),
+        approvedAtTs: intent.meta.ts,
+        riskVersion: 'v0',
+        meta: inheritMeta(intent.meta, 'risk', { ts: intent.meta.ts }),
       };
       bus.publish('risk:approved_intent', approved);
     };

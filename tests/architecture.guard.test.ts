@@ -5,19 +5,43 @@ import path from 'path';
 const planeRules: Array<{ root: string; forbidden: string[] }> = [
   {
     root: path.join(__dirname, '..', 'src', 'exchange'),
-    forbidden: ['strategy', 'risk', 'execution', 'research'],
+    forbidden: ['analytics', 'strategy', 'risk', 'execution', 'research', 'portfolio', 'metrics', 'state', 'replay', 'globalData'],
+  },
+  {
+    root: path.join(__dirname, '..', 'src', 'globalData'),
+    forbidden: ['analytics', 'strategy', 'risk', 'execution', 'research', 'portfolio', 'metrics', 'state', 'replay', 'exchange', 'storage'],
+  },
+  {
+    root: path.join(__dirname, '..', 'src', 'analytics'),
+    forbidden: ['research', 'storage', 'exchange', 'replay', 'state', 'metrics', 'globalData'],
+  },
+  {
+    root: path.join(__dirname, '..', 'src', 'research'),
+    forbidden: ['analytics', 'exchange', 'strategy', 'risk', 'execution', 'portfolio', 'metrics', 'state', 'replay', 'globalData'],
+  },
+  {
+    root: path.join(__dirname, '..', 'src', 'core', 'research'),
+    forbidden: ['analytics'],
   },
   {
     root: path.join(__dirname, '..', 'src', 'strategy'),
-    forbidden: ['market', 'exchange', 'execution', 'research'],
+    forbidden: ['market', 'exchange', 'execution', 'research', 'analytics'],
   },
   {
     root: path.join(__dirname, '..', 'src', 'risk'),
-    forbidden: ['market', 'exchange', 'research'],
+    forbidden: ['market', 'exchange', 'research', 'analytics'],
   },
   {
     root: path.join(__dirname, '..', 'src', 'execution'),
-    forbidden: ['market', 'exchange', 'research'],
+    forbidden: ['market', 'exchange', 'research', 'analytics'],
+  },
+  {
+    root: path.join(__dirname, '..', 'src', 'portfolio'),
+    forbidden: ['market', 'exchange', 'research', 'analytics'],
+  },
+  {
+    root: path.join(__dirname, '..', 'src', 'metrics'),
+    forbidden: ['exchange', 'strategy', 'risk', 'execution', 'portfolio'],
   },
 ];
 

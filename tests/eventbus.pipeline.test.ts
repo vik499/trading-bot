@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { createMeta, inheritMeta, type BotEventMap, type FeaturesComputed, type TickerEvent, EventBus } from '../src/core/events/EventBus';
+import {
+  createMeta,
+  inheritMeta,
+  type AnalyticsFeaturesEvent,
+  type BotEventMap,
+  type TickerEvent,
+  EventBus,
+} from '../src/core/events/EventBus';
 import { createTestEventBus } from '../src/core/events/testing';
 import { InMemoryFeatureStore } from '../src/core/research/FeatureStore';
 
@@ -22,14 +29,20 @@ function waitForEvent<T extends keyof BotEventMap>(bus: EventBus, topic: T, time
 
 const makeFeatureEngine = (bus: EventBus) => {
   const handler = (ticker: TickerEvent) => {
-    const features: FeaturesComputed = {
+    const price = Number(ticker.lastPrice ?? 0);
+    const features: AnalyticsFeaturesEvent = {
       symbol: ticker.symbol,
-      timeframe: '1m',
-      features: {
-        price: Number(ticker.lastPrice ?? 0),
-        emaFast: Number(ticker.lastPrice ?? 0),
-      },
-      meta: inheritMeta(ticker.meta, 'analytics'),
+      ts: ticker.meta.ts,
+      lastPrice: price,
+      return1: 0,
+      sma20: price,
+      volatility: 0,
+      momentum: 0,
+      sampleCount: 1,
+      featuresReady: true,
+      windowSize: 1,
+      smaPeriod: 1,
+      meta: inheritMeta(ticker.meta, 'analytics', { ts: ticker.meta.ts }),
     };
     bus.publish('analytics:features', features);
   };
