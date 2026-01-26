@@ -1,4 +1,4 @@
-import { inheritMeta, eventBus as defaultEventBus, type EventBus, type FeaturesComputed, type FeatureVectorRecorded } from '../events/EventBus';
+import { inheritMeta, eventBus as defaultEventBus, type AnalyticsFeaturesEvent, type EventBus, type FeatureVectorRecorded } from '../events/EventBus';
 
 export interface FeatureStore {
     recordFeatureVector(event: FeatureVectorRecorded): Promise<void> | void;
@@ -27,13 +27,19 @@ export class InMemoryFeatureStore implements FeatureStore {
 
     start(): void {
         if (this.started) return;
-        const handler = (features: FeaturesComputed) => {
+        const handler = (features: AnalyticsFeaturesEvent) => {
+            const featuresMap: Record<string, number> = {};
+            if (Number.isFinite(features.lastPrice)) featuresMap.lastPrice = features.lastPrice;
+            if (features.return1 !== undefined && Number.isFinite(features.return1)) featuresMap.return1 = features.return1;
+            if (features.sma20 !== undefined && Number.isFinite(features.sma20)) featuresMap.sma20 = features.sma20;
+            if (features.volatility !== undefined && Number.isFinite(features.volatility)) featuresMap.volatility = features.volatility;
+            if (features.momentum !== undefined && Number.isFinite(features.momentum)) featuresMap.momentum = features.momentum;
+
             const recorded: FeatureVectorRecorded = {
                 symbol: features.symbol,
-                timeframe: features.timeframe,
                 featureVersion: 'v1',
-                features: features.features,
-                meta: inheritMeta(features.meta, 'research'),
+                features: featuresMap,
+                meta: inheritMeta(features.meta, 'research', { ts: features.meta.ts }),
             };
             this.recordFeatureVector(recorded);
             this.bus.publish('research:featureVectorRecorded', recorded);

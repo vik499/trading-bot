@@ -76,7 +76,7 @@ export class DriftDetector {
 
         if (this.window.length < this.windowSize) return;
 
-        const now = Date.now();
+        const now = fv.meta.ts;
         if (now - this.lastEmitAt < this.minEmitIntervalMs) return;
 
         const stats = this.computeStats();
