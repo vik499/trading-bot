@@ -1,4 +1,6 @@
 import {
+    asSeq,
+    asTsMs,
     inheritMeta,
     type EventBus,
     type EventMeta,
@@ -7,9 +9,11 @@ import {
     type OrderbookL2DeltaEvent,
     type OrderbookL2SnapshotEvent,
     type OrderbookLevel,
+    type Seq,
+    type TsMs,
 } from '../core/events/EventBus';
 import { bucketCloseTs, bucketStartTs as bucketStartTsFromTs } from '../core/buckets';
-import { computeConfidenceScore } from '../core/confidence';
+import { computeConfidenceExplain } from '../core/confidence';
 import { stableRecordFromEntries, stableSortStrings } from '../core/determinism';
 import { sourceRegistry } from '../core/market/SourceRegistry';
 import { normalizeMarketType, normalizeSymbol } from '../core/market/symbols';
@@ -27,6 +31,7 @@ interface OrderbookState {
     bids: Map<number, number>;
     asks: Map<number, number>;
     lastUpdateId?: number;
+    prevUpdateId?: number;
     status: 'OK' | 'RESYNCING';
     sequenceBroken: boolean;
     hasSnapshot: boolean;
@@ -97,6 +102,7 @@ export class LiquidityAggregator {
         const state = this.ensureState(key, evt.streamId);
         state.bids = toLevelMap(evt.bids);
         state.asks = toLevelMap(evt.asks);
+        state.prevUpdateId = state.lastUpdateId;
         state.lastUpdateId = evt.updateId;
         state.status = 'OK';
         state.sequenceBroken = false;
@@ -114,7 +120,7 @@ export class LiquidityAggregator {
             this.enterResync(key, evt.streamId, state);
             return;
         }
-        const strictSequence = this.requiresStrictSequence(evt.streamId);
+        const strictSequence = this.requiresStrictSequence(evt.streamId, evt.updateId, evt.exchangeTs);
         if (state.lastUpdateId !== undefined) {
             if (evt.updateId <= state.lastUpdateId) return;
             if (strictSequence && evt.updateId > state.lastUpdateId + 1) {
@@ -124,6 +130,7 @@ export class LiquidityAggregator {
         }
         applyLevels(state.bids, evt.bids);
         applyLevels(state.asks, evt.asks);
+        state.prevUpdateId = state.lastUpdateId;
         state.lastUpdateId = evt.updateId;
         this.updateMetrics(evt, state, key, normalizedSymbol, normalizedMarketType);
     }
@@ -213,14 +220,54 @@ export class LiquidityAggregator {
         const sourcesUsed: string[] = [];
         const weightsEntries: Array<[string, number]> = [];
         const staleDropped: string[] = [];
+        const venueStatus: Record<
+            string,
+            {
+                freshness: 'fresh' | 'stale' | 'dropped';
+                sequenceBroken?: boolean;
+                lastSeq?: Seq;
+                prevSeq?: Seq;
+                lastTsEvent?: TsMs;
+            }
+        > = {};
 
-        for (const [streamId, metrics] of sources.entries()) {
+        const orderbookStates = this.orderbooks.get(this.key(normalizedSymbol, marketType)) ?? new Map();
+        const streamIds = new Set<string>([...sources.keys(), ...orderbookStates.keys()]);
+
+        for (const streamId of streamIds) {
+            const metrics = sources.get(streamId);
+            if (!metrics) {
+                const state = orderbookStates.get(streamId);
+                venueStatus[streamId] = {
+                    freshness: 'dropped',
+                    sequenceBroken: state?.sequenceBroken,
+                    lastSeq: state?.lastUpdateId !== undefined ? asSeq(state.lastUpdateId) : undefined,
+                    prevSeq: state?.prevUpdateId !== undefined ? asSeq(state.prevUpdateId) : undefined,
+                };
+                continue;
+            }
             const isStale = bucketEndTs - metrics.ts > this.ttlMs;
             const inBucket = metrics.ts >= bucketStartTs && metrics.ts < bucketEndTs;
             if (isStale || !inBucket) {
                 if (isStale) staleDropped.push(streamId);
+                const state = orderbookStates.get(streamId);
+                venueStatus[streamId] = {
+                    freshness: isStale ? 'stale' : 'dropped',
+                    sequenceBroken: state?.sequenceBroken,
+                    lastSeq: state?.lastUpdateId !== undefined ? asSeq(state.lastUpdateId) : undefined,
+                    prevSeq: state?.prevUpdateId !== undefined ? asSeq(state.prevUpdateId) : undefined,
+                    lastTsEvent: asTsMs(metrics.ts),
+                };
                 continue;
             }
+            const state = orderbookStates.get(streamId);
+            venueStatus[streamId] = {
+                freshness: 'fresh',
+                sequenceBroken: state?.sequenceBroken,
+                lastSeq: state?.lastUpdateId !== undefined ? asSeq(state.lastUpdateId) : undefined,
+                prevSeq: state?.prevUpdateId !== undefined ? asSeq(state.prevUpdateId) : undefined,
+                lastTsEvent: asTsMs(metrics.ts),
+            };
             const weight = this.weights[streamId] ?? 1;
             if (metrics.bestBid !== undefined) {
                 bestBid += metrics.bestBid * weight;
@@ -267,7 +314,7 @@ export class LiquidityAggregator {
         const orderedStale = stableSortStrings(staleDropped);
         const venueBreakdown = stableRecordFromEntries(venueEntries);
         const weightsUsed = stableRecordFromEntries(weightsEntries);
-        const sequenceBroken = this.isSequenceBroken(this.key(normalizedSymbol, marketType));
+        const sequenceBroken = this.isSequenceBrokenForSources(orderbookStates, orderedSources);
         if (sequenceBroken) {
             sourceRegistry.recordSuppression(
                 { symbol: normalizedSymbol, marketType, metric: 'liquidity' },
@@ -276,12 +323,13 @@ export class LiquidityAggregator {
         }
 
         const mismatchDetected = detectMismatch(Object.keys(venueBreakdown).length ? venueBreakdown : undefined);
-        const confidenceScore = computeConfidenceScore({
+        const confidenceExplain = computeConfidenceExplain({
             freshSourcesCount: orderedSources.length,
             staleSourcesDroppedCount: orderedStale.length,
             mismatchDetected,
             sequenceBroken,
         });
+        const confidenceScore = confidenceExplain.score;
 
         const payload: MarketLiquidityAggEvent = {
             symbol,
@@ -307,13 +355,19 @@ export class LiquidityAggregator {
             staleSourcesDropped: orderedStale.length ? orderedStale : undefined,
             mismatchDetected,
             confidenceScore,
+            confidenceExplain: {
+                score: confidenceExplain.score,
+                penalties: confidenceExplain.penalties,
+                inputs: confidenceExplain.inputs,
+            },
             qualityFlags: {
                 mismatchDetected,
                 staleSourcesDropped: orderedStale.length ? orderedStale : undefined,
                 sequenceBroken,
             },
+            venueStatus: Object.keys(venueStatus).length ? venueStatus : undefined,
             provider: this.providerId,
-            meta: inheritMeta(parentMeta, 'global_data', { ts: bucketEndTs }),
+            meta: inheritMeta(parentMeta, 'global_data', { tsEvent: asTsMs(bucketEndTs) }),
         };
         this.bus.publish('market:liquidity_agg', payload);
         sourceRegistry.markAggEmitted(
@@ -353,17 +407,18 @@ export class LiquidityAggregator {
         }
     }
 
-    private isSequenceBroken(key: string): boolean {
-        const byStream = this.orderbooks.get(key);
-        if (!byStream) return false;
-        for (const state of byStream.values()) {
-            if (state.sequenceBroken && state.status === 'RESYNCING') return true;
+    private isSequenceBrokenForSources(orderbookStates: Map<string, OrderbookState>, sources: string[]): boolean {
+        for (const streamId of sources) {
+            const state = orderbookStates.get(streamId);
+            if (state?.sequenceBroken && state.status === 'RESYNCING') return true;
         }
         return false;
     }
 
-    private requiresStrictSequence(streamId: string): boolean {
-        return !/binance/i.test(streamId);
+    private requiresStrictSequence(streamId: string, updateId?: number, exchangeTs?: number): boolean {
+        if (/binance/i.test(streamId)) return false;
+        if (updateId !== undefined && exchangeTs !== undefined && Math.abs(updateId - exchangeTs) <= 10_000) return false;
+        return true;
     }
 
     private key(symbol: string, marketType: ReturnType<typeof normalizeMarketType>): string {

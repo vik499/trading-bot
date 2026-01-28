@@ -24,3 +24,4 @@ The metrics aim to capture spread, depth, and imbalance at the top of book.
 ## Limitations
 - Depth uses top N levels, not bps- or USD-normalized depth.
 - Aggregation is a weighted average across venues; venue-specific units may differ.
+- Confidence penalties for sequence/resync issues apply only to sources that contribute to the aggregate. Resyncing unused sources are surfaced via `venueStatus` without lowering confidence.

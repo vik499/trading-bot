@@ -47,7 +47,7 @@ describe('L2 resync state machine', () => {
     agg.stop();
   });
 
-  it('sequence gap triggers RESYNCING and marks sequenceBroken when other sources remain', () => {
+  it('sequence gap on unused source does not penalize aggregate confidence', () => {
     const bus = createTestEventBus();
     const agg = new LiquidityAggregator(bus, { bucketMs: 1000, depthLevels: 1, ttlMs: 5_000 });
     const outputs: MarketLiquidityAggEvent[] = [];
@@ -84,7 +84,8 @@ describe('L2 resync state machine', () => {
     });
 
     const last = outputs[outputs.length - 1];
-    expect(last.qualityFlags?.sequenceBroken).toBe(true);
+    expect(last.qualityFlags?.sequenceBroken).toBe(false);
+    expect(last.confidenceScore).toBe(1);
 
     agg.stop();
   });

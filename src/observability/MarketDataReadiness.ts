@@ -1,12 +1,14 @@
 import { logger } from '../infra/logger';
 import { m } from '../core/logMarkers';
 import {
+    asTsMs,
     createMeta,
     eventBus as defaultEventBus,
     type DataConfidence,
     type DataGapDetected,
     type DataMismatch,
-    type DataOutOfOrder,
+    type DataSequenceGapOrOutOfOrder,
+    type DataTimeOutOfOrder,
     type EventBus,
     type MarketCvdAggEvent,
     type MarketDataStatusPayload,
@@ -51,8 +53,14 @@ export interface MarketDataReadinessOptions {
     logIntervalMs?: number;
     wsRecoveryWindowMs?: number;
     noDataWindowMs?: number;
+    outOfOrderToleranceMs?: number;
     confidenceStaleWindowMs?: number;
     derivativesStaleWindowMs?: number;
+    readinessStabilityWindowMs?: number;
+    lagWindowMs?: number;
+    lagThresholdMs?: number;
+    lagEwmaAlpha?: number;
+    timebasePenaltyWindowMs?: number;
     thresholds?: {
         criticalBlock?: number;
         overall?: number;
@@ -70,7 +78,7 @@ export interface MarketDataReadinessOptions {
 type AggregatedWithMeta = {
     symbol: string;
     ts: number;
-    meta: { ts: number };
+    meta: { tsEvent: number; tsIngest?: number };
     confidenceScore?: number;
     sourcesUsed?: string[];
     staleSourcesDropped?: string[];
@@ -84,20 +92,28 @@ type Reason =
     | 'LIQUIDITY_LOW_CONF'
     | 'DERIVATIVES_LOW_CONF'
     | 'SOURCES_MISSING'
+    | 'NO_DATA'
     | 'LAG_TOO_HIGH'
     | 'GAPS_DETECTED'
     | 'MISMATCH_DETECTED'
     | 'EXPECTED_SOURCES_MISSING_CONFIG'
-    | 'NON_MONOTONIC_TIMEBASE'
     | 'NO_REF_PRICE'
     | 'WS_DISCONNECTED';
+
+type WarningReason = 'TIMEBASE_QUALITY_WARN' | 'NON_MONOTONIC_TIMEBASE';
 
 const DEFAULT_BUCKET_MS = 1_000;
 const DEFAULT_WARMUP_MS = 30 * 60_000;
 const DEFAULT_LOG_INTERVAL_MS = 10_000;
 const DEFAULT_WS_RECOVERY_WINDOW_MS = 15_000;
+const DEFAULT_STABILITY_WINDOW_MS = 10_000;
+const DEFAULT_LAG_WINDOW_MS = 30_000;
+const DEFAULT_LAG_THRESHOLD_MS = 2_000;
+const DEFAULT_LAG_EWMA_ALPHA = 0.2;
+const DEFAULT_TIMEBASE_PENALTY_WINDOW_MS = 10_000;
 const CRITICAL_BLOCK_THRESHOLD = 0.55;
 const OVERALL_THRESHOLD = 0.65;
+const TIMEBASE_CONFIDENCE_PENALTY = 0.9;
 
 const WEIGHTS: Record<ReadinessBlock, number> = {
     price: 0.35,
@@ -115,12 +131,14 @@ const REASON_ORDER: Reason[] = [
     'WS_DISCONNECTED',
     'SOURCES_MISSING',
     'EXPECTED_SOURCES_MISSING_CONFIG',
+    'NO_DATA',
     'LAG_TOO_HIGH',
     'GAPS_DETECTED',
     'MISMATCH_DETECTED',
     'NO_REF_PRICE',
-    'NON_MONOTONIC_TIMEBASE',
 ];
+
+const WARNING_ORDER: WarningReason[] = ['TIMEBASE_QUALITY_WARN', 'NON_MONOTONIC_TIMEBASE'];
 
 export class MarketDataReadiness {
     private readonly bus: EventBus;
@@ -136,8 +154,14 @@ export class MarketDataReadiness {
     private readonly logIntervalMs: number;
     private readonly wsRecoveryWindowMs: number;
     private readonly noDataWindowMs: number;
+    private readonly outOfOrderToleranceMs: number;
     private readonly confidenceStaleWindowMs: number;
     private readonly derivativesStaleWindowMs: number;
+    private readonly readinessStabilityWindowMs: number;
+    private readonly lagWindowMs: number;
+    private readonly lagThresholdMs: number;
+    private readonly lagEwmaAlpha: number;
+    private readonly timebasePenaltyWindowMs: number;
     private readonly thresholds: { criticalBlock: number; overall: number };
     private readonly weights: Record<ReadinessBlock, number>;
     private readonly criticalBlocks: Set<ReadinessBlock>;
@@ -152,9 +176,18 @@ export class MarketDataReadiness {
     private readonly mismatchByBlock = new Map<ReadinessBlock, boolean>();
 
     private readonly gapByBlock = new Map<ReadinessBlock, boolean>();
-    private readonly lagByBlock = new Map<ReadinessBlock, boolean>();
+    private readonly timebaseIssueByBlock = new Map<ReadinessBlock, number>();
+    private readonly lastTimeOutOfOrderByBlock = new Map<ReadinessBlock, DataTimeOutOfOrder>();
+    private readonly lastSequenceIssueByBlock = new Map<ReadinessBlock, DataSequenceGapOrOutOfOrder>();
 
     private readonly dataConfidenceByTopic = new Map<string, DataConfidence>();
+
+    private readonly lagSamples: Array<{ ts: number; lagMs: number }> = [];
+    private lagEwma?: number;
+    private lastLagSampleTs?: number;
+
+    private readonly reasonSince = new Map<Reason, number>();
+    private readonly warningSince = new Map<WarningReason, number>();
 
     private lastSymbol?: string;
     private lastMarketType?: MarketType;
@@ -187,8 +220,18 @@ export class MarketDataReadiness {
         this.logIntervalMs = Math.max(0, options.logIntervalMs ?? DEFAULT_LOG_INTERVAL_MS);
         this.wsRecoveryWindowMs = Math.max(1_000, options.wsRecoveryWindowMs ?? DEFAULT_WS_RECOVERY_WINDOW_MS);
         this.noDataWindowMs = Math.max(0, options.noDataWindowMs ?? 0);
+        this.outOfOrderToleranceMs = Math.max(0, options.outOfOrderToleranceMs ?? this.bucketMs);
         this.confidenceStaleWindowMs = Math.max(0, options.confidenceStaleWindowMs ?? this.bucketMs);
         this.derivativesStaleWindowMs = Math.max(0, options.derivativesStaleWindowMs ?? this.confidenceStaleWindowMs);
+        const isTestEnv = process.env.NODE_ENV === 'test' || Boolean(process.env.VITEST);
+        this.readinessStabilityWindowMs = Math.max(
+            0,
+            options.readinessStabilityWindowMs ?? (isTestEnv ? 0 : DEFAULT_STABILITY_WINDOW_MS)
+        );
+        this.lagWindowMs = Math.max(1_000, options.lagWindowMs ?? DEFAULT_LAG_WINDOW_MS);
+        this.lagThresholdMs = Math.max(0, options.lagThresholdMs ?? DEFAULT_LAG_THRESHOLD_MS);
+        this.lagEwmaAlpha = Math.min(1, Math.max(0.01, options.lagEwmaAlpha ?? DEFAULT_LAG_EWMA_ALPHA));
+        this.timebasePenaltyWindowMs = Math.max(0, options.timebasePenaltyWindowMs ?? DEFAULT_TIMEBASE_PENALTY_WINDOW_MS);
         this.thresholds = {
             criticalBlock: Math.max(0, options.thresholds?.criticalBlock ?? CRITICAL_BLOCK_THRESHOLD),
             overall: Math.max(0, options.thresholds?.overall ?? OVERALL_THRESHOLD),
@@ -220,16 +263,17 @@ export class MarketDataReadiness {
         const onConfidence = (evt: DataConfidence) => this.onConfidence(evt);
         const onMismatch = (evt: DataMismatch) => this.onMismatch(evt);
         const onGap = (evt: DataGapDetected) => this.onGap(evt);
-        const onOutOfOrder = (evt: DataOutOfOrder) => this.onOutOfOrder(evt);
-        const onTrade = (evt: TradeEvent) => this.onRaw('trades', evt.symbol, evt.marketType, evt.streamId, evt.meta.ts);
+        const onTimeOutOfOrder = (evt: DataTimeOutOfOrder) => this.onTimeOutOfOrder(evt);
+        const onSequenceGap = (evt: DataSequenceGapOrOutOfOrder) => this.onSequenceGap(evt);
+        const onTrade = (evt: TradeEvent) => this.onRaw('trades', evt.symbol, evt.marketType, evt.streamId, evt.meta);
         const onOrderbookSnapshot = (evt: OrderbookL2SnapshotEvent) =>
-            this.onRaw('orderbook', evt.symbol, evt.marketType, evt.streamId, evt.meta.ts);
+            this.onRaw('orderbook', evt.symbol, evt.marketType, evt.streamId, evt.meta);
         const onOrderbookDelta = (evt: OrderbookL2DeltaEvent) =>
-            this.onRaw('orderbook', evt.symbol, evt.marketType, evt.streamId, evt.meta.ts);
-        const onOiRaw = (evt: OpenInterestEvent) => this.onRaw('oi', evt.symbol, evt.marketType, evt.streamId, evt.meta.ts);
-        const onFundingRaw = (evt: FundingRateEvent) => this.onRaw('funding', evt.symbol, evt.marketType, evt.streamId, evt.meta.ts);
+            this.onRaw('orderbook', evt.symbol, evt.marketType, evt.streamId, evt.meta);
+        const onOiRaw = (evt: OpenInterestEvent) => this.onRaw('oi', evt.symbol, evt.marketType, evt.streamId, evt.meta);
+        const onFundingRaw = (evt: FundingRateEvent) => this.onRaw('funding', evt.symbol, evt.marketType, evt.streamId, evt.meta);
         const onTicker = (evt: TickerEvent) => this.onTickerRaw(evt);
-        const onKline = (evt: KlineEvent) => this.onRaw('klines', evt.symbol, evt.marketType, evt.streamId, evt.meta.ts);
+        const onKline = (evt: KlineEvent) => this.onRaw('klines', evt.symbol, evt.marketType, evt.streamId, evt.meta);
         const onConnected = (evt: MarketConnected) => this.onWsConnected(evt);
         const onDisconnected = (evt: MarketDisconnected) => this.onWsDisconnected(evt);
 
@@ -243,7 +287,8 @@ export class MarketDataReadiness {
         this.bus.subscribe('data:confidence', onConfidence);
         this.bus.subscribe('data:mismatch', onMismatch);
         this.bus.subscribe('data:gapDetected', onGap);
-        this.bus.subscribe('data:outOfOrder', onOutOfOrder);
+        this.bus.subscribe('data:time_out_of_order', onTimeOutOfOrder);
+        this.bus.subscribe('data:sequence_gap_or_out_of_order', onSequenceGap);
         this.bus.subscribe('market:trade', onTrade);
         this.bus.subscribe('market:orderbook_l2_snapshot', onOrderbookSnapshot);
         this.bus.subscribe('market:orderbook_l2_delta', onOrderbookDelta);
@@ -265,7 +310,8 @@ export class MarketDataReadiness {
             () => this.bus.unsubscribe('data:confidence', onConfidence),
             () => this.bus.unsubscribe('data:mismatch', onMismatch),
             () => this.bus.unsubscribe('data:gapDetected', onGap),
-            () => this.bus.unsubscribe('data:outOfOrder', onOutOfOrder),
+            () => this.bus.unsubscribe('data:time_out_of_order', onTimeOutOfOrder),
+            () => this.bus.unsubscribe('data:sequence_gap_or_out_of_order', onSequenceGap),
             () => this.bus.unsubscribe('market:trade', onTrade),
             () => this.bus.unsubscribe('market:orderbook_l2_snapshot', onOrderbookSnapshot),
             () => this.bus.unsubscribe('market:orderbook_l2_delta', onOrderbookDelta),
@@ -336,23 +382,33 @@ export class MarketDataReadiness {
         this.gapByBlock.set(block, true);
     }
 
-    private onOutOfOrder(evt: DataOutOfOrder): void {
+    private onSequenceGap(evt: DataSequenceGapOrOutOfOrder): void {
         const block = this.mapTopicToBlock(evt.topic);
         if (!block) return;
-        this.lagByBlock.set(block, true);
+        this.gapByBlock.set(block, true);
+        this.lastSequenceIssueByBlock.set(block, evt);
+    }
+
+    private onTimeOutOfOrder(evt: DataTimeOutOfOrder): void {
+        const block = this.mapTopicToBlock(evt.topic);
+        if (!block) return;
+        const delta = evt.prevTs - evt.currTs;
+        if (delta <= this.outOfOrderToleranceMs) return;
+        this.timebaseIssueByBlock.set(block, evt.meta.tsEvent ?? evt.currTs);
+        this.lastTimeOutOfOrderByBlock.set(block, evt);
     }
 
     private onWsConnected(evt: MarketConnected): void {
         if (!this.wsDegraded) return;
         // Подключение само по себе не означает готовность — ждём стабильного потока данных.
         if (this.wsLastDisconnectTs === undefined) {
-            this.wsLastDisconnectTs = evt.meta.ts;
+            this.wsLastDisconnectTs = evt.meta.tsEvent;
         }
     }
 
     private onWsDisconnected(evt: MarketDisconnected): void {
         this.wsDegraded = true;
-        this.wsLastDisconnectTs = evt.meta.ts;
+        this.wsLastDisconnectTs = evt.meta.tsEvent;
         this.wsRecoveryStartTs = undefined;
     }
 
@@ -370,16 +426,23 @@ export class MarketDataReadiness {
         }
     }
 
-    private onRaw(feed: RawFeed, symbol: string, marketType: MarketType | undefined, streamId: string | undefined, ts: number): void {
+    private onRaw(
+        feed: RawFeed,
+        symbol: string,
+        marketType: MarketType | undefined,
+        streamId: string | undefined,
+        meta: { tsEvent: number; tsIngest?: number }
+    ): void {
         const sourceId = streamId ?? 'unknown';
         const inferred = marketType ?? inferMarketTypeFromStreamId(streamId);
         const normalizedMarketType = normalizeMarketType(inferred);
         if (!this.shouldTrackMarketType(normalizedMarketType)) return;
         const normalizedSymbol = normalizeSymbol(symbol);
-        this.registry.markRawSeen({ symbol: normalizedSymbol, marketType: normalizedMarketType, feed }, sourceId, ts);
+        this.registry.markRawSeen({ symbol: normalizedSymbol, marketType: normalizedMarketType, feed }, sourceId, meta.tsEvent);
         this.lastSymbol = normalizedSymbol;
         this.lastMarketType = normalizedMarketType;
-        this.markWsFlow(ts);
+        this.recordLagSample(meta.tsEvent, meta.tsIngest);
+        this.markWsFlow(meta.tsIngest ?? meta.tsEvent);
     }
 
     private onTickerRaw(evt: TickerEvent): void {
@@ -388,23 +451,24 @@ export class MarketDataReadiness {
         if (!this.shouldTrackMarketType(normalizedMarketType)) return;
         const normalizedSymbol = normalizeSymbol(evt.symbol);
         const sourceId = evt.streamId ?? 'unknown';
+        this.recordLagSample(evt.meta.tsEvent, evt.meta.tsIngest);
         if (evt.markPrice !== undefined) {
             this.registry.markRawSeen(
                 { symbol: normalizedSymbol, marketType: normalizedMarketType, feed: 'markPrice' },
                 sourceId,
-                evt.meta.ts
+                evt.meta.tsEvent
             );
         }
         if (evt.indexPrice !== undefined) {
             this.registry.markRawSeen(
                 { symbol: normalizedSymbol, marketType: normalizedMarketType, feed: 'indexPrice' },
                 sourceId,
-                evt.meta.ts
+                evt.meta.tsEvent
             );
         }
         this.lastSymbol = normalizedSymbol;
         this.lastMarketType = normalizedMarketType;
-        this.markWsFlow(evt.meta.ts);
+        this.markWsFlow(evt.meta.tsIngest ?? evt.meta.tsEvent);
     }
 
     private recordBlock(block: ReadinessBlock, evt: AggregatedWithMeta, sources?: string[]): void {
@@ -432,13 +496,13 @@ export class MarketDataReadiness {
         this.registry.markAggEmitted(
             { symbol: normalizedSymbol, marketType: normalizedMarketType, metric: block },
             sources ?? [],
-            evt.meta.ts
+            evt.meta.tsEvent
         );
         this.lastSymbol = normalizedSymbol;
         this.lastMarketType = normalizedMarketType;
-        this.markWsFlow(evt.meta.ts);
+        this.markWsFlow(evt.meta.tsIngest ?? evt.meta.tsEvent);
 
-        const bucketTs = this.bucketEndTs(evt.meta.ts);
+        const bucketTs = this.bucketEndTs(evt.meta.tsEvent);
         this.lastBucketTs = bucketTs;
         if (this.firstBucketTs === undefined) {
             this.firstBucketTs = bucketTs;
@@ -473,7 +537,7 @@ export class MarketDataReadiness {
         this.maybeLogMissingExpectedConfig(snapshot, derivedSources.missingConfig);
         const activeSourcesAgg = this.countSources(snapshot.usedAgg);
         const activeSourcesRaw = this.countSources(snapshot.usedRaw);
-        const degradedReasons = this.computeDegradedReasons(
+        const { degradedReasons, warnings } = this.computeDegradedReasons(
             blockConfidence,
             overallConfidence,
             activeSourcesAgg,
@@ -495,6 +559,7 @@ export class MarketDataReadiness {
             blockConfidence,
             degraded,
             degradedReasons,
+            warnings,
             warmingUp,
             warmingProgress,
             warmingWindowMs,
@@ -505,20 +570,23 @@ export class MarketDataReadiness {
             expectedSourcesAgg: derivedSources.expectedAggCount,
             expectedSourcesRaw: derivedSources.expectedRawCount,
             lastBucketTs: bucketTs,
-            meta: createMeta('system', { ts: bucketTs }),
+            meta: createMeta('system', { tsEvent: asTsMs(bucketTs) }),
         };
     }
 
     private computeBlockConfidence(bucketTs: number, snapshot: SourceRegistrySnapshot): Record<ReadinessBlock, number> {
-        const price = this.expectedBlockEmpty(snapshot, 'price') ? 1 : this.confidenceForBlock('price', bucketTs);
+        const priceRaw = this.expectedBlockEmpty(snapshot, 'price') ? 1 : this.confidenceForBlock('price', bucketTs);
+        const price = this.applyTimebasePenalty('price', priceRaw, bucketTs);
         const flowSpot = this.confidenceForTopic('flow_spot', bucketTs);
         const flowFutures = this.confidenceForTopic('flow_futures', bucketTs);
         const flowCandidates: number[] = [];
         if (this.expectedFlowTypes.has('spot')) flowCandidates.push(flowSpot);
         if (this.expectedFlowTypes.has('futures')) flowCandidates.push(flowFutures);
         const flowRaw = flowCandidates.length ? Math.min(...flowCandidates) : Math.min(flowSpot, flowFutures);
-        const flow = this.expectedBlockEmpty(snapshot, 'flow') ? 1 : flowRaw;
-        const liquidity = this.expectedBlockEmpty(snapshot, 'liquidity') ? 1 : this.confidenceForBlock('liquidity', bucketTs);
+        const flowValue = this.expectedBlockEmpty(snapshot, 'flow') ? 1 : flowRaw;
+        const flow = this.applyTimebasePenalty('flow', flowValue, bucketTs);
+        const liquidityRaw = this.expectedBlockEmpty(snapshot, 'liquidity') ? 1 : this.confidenceForBlock('liquidity', bucketTs);
+        const liquidity = this.applyTimebasePenalty('liquidity', liquidityRaw, bucketTs);
         const derivOi = this.confidenceForTopic('derivatives_oi', bucketTs);
         const derivFunding = this.confidenceForTopic('derivatives_funding', bucketTs);
         const derivLiq = this.confidenceForTopic('derivatives_liquidations', bucketTs);
@@ -527,14 +595,15 @@ export class MarketDataReadiness {
         if (this.expectedDerivativeKinds.has('funding')) derivativeCandidates.push(derivFunding);
         if (this.expectedDerivativeKinds.has('liquidations')) derivativeCandidates.push(derivLiq);
         const derivativesRaw = derivativeCandidates.length ? Math.min(...derivativeCandidates) : Math.min(derivOi, derivFunding, derivLiq);
-        const derivatives = this.expectedBlockEmpty(snapshot, 'derivatives') ? 1 : derivativesRaw;
+        const derivativesValue = this.expectedBlockEmpty(snapshot, 'derivatives') ? 1 : derivativesRaw;
+        const derivatives = this.applyTimebasePenalty('derivatives', derivativesValue, bucketTs);
         return { price, flow, liquidity, derivatives };
     }
 
     private confidenceForBlock(block: ReadinessBlock, bucketTs: number): number {
         const evt = this.lastByBlock.get(block);
         if (!evt) return 0;
-        if (bucketTs - evt.meta.ts > this.confidenceStaleWindowMs) return 0;
+        if (bucketTs - evt.meta.tsEvent > this.confidenceStaleWindowMs) return 0;
         return this.confidenceValue(evt.confidenceScore);
     }
 
@@ -542,7 +611,7 @@ export class MarketDataReadiness {
         const evt = this.dataConfidenceByTopic.get(key);
         if (!evt) return 0;
         const staleWindow = key.startsWith('derivatives_') ? this.derivativesStaleWindowMs : this.confidenceStaleWindowMs;
-        if (bucketTs - evt.ts > staleWindow) return 0;
+        if (bucketTs - evt.meta.tsEvent > staleWindow) return 0;
         return this.confidenceValue(evt.confidenceScore);
     }
 
@@ -563,8 +632,9 @@ export class MarketDataReadiness {
         missingConfig: boolean,
         snapshot: SourceRegistrySnapshot,
         bucketTs: number
-    ): string[] {
+    ): { degradedReasons: string[]; warnings: string[] } {
         const reasons = new Set<Reason>();
+        const warnings = new Set<WarningReason>();
         const withinStartupGrace =
             this.startupGraceWindowMs > 0 &&
             this.startedAtTs !== undefined &&
@@ -575,7 +645,7 @@ export class MarketDataReadiness {
         const expectedDerivatives = !this.expectedBlockEmpty(snapshot, 'derivatives');
 
         const priceEvt = this.lastByBlock.get('price');
-        const priceBucketMatch = priceEvt && this.bucketEndTs(priceEvt.meta.ts) === bucketTs;
+        const priceBucketMatch = priceEvt && this.bucketEndTs(priceEvt.meta.tsEvent) === bucketTs;
         if (!priceEvt || !priceBucketMatch) {
             if (!withinStartupGrace && this.isCriticalBlock('price')) {
                 reasons.add('PRICE_STALE');
@@ -626,12 +696,15 @@ export class MarketDataReadiness {
             const lastRawTs = this.maxLastRawTs(snapshot.lastSeenRawTs);
             if (lastRawTs !== null && bucketTs - lastRawTs > this.noDataWindowMs) {
                 if (!withinStartupGrace) {
-                    reasons.add('LAG_TOO_HIGH');
+                    reasons.add('NO_DATA');
                 }
             }
         }
-
-        if (Array.from(this.lagByBlock.values()).some(Boolean) && !withinStartupGrace) reasons.add('LAG_TOO_HIGH');
+        const lagNowTs = this.lastLagSampleTs ?? bucketTs;
+        const lagStats = this.computeLagStats(lagNowTs);
+        if (this.lagThresholdMs > 0 && lagStats.p95 !== undefined && lagStats.p95 > this.lagThresholdMs && !withinStartupGrace) {
+            reasons.add('LAG_TOO_HIGH');
+        }
         if (Array.from(this.gapByBlock.values()).some(Boolean)) reasons.add('GAPS_DETECTED');
 
         const hasMismatch = Array.from(this.mismatchByBlock.values()).some(Boolean);
@@ -642,10 +715,21 @@ export class MarketDataReadiness {
         }
 
         if (snapshot.nonMonotonicSources.length > 0) {
-            reasons.add('NON_MONOTONIC_TIMEBASE');
+            warnings.add('NON_MONOTONIC_TIMEBASE');
         }
 
-        return this.orderReasons(reasons);
+        const timebaseWarnActive = Array.from(this.timebaseIssueByBlock.entries()).some(
+            ([, ts]) => bucketTs - ts <= this.timebasePenaltyWindowMs
+        );
+        if (timebaseWarnActive) warnings.add('TIMEBASE_QUALITY_WARN');
+
+        const stableReasons = this.stabilizeReasons(reasons, bucketTs);
+        const stableWarnings = this.stabilizeWarnings(warnings, bucketTs);
+
+        return {
+            degradedReasons: this.orderReasons(stableReasons),
+            warnings: this.orderWarnings(stableWarnings),
+        };
     }
 
     private buildSnapshot(bucketTs: number): SourceRegistrySnapshot {
@@ -726,6 +810,53 @@ export class MarketDataReadiness {
         return REASON_ORDER.filter((r) => reasons.has(r));
     }
 
+    private orderWarnings(warnings: Set<WarningReason>): string[] {
+        return WARNING_ORDER.filter((w) => warnings.has(w));
+    }
+
+    private stabilizeReasons(reasons: Set<Reason>, ts: number): Set<Reason> {
+        if (this.readinessStabilityWindowMs === 0) return reasons;
+        const stable = new Set<Reason>();
+        const exempt = new Set<Reason>(['EXPECTED_SOURCES_MISSING_CONFIG']);
+        for (const reason of reasons) {
+            if (exempt.has(reason)) {
+                stable.add(reason);
+                continue;
+            }
+            const since = this.reasonSince.get(reason);
+            if (since === undefined) {
+                this.reasonSince.set(reason, ts);
+                continue;
+            }
+            if (ts - since >= this.readinessStabilityWindowMs) {
+                stable.add(reason);
+            }
+        }
+        for (const reason of Array.from(this.reasonSince.keys())) {
+            if (!reasons.has(reason)) this.reasonSince.delete(reason);
+        }
+        return stable;
+    }
+
+    private stabilizeWarnings(warnings: Set<WarningReason>, ts: number): Set<WarningReason> {
+        if (this.readinessStabilityWindowMs === 0) return warnings;
+        const stable = new Set<WarningReason>();
+        for (const warning of warnings) {
+            const since = this.warningSince.get(warning);
+            if (since === undefined) {
+                this.warningSince.set(warning, ts);
+                continue;
+            }
+            if (ts - since >= this.readinessStabilityWindowMs) {
+                stable.add(warning);
+            }
+        }
+        for (const warning of Array.from(this.warningSince.keys())) {
+            if (!warnings.has(warning)) this.warningSince.delete(warning);
+        }
+        return stable;
+    }
+
     private maybeLog(payload: MarketDataStatusPayload): void {
         const last = this.lastStatus;
         const ts = payload.lastBucketTs;
@@ -733,6 +864,10 @@ export class MarketDataReadiness {
         if (!shouldLog) return;
 
         this.lastLogTs = ts;
+
+        if (payload.degraded && !last?.degraded) {
+            this.logDegradedTransition(payload);
+        }
 
         const status = payload.warmingUp
             ? 'WARMING'
@@ -757,13 +892,128 @@ export class MarketDataReadiness {
         if (payload.degraded && payload.degradedReasons.length) {
             line.push(`Reasons: ${payload.degradedReasons.join(',')}`);
         }
+        if (payload.warnings && payload.warnings.length) {
+            line.push(`Warnings: ${payload.warnings.join(',')}`);
+        }
         logger.info(line.join('\n'));
+    }
+
+    private logDegradedTransition(payload: MarketDataStatusPayload): void {
+        const snapshot = this.lastSnapshot ?? this.buildSnapshot(payload.lastBucketTs);
+        const lowest = this.lowestBlock(payload.blockConfidence);
+        const suppressions = snapshot.suppressions[lowest];
+        const suppressionReasons = suppressions.count
+            ? Object.entries(suppressions.reasons)
+                  .map(([reason, count]) => `${reason}:${count}`)
+                  .join(',')
+            : 'none';
+        const topReasons = payload.degradedReasons.slice(0, 3);
+        const evidence = topReasons.map((reason) => this.buildReasonEvidence(reason as Reason, payload, snapshot));
+        logger.warn(
+            m(
+                'warn',
+                `[MarketDataReadiness] degraded block=${lowest} conf=${payload.blockConfidence[lowest].toFixed(2)} overall=${payload.overallConfidence.toFixed(2)} reasons=${payload.degradedReasons.join(',') || 'n/a'} suppressions=${suppressionReasons}`
+            )
+        );
+        logger.warn(
+            JSON.stringify({
+                type: 'market_data_degraded',
+                ts: payload.lastBucketTs,
+                symbol: snapshot.symbol,
+                marketType: snapshot.marketType,
+                overallConfidence: payload.overallConfidence,
+                blockConfidence: payload.blockConfidence,
+                reasons: payload.degradedReasons,
+                topReasons,
+                evidence,
+            })
+        );
+    }
+
+    private buildReasonEvidence(reason: Reason, payload: MarketDataStatusPayload, snapshot: SourceRegistrySnapshot): Record<string, unknown> {
+        const block = this.reasonToBlock(reason);
+        const blockConfidence = block ? payload.blockConfidence[block] : undefined;
+        const lastAgg = block ? this.lastByBlock.get(block) : undefined;
+        const sourcesUsed = lastAgg?.sourcesUsed;
+        const staleDropped = lastAgg?.staleSourcesDropped;
+        const confidenceExplain = (lastAgg as { confidenceExplain?: unknown })?.confidenceExplain;
+        const venueStatus = (lastAgg as { venueStatus?: unknown })?.venueStatus;
+        const sequenceBrokenSources = venueStatus
+            ? Object.entries(venueStatus as Record<string, { sequenceBroken?: boolean }>)
+                  .filter(([, status]) => status.sequenceBroken)
+                  .map(([streamId]) => streamId)
+                  .sort()
+            : undefined;
+        const sequenceBrokenUsedSources = sequenceBrokenSources && sourcesUsed?.length
+            ? sourcesUsed.filter((source) => sequenceBrokenSources.includes(source)).sort()
+            : undefined;
+        const sequenceIssue = block ? this.lastSequenceIssueByBlock.get(block) : undefined;
+        const timeIssue = block ? this.lastTimeOutOfOrderByBlock.get(block) : undefined;
+        const expectedAgg = block ? snapshot.expected[block] : undefined;
+        const usedAgg = block ? snapshot.usedAgg[block] : undefined;
+        const lagNowTs = this.lastLagSampleTs ?? payload.lastBucketTs;
+        const lagStats = this.computeLagStats(lagNowTs);
+        return {
+            reason,
+            block,
+            confidence: blockConfidence,
+            threshold: block ? this.thresholds.criticalBlock : undefined,
+            overallThreshold: this.thresholds.overall,
+            sourcesUsed,
+            staleDropped,
+            expectedSources: expectedAgg,
+            usedAggSources: usedAgg,
+            lastAggTs: block ? snapshot.lastSeenAggTs[this.blockToAggKey(block)] : undefined,
+            lastRawTs: this.maxLastRawTs(snapshot.lastSeenRawTs),
+            noDataWindowMs: this.noDataWindowMs,
+            lagP95Ms: lagStats.p95,
+            lagEwmaMs: lagStats.ewma,
+            timeOutOfOrder: timeIssue
+                ? {
+                      topic: timeIssue.topic,
+                      prevTs: timeIssue.prevTs,
+                      currTs: timeIssue.currTs,
+                      deltaMs: timeIssue.prevTs - timeIssue.currTs,
+                      tsSource: timeIssue.tsSource,
+                  }
+                : undefined,
+            sequenceIssue: sequenceIssue
+                ? {
+                      topic: sequenceIssue.topic,
+                      prevSeq: sequenceIssue.prevSeq,
+                      currSeq: sequenceIssue.currSeq,
+                      kind: sequenceIssue.kind,
+                  }
+                : undefined,
+            confidenceExplain,
+            venueStatus,
+            sequenceBrokenSources,
+            sequenceBrokenUsedSources,
+            nonMonotonicSources: snapshot.nonMonotonicSources,
+        };
+    }
+
+    private reasonToBlock(reason: Reason): ReadinessBlock | undefined {
+        if (reason.startsWith('PRICE')) return 'price';
+        if (reason.startsWith('FLOW')) return 'flow';
+        if (reason.startsWith('LIQUIDITY')) return 'liquidity';
+        if (reason.startsWith('DERIVATIVES')) return 'derivatives';
+        if (reason === 'GAPS_DETECTED' || reason === 'LAG_TOO_HIGH') return undefined;
+        if (reason === 'SOURCES_MISSING') return undefined;
+        return undefined;
+    }
+
+    private blockToAggKey(block: ReadinessBlock): keyof SourceRegistrySnapshot['lastSeenAggTs'] {
+        if (block === 'price') return 'priceCanonical';
+        if (block === 'flow') return 'flowAgg';
+        if (block === 'liquidity') return 'liquidityAgg';
+        return 'derivativesAgg';
     }
 
     private buildSnapshotLog(payload: MarketDataStatusPayload): Record<string, unknown> {
         const snapshot = this.lastSnapshot ?? this.buildSnapshot(payload.lastBucketTs);
         return {
-            tsMeta: payload.meta.ts,
+            tsMeta: payload.meta.tsEvent,
             symbol: snapshot.symbol,
             marketType: snapshot.marketType,
             expected: snapshot.expected,
@@ -777,6 +1027,7 @@ export class MarketDataReadiness {
                 confidenceTotal: payload.overallConfidence,
                 blocks: payload.blockConfidence,
                 reasons: payload.degradedReasons,
+                warnings: payload.warnings,
             },
         };
     }
@@ -786,6 +1037,7 @@ export class MarketDataReadiness {
         if (last.degraded !== next.degraded) return true;
         if (last.warmingUp !== next.warmingUp) return true;
         if (last.degradedReasons.join(',') !== next.degradedReasons.join(',')) return true;
+        if ((last.warnings ?? []).join(',') !== (next.warnings ?? []).join(',')) return true;
         const lastLogTs = this.lastLogTs ?? 0;
         if (ts - lastLogTs >= this.logIntervalMs) return true;
         return false;
@@ -793,8 +1045,45 @@ export class MarketDataReadiness {
 
     private resetFlags(): void {
         this.gapByBlock.clear();
-        this.lagByBlock.clear();
         this.mismatchByBlock.clear();
+    }
+
+    private recordLagSample(tsEvent: number, tsIngest?: number): void {
+        if (!Number.isFinite(tsEvent)) return;
+        const ingest = tsIngest ?? tsEvent;
+        if (!Number.isFinite(ingest)) return;
+        const lagMs = Math.max(0, ingest - tsEvent);
+        this.lastLagSampleTs = ingest;
+        this.lagSamples.push({ ts: ingest, lagMs });
+        if (this.lagEwma === undefined) {
+            this.lagEwma = lagMs;
+        } else {
+            const alpha = this.lagEwmaAlpha;
+            this.lagEwma = (1 - alpha) * this.lagEwma + alpha * lagMs;
+        }
+        this.pruneLagSamples(ingest);
+    }
+
+    private pruneLagSamples(nowTs: number): void {
+        const cutoff = nowTs - this.lagWindowMs;
+        let idx = 0;
+        while (idx < this.lagSamples.length && this.lagSamples[idx].ts < cutoff) idx += 1;
+        if (idx > 0) this.lagSamples.splice(0, idx);
+    }
+
+    private computeLagStats(nowTs: number): { p95?: number; ewma?: number } {
+        this.pruneLagSamples(nowTs);
+        if (this.lagSamples.length === 0) return { p95: undefined, ewma: this.lagEwma };
+        const values = this.lagSamples.map((sample) => sample.lagMs).sort((a, b) => a - b);
+        return { p95: this.percentile(values, 0.95), ewma: this.lagEwma };
+    }
+
+    private percentile(sortedValues: number[], p: number): number {
+        if (sortedValues.length === 0) return 0;
+        if (p <= 0) return sortedValues[0];
+        if (p >= 1) return sortedValues[sortedValues.length - 1];
+        const rank = Math.ceil(p * sortedValues.length) - 1;
+        return sortedValues[Math.max(0, Math.min(sortedValues.length - 1, rank))];
     }
 
     private bucketEndTs(ts: number): number {
@@ -812,12 +1101,26 @@ export class MarketDataReadiness {
         return Math.max(min, Math.min(max, value));
     }
 
+    private applyTimebasePenalty(block: ReadinessBlock, value: number, bucketTs: number): number {
+        const issueTs = this.timebaseIssueByBlock.get(block);
+        if (issueTs === undefined || this.timebasePenaltyWindowMs === 0) return value;
+        if (bucketTs - issueTs > this.timebasePenaltyWindowMs) {
+            this.timebaseIssueByBlock.delete(block);
+            return value;
+        }
+        return this.clamp(value * TIMEBASE_CONFIDENCE_PENALTY, 0, 1);
+    }
+
     private mapTopicToBlock(topic: string): ReadinessBlock | undefined {
         if (topic.startsWith('market:price')) return 'price';
         if (topic.startsWith('market:cvd')) return 'flow';
         if (topic.startsWith('market:orderbook') || topic.startsWith('market:liquidity')) return 'liquidity';
         if (topic.startsWith('market:oi') || topic.startsWith('market:funding') || topic.startsWith('market:liquidation')) return 'derivatives';
         return undefined;
+    }
+
+    private isSequenceBasedTopic(topic: string): boolean {
+        return topic.startsWith('market:orderbook');
     }
 
     private toConfidence(evt: AggregatedWithMeta, topic: string): DataConfidence {
@@ -830,7 +1133,7 @@ export class MarketDataReadiness {
             freshSourcesCount: evt.sourcesUsed?.length ?? 0,
             staleSourcesDropped: evt.staleSourcesDropped,
             mismatchDetected: evt.mismatchDetected,
-            meta: createMeta('global_data', { ts: evt.meta.ts }),
+            meta: createMeta('global_data', { tsEvent: asTsMs(evt.meta.tsEvent) }),
         };
     }
 
