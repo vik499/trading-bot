@@ -56,8 +56,8 @@ describe('OKX WS contracts', () => {
 
     expect(snapshots).toHaveLength(1);
     expect(deltas).toHaveLength(1);
-    expect(snapshots[0].updateId).toBe(1700000000000);
-    expect(deltas[0].updateId).toBe(1700000001000);
+    expect(snapshots[0].updateId).toBe(1);
+    expect(deltas[0].updateId).toBe(2);
   });
 
   it('maps liquidation to market:liquidation', () => {

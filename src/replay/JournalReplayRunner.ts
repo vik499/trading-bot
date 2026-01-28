@@ -6,6 +6,7 @@ import {
   createMeta,
   eventBus,
   type EventBus,
+  asTsMs,
   type FundingRateEvent,
   type KlineEvent,
   type LiquidationEvent,
@@ -380,35 +381,35 @@ export class JournalReplayRunner {
       if (record.topic === 'market:ticker') {
         const payload: TickerEvent = {
           ...(record.payload as TickerEvent),
-          meta: createMeta('replay', { ts: metaTs }),
+          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
         };
         this.bus.publish('market:ticker', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:kline') {
         const payload: KlineEvent = {
           ...(record.payload as KlineEvent),
-          meta: createMeta('replay', { ts: metaTs }),
+          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
         };
         this.bus.publish('market:kline', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:trade') {
         const payload: TradeEvent = {
           ...(record.payload as TradeEvent),
-          meta: createMeta('replay', { ts: metaTs }),
+          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
         };
         this.bus.publish('market:trade', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:orderbook_l2_snapshot') {
         const payload: OrderbookL2SnapshotEvent = {
           ...(record.payload as OrderbookL2SnapshotEvent),
-          meta: createMeta('replay', { ts: metaTs }),
+          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
         };
         this.bus.publish('market:orderbook_l2_snapshot', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:orderbook_l2_delta') {
         const payload: OrderbookL2DeltaEvent = {
           ...(record.payload as OrderbookL2DeltaEvent),
-          meta: createMeta('replay', { ts: metaTs }),
+          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
         };
         this.bus.publish('market:orderbook_l2_delta', payload);
         stats.emittedCount += 1;
@@ -417,21 +418,21 @@ export class JournalReplayRunner {
         const payload: OpenInterestEvent = {
           ...raw,
           openInterestUnit: raw.openInterestUnit ?? 'base',
-          meta: createMeta('replay', { ts: metaTs }),
+          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
         };
         this.bus.publish('market:oi', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:funding') {
         const payload: FundingRateEvent = {
           ...(record.payload as FundingRateEvent),
-          meta: createMeta('replay', { ts: metaTs }),
+          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
         };
         this.bus.publish('market:funding', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:liquidation') {
         const payload: LiquidationEvent = {
           ...(record.payload as LiquidationEvent),
-          meta: createMeta('replay', { ts: metaTs }),
+          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
         };
         this.bus.publish('market:liquidation', payload);
         stats.emittedCount += 1;

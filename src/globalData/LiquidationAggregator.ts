@@ -1,4 +1,4 @@
-import { inheritMeta, type EventBus, type LiquidationEvent, type MarketLiquidationsAggEvent } from '../core/events/EventBus';
+import { asTsMs, inheritMeta, type EventBus, type LiquidationEvent, type MarketLiquidationsAggEvent } from '../core/events/EventBus';
 import { bucketCloseTs, bucketStartTs as bucketStartTsFromTs } from '../core/buckets';
 import { computeConfidenceScore, getSourceTrustAdjustments } from '../core/confidence';
 import { stableRecordFromEntries, stableSortStrings } from '../core/determinism';
@@ -208,7 +208,7 @@ export class LiquidationAggregator {
             bucketStartTs: bucket.bucketStartTs,
             bucketEndTs: bucket.bucketEndTs,
             bucketSizeMs: this.bucketMs,
-            meta: inheritMeta(bucket.lastMeta, 'global_data', { ts: bucket.bucketEndTs }),
+            meta: inheritMeta(bucket.lastMeta, 'global_data', { tsEvent: asTsMs(bucket.bucketEndTs) }),
         };
         this.bus.publish('market:liquidations_agg', payload);
         sourceRegistry.markAggEmitted(

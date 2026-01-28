@@ -135,7 +135,7 @@ export class FeatureEngine {
     }
 
     private buildMeta(parent: EventMeta) {
-        return inheritMeta(parent, 'analytics', { ts: parent.ts });
+        return inheritMeta(parent, 'analytics', { tsEvent: parent.tsEvent ?? parent.ts });
     }
 
     private ensureState(symbol: string): SymbolState {
@@ -372,7 +372,7 @@ export class KlineFeatureEngine {
     }
 
     private buildMeta(parent: EventMeta) {
-        return inheritMeta(parent, 'analytics', { ts: parent.ts });
+        return inheritMeta(parent, 'analytics', { tsEvent: parent.tsEvent ?? parent.ts });
     }
 
     private ensureState(key: string): KlineState {

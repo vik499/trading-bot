@@ -2,7 +2,9 @@ import { logger } from '../infra/logger';
 import { m } from '../core/logMarkers';
 import {
     eventBus as defaultEventBus,
+    createMeta,
     inheritMeta,
+    asTsMs,
     type EventBus,
     type EventMeta,
     type PaperFillEvent,
@@ -54,7 +56,7 @@ export class PortfolioManager {
         return {
             positions,
             ts,
-            meta: { source: 'portfolio', ts },
+            meta: createMeta('portfolio', { tsEvent: asTsMs(ts) }),
         };
     }
 
@@ -121,6 +123,6 @@ export class PortfolioManager {
     }
 
     private buildMeta(parent: EventMeta) {
-        return inheritMeta(parent, 'portfolio', { ts: parent.ts });
+        return inheritMeta(parent, 'portfolio', { tsEvent: parent.tsEvent ?? parent.ts });
     }
 }

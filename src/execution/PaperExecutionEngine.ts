@@ -93,6 +93,6 @@ export class PaperExecutionEngine {
     }
 
     private buildMeta(parent: EventMeta) {
-        return inheritMeta(parent, 'trading', { ts: parent.ts });
+        return inheritMeta(parent, 'trading', { tsEvent: parent.tsEvent ?? parent.ts });
     }
 }

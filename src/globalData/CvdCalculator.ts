@@ -1,4 +1,4 @@
-import { inheritMeta, type EventBus, type MarketCvdEvent, type MarketType, type TradeEvent } from '../core/events/EventBus';
+import { asTsMs, inheritMeta, type EventBus, type MarketCvdEvent, type MarketType, type TradeEvent } from '../core/events/EventBus';
 import { bucketCloseTs, bucketStartTs as bucketStartTsFromTs } from '../core/buckets';
 
 export interface CvdCalculatorOptions {
@@ -86,7 +86,7 @@ export class CvdCalculator {
             cvdTotal: state.cvdTotal,
             unit: 'base',
             exchangeTs: state.bucketEndTs,
-            meta: inheritMeta(state.lastMeta, 'global_data', { ts: state.bucketEndTs }),
+            meta: inheritMeta(state.lastMeta, 'global_data', { tsEvent: asTsMs(state.bucketEndTs) }),
         };
 
         if (marketType === 'spot') {

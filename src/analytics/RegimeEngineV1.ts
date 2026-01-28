@@ -138,7 +138,7 @@ export class RegimeEngineV1 {
     }
 
     private buildMeta(parent: EventMeta) {
-        return inheritMeta(parent, 'analytics', { ts: parent.ts });
+        return inheritMeta(parent, 'analytics', { tsEvent: parent.tsEvent ?? parent.ts });
     }
 
     private ensureState(symbol: string): RegimeState {

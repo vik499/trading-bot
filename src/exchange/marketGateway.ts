@@ -1,6 +1,7 @@
 import { logger } from '../infra/logger';
 import { m } from '../core/logMarkers';
 import {
+    asTsMs,
     createMeta,
     eventBus,
     inheritMeta,
@@ -52,6 +53,7 @@ export interface MarketGatewayOptions {
     resyncLogCooldownMs?: number;
     resyncReasonCooldownMs?: number;
     topicFilter?: (topic: string) => boolean;
+    shutdownTimeoutMs?: number;
 }
 
 /**
@@ -74,6 +76,7 @@ export class MarketGateway {
     private readonly resyncReasonCooldownMs: number;
     private readonly okxEnableKlines: boolean;
     private readonly topicFilter?: (topic: string) => boolean;
+    private readonly shutdownTimeoutMs: number;
     private lastSubscriptions: string[] = [];
     private resyncInFlight = false;
     private readonly lastResyncAt = new Map<string, number>();
@@ -84,20 +87,21 @@ export class MarketGateway {
         private readonly restClient: KlineRestClient = new BybitPublicRestClient(),
         bus: EventBus = eventBus,
         derivativesPoller?: OpenInterestCollector,
-        options: MarketGatewayOptions = {}
+        private readonly options: MarketGatewayOptions = {}
     ) {
         this.bus = bus;
         this.derivativesPoller = derivativesPoller ?? new BybitDerivativesRestPoller(new BybitPublicRestClient(), bus);
-        this.enableKlineBootstrap = options.enableKlineBootstrap ?? true;
-        this.enableResync = options.enableResync ?? true;
-        this.resyncStrategy = options.resyncStrategy ?? 'reconnect';
-        this.venue = options.venue;
-        this.marketType = options.marketType;
-        this.resyncCooldownMs = Math.max(0, options.resyncCooldownMs ?? 5_000);
-        this.resyncLogCooldownMs = Math.max(0, options.resyncLogCooldownMs ?? 5_000);
-        this.resyncReasonCooldownMs = Math.max(0, options.resyncReasonCooldownMs ?? 2_000);
+        this.enableKlineBootstrap = this.options.enableKlineBootstrap ?? true;
+        this.enableResync = this.options.enableResync ?? true;
+        this.resyncStrategy = this.options.resyncStrategy ?? 'reconnect';
+        this.venue = this.options.venue;
+        this.marketType = this.options.marketType;
+        this.resyncCooldownMs = Math.max(0, this.options.resyncCooldownMs ?? 5_000);
+        this.resyncLogCooldownMs = Math.max(0, this.options.resyncLogCooldownMs ?? 5_000);
+        this.resyncReasonCooldownMs = Math.max(0, this.options.resyncReasonCooldownMs ?? 2_000);
         this.okxEnableKlines = readFlagFromEnv('OKX_ENABLE_KLINES', true);
-        this.topicFilter = options.topicFilter;
+        this.topicFilter = this.options.topicFilter;
+        this.shutdownTimeoutMs = Math.max(0, this.options.shutdownTimeoutMs ?? 2_000);
     }
 
     start(): void {
@@ -147,7 +151,15 @@ export class MarketGateway {
 
     async shutdown(reason = 'shutdown'): Promise<void> {
         this.derivativesPoller.stop();
-        await this.wsClient.disconnect();
+        const disconnect = this.wsClient.disconnect();
+        if (this.shutdownTimeoutMs > 0) {
+            await Promise.race([
+                disconnect,
+                new Promise<void>((resolve) => setTimeout(resolve, this.shutdownTimeoutMs)),
+            ]);
+        } else {
+            await disconnect;
+        }
         this.publishDisconnected(createMeta('market'), reason);
     }
 
@@ -203,8 +215,10 @@ export class MarketGateway {
             const lastLogTs = this.lastResyncLogAt.get(key) ?? 0;
             if (nowTs - lastLogTs >= this.resyncLogCooldownMs) {
                 this.lastResyncLogAt.set(key, nowTs);
-                logger.warn(
-                    m('warn', `[MarketGateway] resync ignored venue=${payload.venue} symbol=${payload.symbol} reason=${payload.reason}`)
+                logger.infoThrottled(
+                    `resync:ignored:${key}`,
+                    m('warn', `[MarketGateway] resync ignored venue=${payload.venue} symbol=${payload.symbol} reason=${payload.reason}`),
+                    this.resyncLogCooldownMs
                 );
             }
             return;
@@ -287,7 +301,7 @@ export class MarketGateway {
                     tf: kline.tf ?? payload.tf,
                     streamId: this.restClient.streamId,
                     marketType: this.restClient.marketType,
-                    meta: inheritMeta(payload.meta, 'market', { ts: kline.endTs }),
+                    meta: inheritMeta(payload.meta, 'market', { tsEvent: asTsMs(kline.endTs) }),
                 };
                 this.bus.publish('market:kline', event);
             }

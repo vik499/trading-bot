@@ -7,7 +7,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { BybitPublicWsClient } from '../exchange/bybit/wsClient';
 import { Orchestrator } from '../control/orchestrator';
-import { eventBus, type ControlCommand, type ControlState } from '../core/events/EventBus';
+import { createMeta, eventBus, type ControlCommand, type ControlState } from '../core/events/EventBus';
 import { logger } from '../infra/logger';
 
 // --------- helpers ---------
@@ -132,13 +132,13 @@ async function run() {
 
     // Command storm
     const publish = (cmd: ControlCommand) => eventBus.publish('control:command', cmd);
-    publish({ type: 'pause', meta: { source: 'cli', ts: Date.now() } });
-    publish({ type: 'pause', meta: { source: 'cli', ts: Date.now() } });
-    publish({ type: 'resume', meta: { source: 'cli', ts: Date.now() } });
-    publish({ type: 'resume', meta: { source: 'cli', ts: Date.now() } });
-    publish({ type: 'shutdown', meta: { source: 'cli', ts: Date.now() }, reason: 'storm exit' });
-    publish({ type: 'shutdown', meta: { source: 'cli', ts: Date.now() }, reason: 'storm exit dup' });
-    publish({ type: 'shutdown', meta: { source: 'cli', ts: Date.now() }, reason: 'storm exit trip' });
+    publish({ type: 'pause', meta: createMeta('cli') });
+    publish({ type: 'pause', meta: createMeta('cli') });
+    publish({ type: 'resume', meta: createMeta('cli') });
+    publish({ type: 'resume', meta: createMeta('cli') });
+    publish({ type: 'shutdown', meta: createMeta('cli'), reason: 'storm exit' });
+    publish({ type: 'shutdown', meta: createMeta('cli'), reason: 'storm exit dup' });
+    publish({ type: 'shutdown', meta: createMeta('cli'), reason: 'storm exit trip' });
 
     await wait(200);
 

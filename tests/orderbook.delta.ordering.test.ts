@@ -28,6 +28,7 @@ describe('Orderbook delta ordering', () => {
     const client = new BinancePublicWsClient('wss://test', {
       eventBus: bus,
       restClient,
+      marketType: 'spot',
     });
 
     await (client as any).ensureDepthSnapshot('BTCUSDT');

@@ -118,7 +118,7 @@ export class FlowEngine {
       sourceTopic: 'market:trade' | 'market:oi' | 'market:funding';
     }
   ): void {
-    const meta = inheritMeta(parentMeta, 'analytics', { ts: parentMeta.ts });
+    const meta = inheritMeta(parentMeta, 'analytics', { tsEvent: parentMeta.tsEvent ?? parentMeta.ts });
     const flowRegime = this.computeFlowRegime(state.lastTradeDelta, snapshot.oiDelta);
 
     const payload: AnalyticsFlowEvent = {

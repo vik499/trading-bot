@@ -14,6 +14,16 @@ import { randomUUID } from 'node:crypto';
 // Общие типы
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Time/Sequence contracts (брендированные типы)
+// ---------------------------------------------------------------------------
+
+export type TsMs = number & { __brand: 'TsMs' };
+export type Seq = number & { __brand: 'Seq' };
+
+export const asTsMs = (value: number): TsMs => value as TsMs;
+export const asSeq = (value: number): Seq => value as Seq;
+
 // Откуда пришло событие/команда (помогает понимать, кто инициировал действие)
 export type EventSource =
     | 'cli'
@@ -36,9 +46,27 @@ export type EventSource =
 
 export interface EventMeta {
     source: EventSource;
-    ts: number; // unix ms
+    tsEvent: TsMs; // unix ms (время события)
+    /** @deprecated use tsEvent */
+    ts: TsMs;
+    tsIngest?: TsMs; // unix ms (время приёма)
+    tsExchange?: TsMs; // unix ms (время от биржи, если доступно)
+    sequence?: Seq; // последовательность (например updateId/seqId)
+    streamId?: string; // source stream id (venue+channel+symbol)
     correlationId?: string; // связывает цепочку событий
 }
+
+type MetaOptions = {
+    correlationId?: string;
+    tsEvent?: TsMs | number;
+    ts?: TsMs | number;
+    tsIngest?: TsMs | number;
+    tsExchange?: TsMs | number;
+    sequence?: Seq | number;
+    streamId?: string;
+};
+
+type MetaOptionsWithIngest = MetaOptions & { tsIngest: TsMs | number };
 
 // ---------------------------------------------------------------------------
 // Meta helpers (единый способ создавать meta по всему проекту)
@@ -62,16 +90,18 @@ export const newCorrelationId = (): string => randomUUID();
  * - correlationId связывает цепочку событий (трассировка)
  * - source помогает понять, откуда пришло действие
  */
-export function createMeta(
-    source: EventSource,
-    opts: {
-        correlationId?: string;
-        ts?: number;
-    } = {}
-): EventMeta {
+export function createMeta(source: EventSource, opts: MetaOptionsWithIngest): EventMeta & { tsIngest: TsMs };
+export function createMeta(source: EventSource, opts?: MetaOptions): EventMeta;
+export function createMeta(source: EventSource, opts: MetaOptions = {}): EventMeta {
+    const tsEvent = normalizeTs(opts.tsEvent ?? opts.ts) ?? asTsMs(nowMs());
     return {
         source,
-        ts: opts.ts ?? nowMs(),
+        tsEvent,
+        ts: tsEvent,
+        tsIngest: normalizeTs(opts.tsIngest),
+        tsExchange: normalizeTs(opts.tsExchange),
+        sequence: normalizeSeq(opts.sequence),
+        streamId: opts.streamId,
         correlationId: opts.correlationId,
     };
 }
@@ -84,15 +114,36 @@ export function inheritMeta(
     parent: EventMeta,
     source: EventSource,
     opts: {
-        ts?: number;
+        tsEvent?: TsMs | number;
+        ts?: TsMs | number;
+        tsIngest?: TsMs | number;
+        tsExchange?: TsMs | number;
+        sequence?: Seq | number;
+        streamId?: string;
     } = {}
 ): EventMeta {
+    const tsEvent = normalizeTs(opts.tsEvent ?? opts.ts) ?? asTsMs(nowMs());
     return {
         source,
-        ts: opts.ts ?? nowMs(),
-        correlationId: parent.correlationId ?? parent.ts.toString(),
+        tsEvent,
+        ts: tsEvent,
+        tsIngest: normalizeTs(opts.tsIngest) ?? parent.tsIngest,
+        tsExchange: normalizeTs(opts.tsExchange) ?? parent.tsExchange,
+        sequence: normalizeSeq(opts.sequence) ?? parent.sequence,
+        streamId: opts.streamId ?? parent.streamId,
+        correlationId: parent.correlationId ?? parent.tsEvent.toString(),
     };
 }
+
+const normalizeTs = (value?: TsMs | number): TsMs | undefined => {
+    if (value === undefined) return undefined;
+    return asTsMs(Number(value));
+};
+
+const normalizeSeq = (value?: Seq | number): Seq | undefined => {
+    if (value === undefined) return undefined;
+    return asSeq(Number(value));
+};
 
 // ---------------------------------------------------------------------------
 // Base event
@@ -100,6 +151,12 @@ export function inheritMeta(
 
 export interface BaseEvent {
     meta: EventMeta;
+}
+
+export interface RawEventMeta extends EventMeta {
+    tsIngest: TsMs;
+    tsEvent: TsMs;
+    tsExchange?: TsMs;
 }
 
 // ============================================================================
@@ -216,6 +273,7 @@ export interface TradeRawEvent extends BaseEvent {
     side: RawSide;
     tradeId?: string;
     seq?: number;
+    meta: RawEventMeta;
 }
 
 export interface OrderbookSnapshotRawEvent extends BaseEvent {
@@ -227,6 +285,7 @@ export interface OrderbookSnapshotRawEvent extends BaseEvent {
     bids: RawLevel[];
     asks: RawLevel[];
     sequence?: number;
+    meta: RawEventMeta;
 }
 
 export interface OrderbookDeltaRawEvent extends BaseEvent {
@@ -240,6 +299,7 @@ export interface OrderbookDeltaRawEvent extends BaseEvent {
     sequence?: number;
     prevSequence?: number;
     range?: { start: number; end: number };
+    meta: RawEventMeta;
 }
 
 export interface CandleRawEvent extends BaseEvent {
@@ -257,6 +317,7 @@ export interface CandleRawEvent extends BaseEvent {
     isClosed: boolean;
     exchangeTsMs: number;
     recvTsMs: number;
+    meta: RawEventMeta;
 }
 
 export interface MarkPriceRawEvent extends BaseEvent {
@@ -266,6 +327,7 @@ export interface MarkPriceRawEvent extends BaseEvent {
     exchangeTsMs: number;
     recvTsMs: number;
     markPrice: string;
+    meta: RawEventMeta;
 }
 
 export interface IndexPriceRawEvent extends BaseEvent {
@@ -275,6 +337,7 @@ export interface IndexPriceRawEvent extends BaseEvent {
     exchangeTsMs: number;
     recvTsMs: number;
     indexPrice: string;
+    meta: RawEventMeta;
 }
 
 export interface FundingRawEvent extends BaseEvent {
@@ -285,6 +348,7 @@ export interface FundingRawEvent extends BaseEvent {
     recvTsMs: number;
     fundingRate: string;
     nextFundingTsMs?: number;
+    meta: RawEventMeta;
 }
 
 export interface OpenInterestRawEvent extends BaseEvent {
@@ -295,6 +359,7 @@ export interface OpenInterestRawEvent extends BaseEvent {
     recvTsMs: number;
     openInterest: string;
     openInterestUsd?: string;
+    meta: RawEventMeta;
 }
 
 export interface LiquidationRawEvent extends BaseEvent {
@@ -307,6 +372,7 @@ export interface LiquidationRawEvent extends BaseEvent {
     price?: string;
     size?: string;
     notionalUsd?: string;
+    meta: RawEventMeta;
 }
 
 export interface WsEventRaw extends BaseEvent {
@@ -395,6 +461,12 @@ export interface AggregatedQualityFlags {
     sequenceBroken?: boolean;
 }
 
+export interface ConfidenceExplain {
+    score: number;
+    penalties: Array<{ reason: string; value: number }>;
+    inputs: Record<string, number | boolean | string[] | undefined>;
+}
+
 export interface MarketAggBase {
     confidence?: number;
     sourcesUsed?: string[];
@@ -402,6 +474,7 @@ export interface MarketAggBase {
     mismatchDetected?: boolean;
     staleSourcesDropped?: string[];
     qualityFlags?: AggregatedQualityFlags;
+    confidenceExplain?: ConfidenceExplain;
 }
 
 export type CvdUnit = 'base' | 'usd';
@@ -551,6 +624,16 @@ export interface MarketLiquidityAggEvent extends BaseEvent, MarketAggBase {
     confidenceScore?: number;
     provider?: string;
     weightsUsed?: AggregatedVenueBreakdown;
+    venueStatus?: Record<
+        string,
+        {
+            freshness: 'fresh' | 'stale' | 'dropped';
+            sequenceBroken?: boolean;
+            lastSeq?: Seq;
+            prevSeq?: Seq;
+            lastTsEvent?: TsMs;
+        }
+    >;
 }
 
 // ---------------------------------------------------------------------------
@@ -965,6 +1048,24 @@ export interface DataOutOfOrder extends BaseEvent {
     currTsExchange?: number;
 }
 
+export interface DataTimeOutOfOrder extends BaseEvent {
+    symbol: string;
+    streamId: string;
+    topic: 'market:ticker' | 'market:kline' | 'market:trade' | 'market:orderbook_l2_snapshot' | 'market:orderbook_l2_delta' | 'market:oi' | 'market:funding';
+    prevTs: TsMs;
+    currTs: TsMs;
+    tsSource: 'event' | 'exchange';
+}
+
+export interface DataSequenceGapOrOutOfOrder extends BaseEvent {
+    symbol: string;
+    streamId: string;
+    topic: 'market:orderbook_l2_snapshot' | 'market:orderbook_l2_delta' | 'market:trade' | 'market:oi' | 'market:funding';
+    prevSeq?: Seq;
+    currSeq?: Seq;
+    kind: 'gap' | 'out_of_order' | 'duplicate';
+}
+
 export interface LatencySpikeDetected extends BaseEvent {
     symbol: string;
     streamId: string;
@@ -1035,6 +1136,7 @@ export interface MarketDataStatusPayload extends BaseEvent {
     blockConfidence: Record<ReadinessBlock, number>;
     degraded: boolean;
     degradedReasons: string[];
+    warnings?: string[];
     warmingUp: boolean;
     warmingProgress: number;
     warmingWindowMs: number;
@@ -1315,6 +1417,8 @@ export type BotEventMap = {
     // Data quality / Storage
     'data:gapDetected': [payload: DataGapDetected];
     'data:outOfOrder': [payload: DataOutOfOrder];
+    'data:time_out_of_order': [payload: DataTimeOutOfOrder];
+    'data:sequence_gap_or_out_of_order': [payload: DataSequenceGapOrOutOfOrder];
     'data:latencySpike': [payload: LatencySpikeDetected];
     'data:duplicateDetected': [payload: DataDuplicateDetected];
     'data:sourceDegraded': [payload: DataSourceDegraded];

@@ -1,5 +1,5 @@
 import { logger } from '../infra/logger';
-import { createMeta, eventBus, newCorrelationId } from '../core/events/EventBus';
+import { asTsMs, createMeta, eventBus, newCorrelationId } from '../core/events/EventBus';
 import { m } from '../core/logMarkers';
 import type {
   ControlCommand,
@@ -29,7 +29,7 @@ export class Orchestrator {
   constructor() {
     const now = Date.now();
     this.state = {
-      meta: createMeta('system', { ts: now }),
+      meta: createMeta('system', { tsEvent: asTsMs(now) }),
       mode: 'LIVE',
       paused: false,
       lifecycle: 'STARTING',
@@ -175,7 +175,7 @@ export class Orchestrator {
     const now = Date.now();
     this.state = {
       ...this.state,
-      meta: createMeta(source, { ts: now }),
+      meta: createMeta(source, { tsEvent: asTsMs(now) }),
       lastCommandAt: now,
       lastCommand: lastCommand ?? this.state.lastCommand,
       lastCommandReason: reason ?? this.state.lastCommandReason,

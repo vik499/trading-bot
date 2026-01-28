@@ -20,6 +20,7 @@ import {
   type MarketOpenInterestAggEvent,
   type MarketPriceIndexEvent,
   type MarketVolumeAggEvent,
+  type MarketResyncRequested,
   type OpenInterestEvent,
   type OrderbookL2DeltaEvent,
   type OrderbookL2SnapshotEvent,
@@ -71,6 +72,7 @@ export interface EventTapCounters {
   fills: number;
   portfolioUpdates: number;
   klineBootstrapsCompleted: number;
+  resyncRequests: number;
 }
 
 export class EventTap {
@@ -234,6 +236,10 @@ export class EventTap {
       () => this.bus.unsubscribe('replay:finished', onReplayFinished)
     );
 
+    const onResync = (evt: MarketResyncRequested) => this.onResync(evt);
+    this.bus.subscribe('market:resync_requested', onResync);
+    this.unsubscribers.push(() => this.bus.unsubscribe('market:resync_requested', onResync));
+
     if (this.opts.summaryIntervalMs > 0) {
       this.summaryTimer = setInterval(() => {
         this.emitSummary();
@@ -278,6 +284,11 @@ export class EventTap {
     if (this.opts.summaryIntervalMs <= 0) {
       this.emitSummary();
     }
+  }
+
+  private onResync(evt: MarketResyncRequested): void {
+    this.lastMeta = evt.meta;
+    this.counters.resyncRequests += 1;
   }
 
   private onTicker(evt: TickerEvent): void {
@@ -488,6 +499,7 @@ export class EventTap {
       `bootstraps=${this.counters.klineBootstrapsCompleted}`,
       `oiAgg=${this.counters.oiAggSeen}`,
       `fundingAgg=${this.counters.fundingAggSeen}`,
+      `resync=${this.counters.resyncRequests}`,
     ];
     if (meta) {
       parts.push(`ts=${meta.ts}`);
@@ -541,6 +553,7 @@ export class EventTap {
       fills: 0,
       portfolioUpdates: 0,
       klineBootstrapsCompleted: 0,
+      resyncRequests: 0,
     };
   }
 }

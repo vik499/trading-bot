@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import {
+  asSeq,
+  asTsMs,
   createMeta,
   eventBus,
   type EventBus,
@@ -24,7 +26,8 @@ import {
   type TickerEvent,
   type DataGapDetected,
   type DataDuplicateDetected,
-  type DataOutOfOrder,
+  type DataSequenceGapOrOutOfOrder,
+  type DataTimeOutOfOrder,
   type LatencySpikeDetected,
   type StorageWriteFailed,
 } from '../core/events/EventBus';
@@ -333,7 +336,7 @@ export class EventJournal {
       | LiquidationRawEvent,
     tsExchange?: number
   ): JournalRecord {
-    const tsIngest = payload.meta.ts;
+    const tsIngest = payload.meta.tsIngest ?? payload.meta.tsEvent;
     const tf =
       topic === 'market:kline'
         ? (payload as KlineEvent).tf
@@ -365,25 +368,28 @@ export class EventJournal {
   private detectTickerQuality(payload: TickerEvent, record: JournalRecord): void {
     const exchangeTs = payload.exchangeTs;
     if (exchangeTs !== undefined) {
-      const prev = this.lastExchangeTs.get(payload.symbol);
+      const key = this.qualityKey(payload.symbol, payload.streamId, 'market:ticker');
+      const streamId = this.payloadStreamId(payload);
+      const prev = this.lastExchangeTs.get(key);
       if (prev !== undefined) {
         if (exchangeTs < prev) {
-          const evt: DataOutOfOrder = {
+          const evt: DataTimeOutOfOrder = {
             meta: createMeta('storage'),
             symbol: payload.symbol,
-            streamId: this.options.streamId,
+            streamId,
             topic: 'market:ticker',
-            prevTsExchange: prev,
-            currTsExchange: exchangeTs,
+            prevTs: asTsMs(prev),
+            currTs: asTsMs(exchangeTs),
+            tsSource: 'exchange',
           };
-          this.bus.publish('data:outOfOrder', evt);
+          this.bus.publish('data:time_out_of_order', evt);
         }
         const delta = exchangeTs - prev;
         if (delta > this.options.gapMs) {
           const evt: DataGapDetected = {
             meta: createMeta('storage'),
             symbol: payload.symbol,
-            streamId: this.options.streamId,
+            streamId,
             topic: 'market:ticker',
             prevTsExchange: prev,
             currTsExchange: exchangeTs,
@@ -397,7 +403,7 @@ export class EventJournal {
         const evt: LatencySpikeDetected = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic: 'market:ticker',
           latencyMs: latency,
           tsExchange: exchangeTs,
@@ -406,47 +412,52 @@ export class EventJournal {
         };
         this.bus.publish('data:latencySpike', evt);
       }
-      this.lastExchangeTs.set(payload.symbol, exchangeTs);
+      this.lastExchangeTs.set(key, exchangeTs);
     }
   }
 
   private detectKlineQuality(payload: KlineEvent): void {
-    const endTs = payload.meta.ts;
-    const key = `${payload.symbol}:${payload.tf}`;
+    const endTs = payload.meta.tsEvent;
+    const key = this.qualityKey(payload.symbol, payload.streamId, `market:kline:${payload.tf ?? 'unknown'}`);
     const prev = this.lastKlineEndTs.get(key);
     if (prev !== undefined && endTs < prev) {
-      const evt: DataOutOfOrder = {
+      const streamId = this.payloadStreamId(payload);
+      const evt: DataTimeOutOfOrder = {
         meta: createMeta('storage'),
         symbol: payload.symbol,
-        streamId: this.options.streamId,
+        streamId,
         topic: 'market:kline',
-        prevTsExchange: prev,
-        currTsExchange: endTs,
+        prevTs: asTsMs(prev),
+        currTs: asTsMs(endTs),
+        tsSource: 'event',
       };
-      this.bus.publish('data:outOfOrder', evt);
+      this.bus.publish('data:time_out_of_order', evt);
     }
     this.lastKlineEndTs.set(key, endTs);
   }
 
   private detectTradeQuality(payload: TradeEvent, record: JournalRecord): void {
     const tradeTs = payload.tradeTs;
-    const prevTs = this.lastTradeTs.get(payload.symbol);
+    const key = this.qualityKey(payload.symbol, payload.streamId, 'market:trade');
+    const streamId = this.payloadStreamId(payload);
+    const prevTs = this.lastTradeTs.get(key);
     if (prevTs !== undefined) {
       if (tradeTs < prevTs) {
-        const evt: DataOutOfOrder = {
+        const evt: DataTimeOutOfOrder = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic: 'market:trade',
-          prevTsExchange: prevTs,
-          currTsExchange: tradeTs,
+          prevTs: asTsMs(prevTs),
+          currTs: asTsMs(tradeTs),
+          tsSource: 'event',
         };
-        this.bus.publish('data:outOfOrder', evt);
+        this.bus.publish('data:time_out_of_order', evt);
       } else if (tradeTs === prevTs) {
         const evt: DataDuplicateDetected = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic: 'market:trade',
           key: payload.tradeId,
           tsExchange: tradeTs,
@@ -455,12 +466,12 @@ export class EventJournal {
       }
     }
 
-    const lastId = this.lastTradeId.get(payload.symbol);
+    const lastId = this.lastTradeId.get(key);
     if (payload.tradeId && lastId === payload.tradeId) {
       const evt: DataDuplicateDetected = {
         meta: createMeta('storage'),
         symbol: payload.symbol,
-        streamId: this.options.streamId,
+        streamId,
         topic: 'market:trade',
         key: payload.tradeId,
         tsExchange: tradeTs,
@@ -475,7 +486,7 @@ export class EventJournal {
         const evt: LatencySpikeDetected = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic: 'market:trade',
           latencyMs: latency,
           tsExchange: exchangeTs,
@@ -486,8 +497,8 @@ export class EventJournal {
       }
     }
 
-    this.lastTradeTs.set(payload.symbol, tradeTs);
-    if (payload.tradeId) this.lastTradeId.set(payload.symbol, payload.tradeId);
+    this.lastTradeTs.set(key, tradeTs);
+    if (payload.tradeId) this.lastTradeId.set(key, payload.tradeId);
   }
 
   private detectOrderbookQuality(
@@ -495,34 +506,51 @@ export class EventJournal {
     record: JournalRecord,
     topic: 'market:orderbook_l2_snapshot' | 'market:orderbook_l2_delta'
   ): void {
-    const key = payload.symbol;
-    const updateId = payload.updateId;
-    const prev = this.lastOrderbookUpdateId.get(key);
-    if (prev !== undefined) {
-      if (updateId < prev) {
-        const evt: DataOutOfOrder = {
-          meta: createMeta('storage'),
-          symbol: payload.symbol,
-          streamId: this.options.streamId,
-          topic,
-          prevTsExchange: prev,
-          currTsExchange: updateId,
-        };
-        this.bus.publish('data:outOfOrder', evt);
-      } else if (updateId === prev) {
-        const evt: DataDuplicateDetected = {
-          meta: createMeta('storage'),
-          symbol: payload.symbol,
-          streamId: this.options.streamId,
-          topic,
-          key: String(updateId),
-          tsExchange: payload.exchangeTs,
-        };
-        this.bus.publish('data:duplicateDetected', evt);
+    const key = this.qualityKey(payload.symbol, payload.streamId, topic);
+    const exchangeTs = payload.exchangeTs;
+    const streamId = this.payloadStreamId(payload);
+    const sequence = payload.meta.sequence !== undefined ? Number(payload.meta.sequence) : undefined;
+    if (sequence !== undefined) {
+      const prev = this.lastOrderbookUpdateId.get(key);
+      if (prev !== undefined) {
+        if (sequence < prev) {
+          const evt: DataSequenceGapOrOutOfOrder = {
+            meta: createMeta('storage'),
+            symbol: payload.symbol,
+            streamId,
+            topic,
+            prevSeq: asSeq(prev),
+            currSeq: asSeq(sequence),
+            kind: 'out_of_order',
+          };
+          this.bus.publish('data:sequence_gap_or_out_of_order', evt);
+        } else if (sequence === prev) {
+          const evt: DataSequenceGapOrOutOfOrder = {
+            meta: createMeta('storage'),
+            symbol: payload.symbol,
+            streamId,
+            topic,
+            prevSeq: asSeq(prev),
+            currSeq: asSeq(sequence),
+            kind: 'duplicate',
+          };
+          this.bus.publish('data:sequence_gap_or_out_of_order', evt);
+        } else if (sequence > prev + 1) {
+          const evt: DataSequenceGapOrOutOfOrder = {
+            meta: createMeta('storage'),
+            symbol: payload.symbol,
+            streamId,
+            topic,
+            prevSeq: asSeq(prev),
+            currSeq: asSeq(sequence),
+            kind: 'gap',
+          };
+          this.bus.publish('data:sequence_gap_or_out_of_order', evt);
+        }
       }
+      this.lastOrderbookUpdateId.set(key, sequence);
     }
 
-    const exchangeTs = payload.exchangeTs;
     const prevTs = this.lastOrderbookTs.get(key);
     if (exchangeTs !== undefined && prevTs !== undefined) {
       const delta = exchangeTs - prevTs;
@@ -530,7 +558,7 @@ export class EventJournal {
         const evt: DataGapDetected = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic,
           prevTsExchange: prevTs,
           currTsExchange: exchangeTs,
@@ -544,7 +572,7 @@ export class EventJournal {
         const evt: LatencySpikeDetected = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic,
           latencyMs: latency,
           tsExchange: exchangeTs,
@@ -555,29 +583,31 @@ export class EventJournal {
       }
     }
 
-    this.lastOrderbookUpdateId.set(key, updateId);
     if (exchangeTs !== undefined) this.lastOrderbookTs.set(key, exchangeTs);
   }
 
   private detectOiQuality(payload: OpenInterestEvent, record: JournalRecord): void {
-    const ts = payload.exchangeTs ?? payload.meta.ts;
-    const prev = this.lastOiTs.get(payload.symbol);
+    const ts = payload.exchangeTs ?? payload.meta.tsExchange ?? payload.meta.tsEvent;
+    const key = this.qualityKey(payload.symbol, payload.streamId, 'market:oi');
+    const streamId = this.payloadStreamId(payload);
+    const prev = this.lastOiTs.get(key);
     if (prev !== undefined) {
       if (ts < prev) {
-        const evt: DataOutOfOrder = {
+        const evt: DataTimeOutOfOrder = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic: 'market:oi',
-          prevTsExchange: prev,
-          currTsExchange: ts,
+          prevTs: asTsMs(prev),
+          currTs: asTsMs(ts),
+          tsSource: payload.exchangeTs !== undefined || payload.meta.tsExchange !== undefined ? 'exchange' : 'event',
         };
-        this.bus.publish('data:outOfOrder', evt);
+        this.bus.publish('data:time_out_of_order', evt);
       } else if (ts === prev) {
         const evt: DataDuplicateDetected = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic: 'market:oi',
           tsExchange: ts,
         };
@@ -588,7 +618,7 @@ export class EventJournal {
           const evt: DataGapDetected = {
             meta: createMeta('storage'),
             symbol: payload.symbol,
-            streamId: this.options.streamId,
+            streamId,
             topic: 'market:oi',
             prevTsExchange: prev,
             currTsExchange: ts,
@@ -606,7 +636,7 @@ export class EventJournal {
         const evt: LatencySpikeDetected = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic: 'market:oi',
           latencyMs: latency,
           tsExchange: exchangeTs,
@@ -617,28 +647,31 @@ export class EventJournal {
       }
     }
 
-    this.lastOiTs.set(payload.symbol, ts);
+    this.lastOiTs.set(key, ts);
   }
 
   private detectFundingQuality(payload: FundingRateEvent, record: JournalRecord): void {
-    const ts = payload.exchangeTs ?? payload.meta.ts;
-    const prev = this.lastFundingTs.get(payload.symbol);
+    const ts = payload.exchangeTs ?? payload.meta.tsExchange ?? payload.meta.tsEvent;
+    const key = this.qualityKey(payload.symbol, payload.streamId, 'market:funding');
+    const streamId = this.payloadStreamId(payload);
+    const prev = this.lastFundingTs.get(key);
     if (prev !== undefined) {
       if (ts < prev) {
-        const evt: DataOutOfOrder = {
+        const evt: DataTimeOutOfOrder = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic: 'market:funding',
-          prevTsExchange: prev,
-          currTsExchange: ts,
+          prevTs: asTsMs(prev),
+          currTs: asTsMs(ts),
+          tsSource: payload.exchangeTs !== undefined || payload.meta.tsExchange !== undefined ? 'exchange' : 'event',
         };
-        this.bus.publish('data:outOfOrder', evt);
+        this.bus.publish('data:time_out_of_order', evt);
       } else if (ts === prev) {
         const evt: DataDuplicateDetected = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic: 'market:funding',
           tsExchange: ts,
         };
@@ -649,7 +682,7 @@ export class EventJournal {
           const evt: DataGapDetected = {
             meta: createMeta('storage'),
             symbol: payload.symbol,
-            streamId: this.options.streamId,
+            streamId,
             topic: 'market:funding',
             prevTsExchange: prev,
             currTsExchange: ts,
@@ -667,7 +700,7 @@ export class EventJournal {
         const evt: LatencySpikeDetected = {
           meta: createMeta('storage'),
           symbol: payload.symbol,
-          streamId: this.options.streamId,
+          streamId,
           topic: 'market:funding',
           latencyMs: latency,
           tsExchange: exchangeTs,
@@ -678,8 +711,18 @@ export class EventJournal {
       }
     }
 
-    this.lastFundingTs.set(payload.symbol, ts);
+    this.lastFundingTs.set(key, ts);
   }
+
+  private qualityKey(symbol: string, streamId: string | undefined, scope: string): string {
+    const normalizedStream = streamId && streamId.length > 0 ? streamId : this.options.streamId;
+    return `${symbol}:${normalizedStream}:${scope}`;
+  }
+
+  private payloadStreamId(payload: { streamId?: string; meta?: { streamId?: string } }): string {
+    return payload.streamId ?? payload.meta?.streamId ?? this.options.streamId;
+  }
+
 
   private scheduleFlush(): void {
     if (this.queue.length >= this.options.maxBatchSize) {

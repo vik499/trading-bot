@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import WebSocket from 'ws';
 import { OkxPublicWsClient } from '../src/exchange/okx/wsClient';
 import { eventBus, type KlineEvent, type LiquidationEvent, type TradeEvent } from '../src/core/events/EventBus';
 
@@ -66,5 +67,40 @@ describe('OkxPublicWsClient', () => {
     expect(liquidations).toHaveLength(1);
     expect(liquidations[0].side).toBe('Sell');
     expect(liquidations[0].notionalUsd).toBeCloseTo(300, 8);
+  });
+
+  it('deduplicates subscribe frames', () => {
+    const client = new OkxPublicWsClient('wss://ws.okx.com:8443/ws/v5/public', {
+      streamId: 'okx.public.swap',
+      marketType: 'futures',
+      supportsLiquidations: true,
+    });
+
+    const sent: string[] = [];
+    (client as any).socket = {
+      readyState: WebSocket.OPEN,
+      send: (msg: string) => sent.push(msg),
+    };
+
+    client.subscribeTrades('BTCUSDT');
+    client.subscribeTrades('BTCUSDT');
+    (client as any).flushSubscriptions();
+
+    expect(sent).toHaveLength(1);
+
+    const offline = new OkxPublicWsClient('wss://ws.okx.com:8443/ws/v5/public', {
+      streamId: 'okx.public.swap',
+      marketType: 'futures',
+    });
+    offline.subscribeTrades('ETHUSDT');
+    const sentOffline: string[] = [];
+    (offline as any).socket = {
+      readyState: WebSocket.OPEN,
+      send: (msg: string) => sentOffline.push(msg),
+    };
+    (offline as any).flushSubscriptions();
+    (offline as any).flushSubscriptions();
+
+    expect(sentOffline).toHaveLength(1);
   });
 });

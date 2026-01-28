@@ -3,6 +3,7 @@ import { URL } from 'node:url';
 import { logger } from '../../infra/logger';
 import { m } from '../../core/logMarkers';
 import {
+    asTsMs,
     createMeta,
     eventBus,
     nowMs,
@@ -298,7 +299,7 @@ export class BinanceOpenInterestCollector implements OpenInterestCollector {
         this.abortControllers.set(symbol, controller);
         try {
             const data = await this.restClient.fetchOpenInterest({ symbol, signal: controller.signal });
-            const meta = createMeta('binance', { ts: data.ts });
+            const meta = createMeta('binance', { tsEvent: asTsMs(data.ts) });
 
             if (this.lastEmittedTs.get(symbol) === data.ts) {
                 this.resetBackoff(symbol);
@@ -324,12 +325,13 @@ export class BinanceOpenInterestCollector implements OpenInterestCollector {
             this.resetBackoff(symbol);
         } catch (err) {
             if (isAbortError(err)) return;
+            const backoff = this.bumpBackoff(symbol);
             this.logErrorThrottled(
                 `oi:${symbol}`,
                 `[BinanceREST] open interest failed for ${symbol}: ${(err as Error).message}`,
-                err
+                err,
+                backoff
             );
-            this.bumpBackoff(symbol);
         } finally {
             this.abortControllers.delete(symbol);
             this.inFlight.delete(symbol);
@@ -346,14 +348,16 @@ export class BinanceOpenInterestCollector implements OpenInterestCollector {
         this.backoffState.delete(symbol);
     }
 
-    private bumpBackoff(symbol: string): void {
+    private bumpBackoff(symbol: string): BackoffInfo {
         const existing = this.backoffState.get(symbol) ?? { failures: 0, nextAllowedTs: 0 };
         const failures = existing.failures + 1;
         const backoffMs = this.computeBackoffMs(symbol, failures);
+        const nextAllowedTs = this.now() + backoffMs;
         this.backoffState.set(symbol, {
             failures,
-            nextAllowedTs: this.now() + backoffMs,
+            nextAllowedTs,
         });
+        return { failures, backoffMs, nextAllowedTs };
     }
 
     private computeBackoffMs(symbol: string, failures: number): number {
@@ -364,13 +368,14 @@ export class BinanceOpenInterestCollector implements OpenInterestCollector {
         return backoff + jitter;
     }
 
-    private logErrorThrottled(key: string, message: string, err?: unknown): void {
+    private logErrorThrottled(key: string, message: string, err?: unknown, backoff?: BackoffInfo): void {
         const now = this.now();
         const last = this.lastErrorLogAt.get(key) ?? 0;
         if (now - last < 30_000) return;
         this.lastErrorLogAt.set(key, now);
         const details = formatRestError(err);
-        const full = details ? `${message} ${details}` : message;
+        const classification = formatRestClassification(err, backoff);
+        const full = [message, details, classification].filter(Boolean).join(' ');
         logger.warn(m('warn', full));
     }
 }
@@ -441,7 +446,7 @@ export class BinanceFundingCollector implements OpenInterestCollector {
         this.abortControllers.set(symbol, controller);
         try {
             const data = await this.restClient.fetchPremiumIndex({ symbol, signal: controller.signal });
-            const meta = createMeta('binance', { ts: data.ts });
+            const meta = createMeta('binance', { tsEvent: asTsMs(data.ts) });
 
             if (this.lastEmittedTs.get(symbol) === data.ts) {
                 this.resetBackoff(symbol);
@@ -470,12 +475,13 @@ export class BinanceFundingCollector implements OpenInterestCollector {
             this.resetBackoff(symbol);
         } catch (err) {
             if (isAbortError(err)) return;
+            const backoff = this.bumpBackoff(symbol);
             this.logErrorThrottled(
                 `funding:${symbol}`,
                 `[BinanceREST] funding failed for ${symbol}: ${(err as Error).message}`,
-                err
+                err,
+                backoff
             );
-            this.bumpBackoff(symbol);
         } finally {
             this.abortControllers.delete(symbol);
             this.inFlight.delete(symbol);
@@ -492,14 +498,16 @@ export class BinanceFundingCollector implements OpenInterestCollector {
         this.backoffState.delete(symbol);
     }
 
-    private bumpBackoff(symbol: string): void {
+    private bumpBackoff(symbol: string): BackoffInfo {
         const existing = this.backoffState.get(symbol) ?? { failures: 0, nextAllowedTs: 0 };
         const failures = existing.failures + 1;
         const backoffMs = this.computeBackoffMs(symbol, failures);
+        const nextAllowedTs = this.now() + backoffMs;
         this.backoffState.set(symbol, {
             failures,
-            nextAllowedTs: this.now() + backoffMs,
+            nextAllowedTs,
         });
+        return { failures, backoffMs, nextAllowedTs };
     }
 
     private computeBackoffMs(symbol: string, failures: number): number {
@@ -510,15 +518,22 @@ export class BinanceFundingCollector implements OpenInterestCollector {
         return backoff + jitter;
     }
 
-    private logErrorThrottled(key: string, message: string, err?: unknown): void {
+    private logErrorThrottled(key: string, message: string, err?: unknown, backoff?: BackoffInfo): void {
         const now = this.now();
         const last = this.lastErrorLogAt.get(key) ?? 0;
         if (now - last < 30_000) return;
         this.lastErrorLogAt.set(key, now);
         const details = formatRestError(err);
-        const full = details ? `${message} ${details}` : message;
+        const classification = formatRestClassification(err, backoff);
+        const full = [message, details, classification].filter(Boolean).join(' ');
         logger.warn(m('warn', full));
     }
+}
+
+interface BackoffInfo {
+    failures: number;
+    backoffMs: number;
+    nextAllowedTs: number;
 }
 
 export interface BinanceDerivativesPollerOptions {
@@ -818,6 +833,54 @@ function formatRestError(err: unknown): string | undefined {
     pushDetail(parts, 'rateLimit', details.rateLimit);
 
     return parts.length ? `details=${parts.join(' ')}` : undefined;
+}
+
+function formatRestClassification(err: unknown, backoff?: BackoffInfo): string | undefined {
+    const classification = classifyRestError(err);
+    const parts: string[] = [];
+    if (classification.category) parts.push(`category=${classification.category}`);
+    if (classification.status !== undefined) parts.push(`status=${classification.status}`);
+    if (classification.retryAfter) parts.push(`retryAfter=${classification.retryAfter}`);
+    if (classification.errorCode) parts.push(`errorCode=${classification.errorCode}`);
+    if (classification.requestId) parts.push(`requestId=${classification.requestId}`);
+    if (backoff) {
+        parts.push(`attempt=${backoff.failures}`);
+        parts.push(`backoffMs=${backoff.backoffMs}`);
+        parts.push(`nextAllowedTs=${backoff.nextAllowedTs}`);
+    }
+    return parts.length ? `meta=${parts.join(' ')}` : undefined;
+}
+
+function classifyRestError(err: unknown): {
+    category: string;
+    status?: number;
+    retryAfter?: string;
+    errorCode?: string;
+    requestId?: string;
+} {
+    if (isAbortError(err)) return { category: 'abort' };
+    if (err instanceof BinanceRestError) {
+        const details = err.details as Record<string, unknown> | undefined;
+        const status = typeof details?.status === 'number' ? details.status : undefined;
+        const requestId = typeof details?.requestId === 'string' ? details.requestId : undefined;
+        const rateLimit = details?.rateLimit as Record<string, string> | undefined;
+        const retryAfter = rateLimit?.['retry-after'];
+        const errorCode = typeof details?.code === 'string' ? details?.code : undefined;
+        if (status === 418 || status === 429 || retryAfter) {
+            return { category: 'rate_limit', status, retryAfter, requestId, errorCode };
+        }
+        if (status !== undefined) {
+            if (status >= 500) return { category: 'http_5xx', status, retryAfter, requestId, errorCode };
+            if (status >= 400) return { category: 'http_4xx', status, retryAfter, requestId, errorCode };
+        }
+        return { category: 'exchange_error', status, retryAfter, requestId, errorCode };
+    }
+    const error = err as { code?: string; message?: string } | undefined;
+    const code = error?.code?.toString();
+    if (code && ['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED'].includes(code)) {
+        return { category: 'network', errorCode: code };
+    }
+    return { category: 'unknown' };
 }
 
 function pushDetail(parts: string[], key: string, value: unknown): void {

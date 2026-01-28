@@ -189,7 +189,7 @@ describe('EventJournal', () => {
   test('emits outOfOrder when exchange ts decreases', async () => {
     const bus = createTestEventBus();
     const outOfOrder: unknown[] = [];
-    bus.subscribe('data:outOfOrder', (evt) => outOfOrder.push(evt));
+    bus.subscribe('data:time_out_of_order', (evt) => outOfOrder.push(evt));
 
     journal = createEventJournal(bus, { baseDir: tmpDir, runId, flushIntervalMs: 5, maxBatchSize: 1 });
     journal.start();
@@ -206,7 +206,7 @@ describe('EventJournal', () => {
   test('emits outOfOrder for klines per tf', async () => {
     const bus = createTestEventBus();
     const outOfOrder: unknown[] = [];
-    bus.subscribe('data:outOfOrder', (evt) => outOfOrder.push(evt));
+    bus.subscribe('data:time_out_of_order', (evt) => outOfOrder.push(evt));
 
     journal = createEventJournal(bus, { baseDir: tmpDir, runId, flushIntervalMs: 5, maxBatchSize: 1 });
     journal.start();
@@ -262,7 +262,7 @@ describe('EventJournal', () => {
   test('emits outOfOrder for trades when tradeTs decreases', async () => {
     const bus = createTestEventBus();
     const outOfOrder: unknown[] = [];
-    bus.subscribe('data:outOfOrder', (evt) => outOfOrder.push(evt));
+    bus.subscribe('data:time_out_of_order', (evt) => outOfOrder.push(evt));
 
     journal = createEventJournal(bus, { baseDir: tmpDir, runId, flushIntervalMs: 5, maxBatchSize: 1 });
     journal.start();

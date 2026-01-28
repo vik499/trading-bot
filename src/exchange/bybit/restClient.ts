@@ -3,6 +3,7 @@ import { URL } from 'node:url';
 import { logger } from '../../infra/logger';
 import { m } from '../../core/logMarkers';
 import {
+    asTsMs,
     createMeta,
     eventBus,
     nowMs,
@@ -564,7 +565,7 @@ export class BybitDerivativesRestPoller implements OpenInterestCollector {
         this.oiAbortControllers.set(symbol, controller);
         try {
             const data = await this.restClient.fetchOpenInterest({ symbol, intervalTime: this.oiIntervalTime, signal: controller.signal });
-            const meta = createMeta('market', { ts: data.ts });
+            const meta = createMeta('market', { tsEvent: asTsMs(data.ts) });
             const payload: OpenInterestEvent = {
                 symbol,
                 streamId: this.streamId,
@@ -582,8 +583,13 @@ export class BybitDerivativesRestPoller implements OpenInterestCollector {
             this.resetOiBackoff(symbol);
         } catch (err) {
             if (isAbortError(err)) return;
-            this.logErrorThrottled(`oi:${symbol}`, `[BybitREST] open interest failed for ${symbol}: ${(err as Error).message}`, err);
-            this.bumpOiBackoff(symbol);
+            const backoff = this.bumpOiBackoff(symbol);
+            this.logErrorThrottled(
+                `oi:${symbol}`,
+                `[BybitREST] open interest failed for ${symbol}: ${(err as Error).message}`,
+                err,
+                backoff
+            );
         } finally {
             this.oiAbortControllers.delete(symbol);
             this.oiInFlight.delete(symbol);
@@ -598,7 +604,7 @@ export class BybitDerivativesRestPoller implements OpenInterestCollector {
         this.fundingAbortControllers.set(symbol, controller);
         try {
             const data = await this.restClient.fetchFundingRate({ symbol, signal: controller.signal });
-            const meta = createMeta('market', { ts: data.ts });
+            const meta = createMeta('market', { tsEvent: asTsMs(data.ts) });
             if (this.lastFundingTs.get(symbol) === data.ts) {
                 this.resetFundingBackoff(symbol);
                 return;
@@ -621,8 +627,13 @@ export class BybitDerivativesRestPoller implements OpenInterestCollector {
             this.resetFundingBackoff(symbol);
         } catch (err) {
             if (isAbortError(err)) return;
-            this.logErrorThrottled(`funding:${symbol}`, `[BybitREST] funding failed for ${symbol}: ${(err as Error).message}`, err);
-            this.bumpFundingBackoff(symbol);
+            const backoff = this.bumpFundingBackoff(symbol);
+            this.logErrorThrottled(
+                `funding:${symbol}`,
+                `[BybitREST] funding failed for ${symbol}: ${(err as Error).message}`,
+                err,
+                backoff
+            );
         } finally {
             this.fundingAbortControllers.delete(symbol);
             this.fundingInFlight.delete(symbol);
@@ -649,24 +660,28 @@ export class BybitDerivativesRestPoller implements OpenInterestCollector {
         this.fundingBackoffState.delete(symbol);
     }
 
-    private bumpOiBackoff(symbol: string): void {
+    private bumpOiBackoff(symbol: string): BackoffInfo {
         const existing = this.oiBackoffState.get(symbol) ?? { failures: 0, nextAllowedTs: 0 };
         const failures = existing.failures + 1;
         const backoffMs = this.computeBackoffMs(symbol, failures);
+        const nextAllowedTs = this.now() + backoffMs;
         this.oiBackoffState.set(symbol, {
             failures,
-            nextAllowedTs: this.now() + backoffMs,
+            nextAllowedTs,
         });
+        return { failures, backoffMs, nextAllowedTs };
     }
 
-    private bumpFundingBackoff(symbol: string): void {
+    private bumpFundingBackoff(symbol: string): BackoffInfo {
         const existing = this.fundingBackoffState.get(symbol) ?? { failures: 0, nextAllowedTs: 0 };
         const failures = existing.failures + 1;
         const backoffMs = this.computeBackoffMs(symbol, failures);
+        const nextAllowedTs = this.now() + backoffMs;
         this.fundingBackoffState.set(symbol, {
             failures,
-            nextAllowedTs: this.now() + backoffMs,
+            nextAllowedTs,
         });
+        return { failures, backoffMs, nextAllowedTs };
     }
 
     private computeBackoffMs(symbol: string, failures: number): number {
@@ -677,13 +692,14 @@ export class BybitDerivativesRestPoller implements OpenInterestCollector {
         return backoff + jitter;
     }
 
-    private logErrorThrottled(key: string, message: string, err?: unknown): void {
+    private logErrorThrottled(key: string, message: string, err?: unknown, backoff?: BackoffInfo): void {
         const now = this.now();
         const last = this.lastErrorLogAt.get(key) ?? 0;
         if (now - last < 30_000) return;
         this.lastErrorLogAt.set(key, now);
         const details = this.formatRestError(err);
-        const full = details ? `${message} ${details}` : message;
+        const classification = formatRestClassification(err, backoff);
+        const full = [message, details, classification].filter(Boolean).join(' ');
         logger.warn(m('warn', full));
     }
 
@@ -707,6 +723,12 @@ export class BybitDerivativesRestPoller implements OpenInterestCollector {
     }
 }
 
+interface BackoffInfo {
+    failures: number;
+    backoffMs: number;
+    nextAllowedTs: number;
+}
+
 function pushDetail(parts: string[], key: string, value: unknown): void {
     if (value === undefined || value === null) return;
     if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
@@ -714,4 +736,52 @@ function pushDetail(parts: string[], key: string, value: unknown): void {
         return;
     }
     parts.push(`${key}=${JSON.stringify(value)}`);
+}
+
+function formatRestClassification(err: unknown, backoff?: BackoffInfo): string | undefined {
+    const classification = classifyRestError(err);
+    const parts: string[] = [];
+    if (classification.category) parts.push(`category=${classification.category}`);
+    if (classification.status !== undefined) parts.push(`status=${classification.status}`);
+    if (classification.retryAfter) parts.push(`retryAfter=${classification.retryAfter}`);
+    if (classification.errorCode) parts.push(`errorCode=${classification.errorCode}`);
+    if (classification.requestId) parts.push(`requestId=${classification.requestId}`);
+    if (backoff) {
+        parts.push(`attempt=${backoff.failures}`);
+        parts.push(`backoffMs=${backoff.backoffMs}`);
+        parts.push(`nextAllowedTs=${backoff.nextAllowedTs}`);
+    }
+    return parts.length ? `meta=${parts.join(' ')}` : undefined;
+}
+
+function classifyRestError(err: unknown): {
+    category: string;
+    status?: number;
+    retryAfter?: string;
+    errorCode?: string;
+    requestId?: string;
+} {
+    if (isAbortError(err)) return { category: 'abort' };
+    if (err instanceof BybitRestError) {
+        const details = err.details as Record<string, unknown> | undefined;
+        const status = typeof details?.status === 'number' ? details.status : undefined;
+        const requestId = typeof details?.requestId === 'string' ? details.requestId : undefined;
+        const rateLimit = details?.rateLimit as Record<string, string> | undefined;
+        const retryAfter = rateLimit?.['retry-after'];
+        const errorCode = typeof details?.retCode === 'number' ? String(details.retCode) : undefined;
+        if (status === 418 || status === 429 || retryAfter) {
+            return { category: 'rate_limit', status, retryAfter, requestId, errorCode };
+        }
+        if (status !== undefined) {
+            if (status >= 500) return { category: 'http_5xx', status, retryAfter, requestId, errorCode };
+            if (status >= 400) return { category: 'http_4xx', status, retryAfter, requestId, errorCode };
+        }
+        return { category: 'exchange_error', status, retryAfter, requestId, errorCode };
+    }
+    const error = err as { code?: string; message?: string } | undefined;
+    const code = error?.code?.toString();
+    if (code && ['ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED'].includes(code)) {
+        return { category: 'network', errorCode: code };
+    }
+    return { category: 'unknown' };
 }

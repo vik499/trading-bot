@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  asTsMs,
   createMeta,
   type MarketCvdAggEvent,
   type MarketDataStatusPayload,
@@ -95,6 +96,18 @@ const makeTrade = (ts: number, marketType: 'spot' | 'futures', streamId: string)
   meta: createMeta('market', { ts }),
 });
 
+const makeLagTrade = (tsEvent: number, tsIngest: number): TradeEvent => ({
+  symbol: 'BTCUSDT',
+  streamId: 's1',
+  side: 'Buy',
+  price: 100,
+  size: 1,
+  tradeTs: tsEvent,
+  exchangeTs: tsEvent,
+  marketType: 'futures',
+  meta: createMeta('market', { tsEvent: asTsMs(tsEvent), tsIngest: asTsMs(tsIngest), tsExchange: asTsMs(tsEvent), streamId: 's1' }),
+});
+
 function collectStatuses() {
   const bus = createTestEventBus();
   const readiness = new MarketDataReadiness(bus, {
@@ -102,6 +115,7 @@ function collectStatuses() {
     warmingWindowMs: 1000,
     expectedSources: 1,
     logIntervalMs: 0,
+    readinessStabilityWindowMs: 0,
   });
   const outputs: MarketDataStatusPayload[] = [];
   bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
@@ -164,6 +178,7 @@ describe('MarketDataReadiness', () => {
       warmingWindowMs: 0,
       expectedSources: 2,
       logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
     });
     const outputs: MarketDataStatusPayload[] = [];
     bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
@@ -191,6 +206,7 @@ describe('MarketDataReadiness', () => {
       warmingWindowMs: 3000,
       expectedSources: 1,
       logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
     });
     const outputs: MarketDataStatusPayload[] = [];
     bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
@@ -232,6 +248,7 @@ describe('MarketDataReadiness', () => {
       warmingWindowMs: 0,
       logIntervalMs: 0,
       targetMarketType: 'futures',
+      readinessStabilityWindowMs: 0,
       expectedSourcesConfig: {
         default: {
           futures: {
@@ -261,6 +278,7 @@ describe('MarketDataReadiness', () => {
       bucketMs: 1000,
       warmingWindowMs: 0,
       logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
       expectedSourcesByBlock: { price: ['s1'] },
     });
     readiness.start();
@@ -286,6 +304,7 @@ describe('MarketDataReadiness', () => {
       bucketMs: 1000,
       warmingWindowMs: 0,
       logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
       expectedSourcesByBlock: { price: ['s1'], derivatives: ['s1'] },
       expectedDerivativeKinds: ['funding'],
       confidenceStaleWindowMs: 1000,
@@ -310,6 +329,7 @@ describe('MarketDataReadiness', () => {
       bucketMs: 1000,
       warmingWindowMs: 0,
       logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
       expectedSourcesByBlock: {
         price: ['s1'],
         flow: ['s1'],
@@ -343,6 +363,7 @@ describe('MarketDataReadiness', () => {
       bucketMs: 1000,
       warmingWindowMs: 0,
       logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
       expectedSourcesByBlock: {
         price: ['s1'],
         flow: ['s1'],
@@ -361,6 +382,140 @@ describe('MarketDataReadiness', () => {
     const snapshot = (readiness as any).buildSnapshot(1000);
     expect(snapshot.marketType).toBe('futures');
     expect(snapshot.usedRaw.trades).toEqual(['futures-stream']);
+
+    readiness.stop();
+  });
+
+  it('ignores minor out-of-order deltas for lag', () => {
+    const bus = createTestEventBus();
+    const readiness = new MarketDataReadiness(bus, {
+      bucketMs: 1000,
+      warmingWindowMs: 0,
+      expectedSources: 1,
+      outOfOrderToleranceMs: 500,
+      logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
+    });
+    const outputs: MarketDataStatusPayload[] = [];
+    bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
+    readiness.start();
+
+    bus.publish('data:outOfOrder', {
+      symbol: 'BTCUSDT',
+      streamId: 's1',
+      topic: 'market:trade',
+      prevTsExchange: 1000,
+      currTsExchange: 950,
+      meta: createMeta('storage', { ts: 1000 }),
+    });
+
+    const bucketTs = 1000;
+    bus.publish('market:price_canonical', makePrice(bucketTs));
+    bus.publish('market:cvd_spot_agg', makeCvd(bucketTs));
+    bus.publish('market:cvd_futures_agg', { ...makeCvd(bucketTs), marketType: 'futures' });
+    bus.publish('market:liquidity_agg', makeLiquidity(bucketTs));
+    bus.publish('market:oi_agg', makeOi(bucketTs));
+    bus.publish('market:funding_agg', makeFunding(bucketTs));
+    bus.publish('market:liquidations_agg', makeLiq(bucketTs));
+
+    const last = outputs[outputs.length - 1];
+    expect(last.degradedReasons).not.toContain('LAG_TOO_HIGH');
+
+    readiness.stop();
+  });
+
+  it('ignores orderbook sequence out-of-order for lag', () => {
+    const bus = createTestEventBus();
+    const readiness = new MarketDataReadiness(bus, {
+      bucketMs: 1000,
+      warmingWindowMs: 0,
+      expectedSources: 1,
+      outOfOrderToleranceMs: 500,
+      logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
+    });
+    const outputs: MarketDataStatusPayload[] = [];
+    bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
+    readiness.start();
+
+    bus.publish('data:outOfOrder', {
+      symbol: 'BTCUSDT',
+      streamId: 's1',
+      topic: 'market:orderbook_l2_delta',
+      prevTsExchange: 5000,
+      currTsExchange: 1,
+      meta: createMeta('storage', { ts: 1000 }),
+    });
+
+    const bucketTs = 1000;
+    bus.publish('market:price_canonical', makePrice(bucketTs));
+    bus.publish('market:cvd_spot_agg', makeCvd(bucketTs));
+    bus.publish('market:cvd_futures_agg', { ...makeCvd(bucketTs), marketType: 'futures' });
+    bus.publish('market:liquidity_agg', makeLiquidity(bucketTs));
+    bus.publish('market:oi_agg', makeOi(bucketTs));
+    bus.publish('market:funding_agg', makeFunding(bucketTs));
+    bus.publish('market:liquidations_agg', makeLiq(bucketTs));
+
+    const last = outputs[outputs.length - 1];
+    expect(last.degradedReasons).not.toContain('LAG_TOO_HIGH');
+
+    readiness.stop();
+  });
+
+  it('computes lag from ingestTs-tsEvent', () => {
+    const bus = createTestEventBus();
+    const readiness = new MarketDataReadiness(bus, {
+      bucketMs: 1000,
+      warmingWindowMs: 0,
+      expectedSources: 1,
+      logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
+      lagThresholdMs: 1000,
+      lagWindowMs: 10_000,
+      expectedSourcesByBlock: {
+        price: ['s1'],
+        flow: [],
+        liquidity: [],
+        derivatives: [],
+      },
+    });
+    const outputs: MarketDataStatusPayload[] = [];
+    bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
+    readiness.start();
+
+    bus.publish('market:trade', makeLagTrade(1000, 4000));
+    bus.publish('market:price_canonical', makePrice(2000));
+
+    const last = outputs[outputs.length - 1];
+    expect(last.degradedReasons).toContain('LAG_TOO_HIGH');
+
+    readiness.stop();
+  });
+
+  it('reaches READY with stability window enabled', () => {
+    const bus = createTestEventBus();
+    const readiness = new MarketDataReadiness(bus, {
+      bucketMs: 1000,
+      warmingWindowMs: 0,
+      expectedSources: 1,
+      logIntervalMs: 0,
+      readinessStabilityWindowMs: 2000,
+    });
+    const outputs: MarketDataStatusPayload[] = [];
+    bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
+    readiness.start();
+
+    const bucketTs = 1000;
+    bus.publish('market:price_canonical', makePrice(bucketTs));
+    bus.publish('market:cvd_spot_agg', makeCvd(bucketTs));
+    bus.publish('market:cvd_futures_agg', { ...makeCvd(bucketTs), marketType: 'futures' });
+    bus.publish('market:liquidity_agg', makeLiquidity(bucketTs));
+    bus.publish('market:oi_agg', makeOi(bucketTs));
+    bus.publish('market:funding_agg', makeFunding(bucketTs));
+    bus.publish('market:liquidations_agg', makeLiq(bucketTs));
+
+    const last = outputs[outputs.length - 1];
+    expect(last.degraded).toBe(false);
 
     readiness.stop();
   });

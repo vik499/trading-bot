@@ -2,7 +2,9 @@ import { logger } from '../infra/logger';
 import { m } from '../core/logMarkers';
 import {
     eventBus as defaultEventBus,
+    createMeta,
     inheritMeta,
+    asTsMs,
     type ControlState,
     type EventBus,
     type EventMeta,
@@ -33,7 +35,7 @@ export class RiskManager {
     private readonly config: Required<RiskManagerConfig>;
     private started = false;
     private controlState: ControlState = {
-        meta: { source: 'system', ts: 0 },
+        meta: createMeta('system', { tsEvent: asTsMs(0) }),
         mode: 'PAPER',
         paused: false,
         lifecycle: 'RUNNING',
@@ -144,7 +146,7 @@ export class RiskManager {
     }
 
     private buildMeta(parent: EventMeta) {
-        return inheritMeta(parent, 'risk', { ts: parent.ts });
+        return inheritMeta(parent, 'risk', { tsEvent: parent.tsEvent ?? parent.ts });
     }
 
     private ensureState(symbol: string): SymbolRiskState {

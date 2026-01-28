@@ -41,7 +41,7 @@ describe('Journal separation invariants', () => {
       price: '100',
       size: '0.1',
       side: 'buy',
-      meta: createMeta('market', { ts: 1_000 }),
+      meta: createMeta('market', { ts: 1_000, tsIngest: 1_000 }),
     };
 
     bus.publish('market:trade_raw', rawTrade);

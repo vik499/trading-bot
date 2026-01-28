@@ -1,7 +1,7 @@
 import WebSocket from 'ws';
 import { logger } from '../../infra/logger';
 import { m } from '../../core/logMarkers';
-import { createMeta, eventBus, nowMs, type EventBus } from '../../core/events/EventBus';
+import { asSeq, asTsMs, createMeta, eventBus, nowMs, type EventBus } from '../../core/events/EventBus';
 import type {
     KlineEvent,
     KlineInterval,
@@ -62,6 +62,7 @@ export class OkxPublicWsClient {
     private lastProtocolError: { event: string; code?: string; msg?: string } | null = null;
     private lastError?: string;
     private readonly subscriptions = new Set<string>();
+    private readonly sentSubscriptions = new Set<string>();
     private readonly orderbookSeq = new Map<string, number>();
     private readonly orderbookSnapshotReady = new Set<string>();
     private readonly orderbookLastAppliedAt = new Map<string, number>();
@@ -121,6 +122,7 @@ export class OkxPublicWsClient {
                 this.state = 'idle';
                 this.connectPromise = null;
                 this.stopPing();
+                this.sentSubscriptions.clear();
                 if (!this.isDisconnecting) {
                     this.scheduleReconnect(reason);
                 }
@@ -134,6 +136,7 @@ export class OkxPublicWsClient {
                 this.orderbookPendingResync.clear();
                 this.orderbookGapCount.clear();
                 this.orderbookGapWindowStart.clear();
+                this.sentSubscriptions.clear();
                 this.scheduleStableReset();
                 this.startPing();
                 this.flushSubscriptions();
@@ -180,6 +183,7 @@ export class OkxPublicWsClient {
         this.orderbookPendingResync.clear();
         this.orderbookGapCount.clear();
         this.orderbookGapWindowStart.clear();
+        this.sentSubscriptions.clear();
         if (!this.socket) return;
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
@@ -248,17 +252,25 @@ export class OkxPublicWsClient {
     private subscribe(arg: OkxArg): void {
         const normalized = this.normalizeSubArg(arg);
         const key = buildSubKey(normalized);
-        if (this.subscriptions.has(key)) return;
-        this.subscriptions.add(key);
+        if (this.subscriptions.has(key)) {
+            if (this.sentSubscriptions.has(key)) return;
+        } else {
+            this.subscriptions.add(key);
+        }
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+        if (this.sentSubscriptions.has(key)) return;
         this.sendJson({ op: 'subscribe', args: [normalized] });
+        this.sentSubscriptions.add(key);
     }
 
     private flushSubscriptions(): void {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
         if (this.subscriptions.size === 0) return;
-        const args: OkxArg[] = Array.from(this.subscriptions).map((entry) => JSON.parse(entry) as OkxArg);
+        const pending = Array.from(this.subscriptions).filter((entry) => !this.sentSubscriptions.has(entry));
+        if (pending.length === 0) return;
+        const args: OkxArg[] = pending.map((entry) => JSON.parse(entry) as OkxArg);
         this.sendJson({ op: 'subscribe', args });
+        pending.forEach((entry) => this.sentSubscriptions.add(entry));
         logger.info(m('connect', `[OKXWS] subscribed ${args.length} channels`));
     }
 
@@ -287,6 +299,7 @@ export class OkxPublicWsClient {
                     const instType = arg.instType ? String(arg.instType) : toOkxInstType(this.marketType);
                     const subKey = buildSubKey({ channel, instId, instType: instType as OkxInstType });
                     this.subscriptions.delete(subKey);
+                    this.sentSubscriptions.delete(subKey);
                     this.lastError = `error:${code}:${msg ?? ''}`;
                 }
                 this.lastProtocolError = { event, code, msg };
@@ -305,7 +318,7 @@ export class OkxPublicWsClient {
                 code,
                 msg,
                 payload: parsed,
-                meta: createMeta('market', { ts: this.now() }),
+                meta: createMeta('market', { tsEvent: asTsMs(this.now()), tsIngest: asTsMs(this.now()) }),
             };
             this.bus.publish('market:ws_event_raw', evt);
             return;
@@ -360,7 +373,12 @@ export class OkxPublicWsClient {
                 tradeTs,
                 exchangeTs: tradeTs,
                 marketType: this.marketType ?? detectMarketType(instId),
-                meta: createMeta('market', { ts: tradeTs }),
+                meta: createMeta('market', {
+                    tsEvent: asTsMs(tradeTs),
+                    tsExchange: asTsMs(tradeTs),
+                    tsIngest: asTsMs(this.now()),
+                    streamId: this.streamId,
+                }),
             } as TradeEvent;
             this.bus.publish('market:trade', evt);
 
@@ -408,7 +426,12 @@ export class OkxPublicWsClient {
                 volume,
                 streamId: this.streamId,
                 marketType: this.marketType ?? detectMarketType(instId),
-                meta: createMeta('market', { ts: endTs }),
+                meta: createMeta('market', {
+                    tsEvent: asTsMs(endTs),
+                    tsExchange: asTsMs(endTs),
+                    tsIngest: asTsMs(this.now()),
+                    streamId: this.streamId,
+                }),
             } as KlineEvent;
             this.bus.publish('market:kline', evt);
 
@@ -446,7 +469,7 @@ export class OkxPublicWsClient {
 
         const bids = parseLevels(obj.bids);
         const asks = parseLevels(obj.asks);
-        const updateId = Number.parseInt(String(exchangeTs), 10);
+        const updateId = seqId ?? Number.parseInt(String(exchangeTs), 10);
         const isSnapshot = String(action ?? '').toLowerCase() === 'snapshot';
         const lastSeq = this.orderbookSeq.get(symbol);
         if (isSnapshot) {
@@ -489,7 +512,13 @@ export class OkxPublicWsClient {
                 marketType: this.marketType ?? detectMarketType(instId),
                 bids,
                 asks,
-                meta: createMeta('market', { ts: exchangeTs }),
+                meta: createMeta('market', {
+                    tsEvent: asTsMs(exchangeTs),
+                    tsExchange: asTsMs(exchangeTs),
+                    tsIngest: asTsMs(this.now()),
+                    sequence: seqId !== undefined ? asSeq(seqId) : undefined,
+                    streamId: this.streamId,
+                }),
             } as OrderbookL2SnapshotEvent;
             this.bus.publish('market:orderbook_l2_snapshot', evt);
             this.bus.publish(
@@ -507,7 +536,13 @@ export class OkxPublicWsClient {
             marketType: this.marketType ?? detectMarketType(instId),
             bids,
             asks,
-            meta: createMeta('market', { ts: exchangeTs }),
+            meta: createMeta('market', {
+                tsEvent: asTsMs(exchangeTs),
+                tsExchange: asTsMs(exchangeTs),
+                tsIngest: asTsMs(this.now()),
+                sequence: seqId !== undefined ? asSeq(seqId) : undefined,
+                streamId: this.streamId,
+            }),
         } as OrderbookL2DeltaEvent;
         this.bus.publish('market:orderbook_l2_delta', evt);
         this.bus.publish(
@@ -534,7 +569,12 @@ export class OkxPublicWsClient {
             volume24h: obj.vol24h !== undefined ? String(obj.vol24h) : undefined,
             turnover24h: obj.volCcy24h !== undefined ? String(obj.volCcy24h) : undefined,
             exchangeTs: ts,
-            meta: createMeta('market', { ts }),
+            meta: createMeta('market', {
+                tsEvent: asTsMs(ts),
+                tsExchange: asTsMs(ts),
+                tsIngest: asTsMs(this.now()),
+                streamId: this.streamId,
+            }),
         } as TickerEvent;
         this.bus.publish('market:ticker', evt);
 
@@ -566,7 +606,12 @@ export class OkxPublicWsClient {
                 notionalUsd: price !== undefined && size !== undefined ? price * size : undefined,
                 exchangeTs: ts,
                 marketType: this.marketType ?? detectMarketType(instId),
-                meta: createMeta('market', { ts: ts ?? this.now() }),
+                meta: createMeta('market', {
+                    tsEvent: asTsMs(ts ?? this.now()),
+                    tsExchange: ts !== undefined ? asTsMs(ts) : undefined,
+                    tsIngest: asTsMs(this.now()),
+                    streamId: this.streamId,
+                }),
             } as LiquidationEvent;
             this.bus.publish('market:liquidation', evt);
 
@@ -649,7 +694,7 @@ export class OkxPublicWsClient {
             reason,
             streamId: this.streamId,
             details,
-            meta: createMeta('market', { ts: this.now() }),
+            meta: createMeta('market', { tsEvent: asTsMs(this.now()), tsIngest: asTsMs(this.now()) }),
         });
     }
 
@@ -703,7 +748,10 @@ export class OkxPublicWsClient {
         logger.warn(m('warn', `[OKXWS] reconnect in ${delay}ms (reason=${reason})`));
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
-            void this.connect();
+            this.connect().catch((err) => {
+                const msg = toErrorMessage(err);
+                logger.warn(m('warn', `[OKXWS] reconnect failed: ${msg}`));
+            });
         }, delay);
     }
 
@@ -716,6 +764,16 @@ export class OkxPublicWsClient {
         }
     }
 }
+
+const toErrorMessage = (err: unknown): string => {
+    if (!err) return 'unknown error';
+    if (err instanceof Error) return err.message;
+    try {
+        return JSON.stringify(err);
+    } catch {
+        return String(err);
+    }
+};
 
 function normalizeOkxSymbol(instId: string): string {
     const trimmed = instId.trim().toUpperCase();

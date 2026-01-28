@@ -12,7 +12,7 @@ import type {
     TradeRawEvent,
     VenueId,
 } from '../../core/events/EventBus';
-import { createMeta, type EventMeta, type MarketType } from '../../core/events/EventBus';
+import { asSeq, asTsMs, createMeta, type EventMeta, type MarketType } from '../../core/events/EventBus';
 import { toCanonicalSymbol } from '../../core/market/symbolMapper';
 
 const toSide = (value: string | undefined): RawSide | undefined => {
@@ -61,7 +61,12 @@ export function mapTradeRaw(
         side,
         tradeId: payload.i !== undefined ? String(payload.i) : payload.tradeId !== undefined ? String(payload.tradeId) : payload.a !== undefined ? String(payload.a) : undefined,
         seq: payload.seq !== undefined ? Number(payload.seq) : undefined,
-        meta: createMeta('market', { ts: exchangeTsMs }),
+        meta: createMeta('market', {
+            tsEvent: asTsMs(exchangeTsMs),
+            tsIngest: asTsMs(recvTsMs),
+            tsExchange: asTsMs(exchangeTsMs),
+            sequence: payload.seq !== undefined ? asSeq(Number(payload.seq)) : undefined,
+        }),
     };
 }
 
@@ -85,7 +90,12 @@ export function mapOrderbookSnapshotRaw(
         bids: toLevels(bids),
         asks: toLevels(asks),
         sequence,
-        meta: createMeta('market', { ts: exchangeTsMs }),
+        meta: createMeta('market', {
+            tsEvent: asTsMs(exchangeTsMs),
+            tsIngest: asTsMs(recvTsMs),
+            tsExchange: asTsMs(exchangeTsMs),
+            sequence: sequence !== undefined ? asSeq(sequence) : undefined,
+        }),
     };
 }
 
@@ -113,7 +123,12 @@ export function mapOrderbookDeltaRaw(
         sequence,
         prevSequence,
         range,
-        meta: createMeta('market', { ts: exchangeTsMs }),
+        meta: createMeta('market', {
+            tsEvent: asTsMs(exchangeTsMs),
+            tsIngest: asTsMs(recvTsMs),
+            tsExchange: asTsMs(exchangeTsMs),
+            sequence: sequence !== undefined ? asSeq(sequence) : undefined,
+        }),
     };
 }
 
@@ -149,7 +164,11 @@ export function mapCandleRaw(
         isClosed,
         exchangeTsMs,
         recvTsMs,
-        meta: createMeta('market', { ts: exchangeTsMs }),
+        meta: createMeta('market', {
+            tsEvent: asTsMs(exchangeTsMs),
+            tsIngest: asTsMs(recvTsMs),
+            tsExchange: asTsMs(exchangeTsMs),
+        }),
     };
 }
 
@@ -169,7 +188,11 @@ export function mapMarkPriceRaw(
         exchangeTsMs,
         recvTsMs,
         markPrice: String(markPrice),
-        meta: createMeta('market', { ts: exchangeTsMs }),
+        meta: createMeta('market', {
+            tsEvent: asTsMs(exchangeTsMs),
+            tsIngest: asTsMs(recvTsMs),
+            tsExchange: asTsMs(exchangeTsMs),
+        }),
     };
 }
 
@@ -189,7 +212,11 @@ export function mapIndexPriceRaw(
         exchangeTsMs,
         recvTsMs,
         indexPrice: String(indexPrice),
-        meta: createMeta('market', { ts: exchangeTsMs }),
+        meta: createMeta('market', {
+            tsEvent: asTsMs(exchangeTsMs),
+            tsIngest: asTsMs(recvTsMs),
+            tsExchange: asTsMs(exchangeTsMs),
+        }),
     };
 }
 
@@ -211,7 +238,11 @@ export function mapFundingRaw(
         recvTsMs,
         fundingRate: String(fundingRate),
         nextFundingTsMs,
-        meta: createMeta('market', { ts: exchangeTsMs }),
+        meta: createMeta('market', {
+            tsEvent: asTsMs(exchangeTsMs),
+            tsIngest: asTsMs(recvTsMs),
+            tsExchange: asTsMs(exchangeTsMs),
+        }),
     };
 }
 
@@ -233,7 +264,11 @@ export function mapOpenInterestRaw(
         recvTsMs,
         openInterest: String(openInterest),
         openInterestUsd: openInterestUsd !== undefined ? String(openInterestUsd) : undefined,
-        meta: createMeta('market', { ts: exchangeTsMs }),
+        meta: createMeta('market', {
+            tsEvent: asTsMs(exchangeTsMs),
+            tsIngest: asTsMs(recvTsMs),
+            tsExchange: asTsMs(exchangeTsMs),
+        }),
     };
 }
 
@@ -257,10 +292,14 @@ export function mapLiquidationRaw(
         price: payload.price !== undefined ? String(payload.price) : undefined,
         size: payload.size !== undefined ? String(payload.size) : undefined,
         notionalUsd: payload.notionalUsd !== undefined ? String(payload.notionalUsd) : undefined,
-        meta: createMeta('market', { ts: exchangeTsMs }),
+        meta: createMeta('market', {
+            tsEvent: asTsMs(exchangeTsMs),
+            tsIngest: asTsMs(recvTsMs),
+            tsExchange: asTsMs(exchangeTsMs),
+        }),
     };
 }
 
-export function inheritMetaOverride(meta: EventMeta, ts: number): EventMeta {
-    return { ...meta, ts };
+export function inheritMetaOverride(meta: EventMeta, tsEvent: number): EventMeta {
+    return { ...meta, tsEvent: asTsMs(tsEvent) };
 }

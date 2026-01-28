@@ -241,7 +241,7 @@ export class MarketContextBuilder {
     }
 
     private buildMeta(parent: EventMeta) {
-        return inheritMeta(parent, 'analytics', { ts: parent.ts });
+        return inheritMeta(parent, 'analytics', { tsEvent: parent.tsEvent ?? parent.ts });
     }
 
     private makeKey(symbol: string, tf: string): string {

@@ -1,6 +1,7 @@
 import { logger } from '../infra/logger';
 import { m } from '../core/logMarkers';
 import {
+    asTsMs,
     eventBus as defaultEventBus,
     inheritMeta,
     type AnalyticsFeaturesEvent,
@@ -106,7 +107,7 @@ export class PatternMiner {
             score,
             window: this.config.windowSize,
             sourceTopic,
-            meta: inheritMeta(meta, 'research', { ts }),
+            meta: inheritMeta(meta, 'research', { tsEvent: asTsMs(ts) }),
         };
         this.bus.publish('research:patternFound', found);
 
@@ -116,7 +117,7 @@ export class PatternMiner {
             patternId,
             occurrences: count,
             avgReturn: state.patternAvgReturn[patternId],
-            meta: inheritMeta(meta, 'research', { ts }),
+            meta: inheritMeta(meta, 'research', { tsEvent: asTsMs(ts) }),
         };
         this.bus.publish('research:patternStats', stats);
     }

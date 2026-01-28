@@ -5,7 +5,7 @@ import WebSocket, { RawData } from 'ws';
 // Импортируем наш логгер — централизованный способ логирования
 // (чтобы позже легко заменить формат, вывод, уровни логов и т.д.)
 import { logger } from '../../infra/logger';
-import { eventBus, nowMs, type EventBus } from '../../core/events/EventBus';
+import { asSeq, asTsMs, createMeta, eventBus, nowMs, type EventBus } from '../../core/events/EventBus';
 import { m } from '../../core/logMarkers';
 import type {
     EventMeta,
@@ -166,13 +166,7 @@ export class BybitPublicWsClient {
                 socket.removeAllListeners();
 
                 // Аккуратное закрытие без исключений
-                if (socket.readyState === WebSocket.CONNECTING) {
-                    try {
-                        socket.close();
-                    } catch {
-                        // ignore
-                    }
-                } else if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
+                if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
                     try {
                         socket.close();
                     } catch {
@@ -348,11 +342,12 @@ export class BybitPublicWsClient {
                 logger.error(m('timeout', `[BybitWS] Таймаут подключения (${connectTimeoutMs}мс)`));
 
                 try {
-                    // Важно: в CONNECTING terminate() иногда кидает исключение (как ты уже видел).
-                    // Для таймаута достаточно close().
-                    socket.close();
-                } catch {
-                    // ignore
+                    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
+                        socket.close();
+                    }
+                } catch (err) {
+                    const msg = toErrorMessage(err);
+                    logger.warn(m('warn', `[BybitWS] close on connect-timeout failed: ${msg}`));
                 }
 
                 this.cleanupOnce('connect timeout');
@@ -650,11 +645,15 @@ export class BybitPublicWsClient {
         logger.info(m('connect', `[BybitWS] Подписка отправлена: ${topic}`));
     }
 
-    private makeMeta(source: EventSource, ts?: number): EventMeta {
-        return {
-            source,
-            ts: ts ?? this.now(),
-        };
+    private makeMeta(source: EventSource, tsEvent?: number, tsExchange?: number, sequence?: number): EventMeta {
+        const eventTs = tsEvent ?? this.now();
+        return createMeta(source, {
+            tsEvent: asTsMs(eventTs),
+            tsIngest: asTsMs(this.now()),
+            tsExchange: tsExchange !== undefined ? asTsMs(tsExchange) : undefined,
+            sequence: sequence !== undefined ? asSeq(sequence) : undefined,
+            streamId: this.streamId,
+        });
     }
 
     private handleMessage(text: string): void {
@@ -714,7 +713,7 @@ export class BybitPublicWsClient {
                 volume24h: toStr(ticker.volume24h ?? ticker.volume_24h),
                 turnover24h: toStr(ticker.turnover24h ?? ticker.turnover_24h),
                 exchangeTs,
-                meta: this.makeMeta('market', exchangeTs),
+                meta: this.makeMeta('market', exchangeTs, exchangeTs),
             };
 
             // MVP: без lastPrice смысла нет
@@ -760,7 +759,7 @@ export class BybitPublicWsClient {
                 const tradeIdRaw = obj.i ?? obj.tradeId ?? obj.execId;
                 const tradeId = tradeIdRaw !== undefined ? String(tradeIdRaw) : undefined;
                 const recvTs = this.now();
-                const meta = this.makeMeta('market', tradeTs);
+                const meta = this.makeMeta('market', tradeTs, tradeTs);
                 const tradeEvent: TradeEvent = {
                     symbol,
                     streamId: this.streamId,
@@ -795,7 +794,7 @@ export class BybitPublicWsClient {
             const asks = parseLevels(obj.a ?? obj.asks);
             const exchangeTs = toNumber(obj.ts ?? obj.T ?? parsed.ts);
             const recvTs = this.now();
-            const meta = this.makeMeta('market', exchangeTs);
+            const meta = this.makeMeta('market', exchangeTs, exchangeTs, updateId);
             const isSnapshot = String(parsed?.type ?? obj.type ?? '').toLowerCase() === 'snapshot';
 
             const lastSeq = this.orderbookSeq.get(symbol);
@@ -904,7 +903,7 @@ export class BybitPublicWsClient {
                     volume,
                     streamId: this.streamId,
                     marketType: this.marketType,
-                    meta: this.makeMeta('market', endTs),
+                    meta: this.makeMeta('market', endTs, endTs),
                 };
                 this.bus.publish('market:kline', event);
 
@@ -958,7 +957,7 @@ export class BybitPublicWsClient {
                     notionalUsd: price !== undefined && size !== undefined ? price * size : undefined,
                     exchangeTs,
                     marketType: this.marketType,
-                    meta: this.makeMeta('market', exchangeTs ?? parsed.ts),
+                    meta: this.makeMeta('market', exchangeTs ?? parsed.ts, exchangeTs),
                 };
                 this.bus.publish('market:liquidation', payload);
 

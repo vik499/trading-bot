@@ -1,4 +1,4 @@
-import { createMeta, eventBus, type EventBus, type WalkForwardSummary } from '../core/events/EventBus';
+import { asTsMs, createMeta, eventBus, type EventBus, type WalkForwardSummary } from '../core/events/EventBus';
 import { formatUtcDate } from '../core/time/utc';
 import { createJournalReplayRunner, type ReplayMode } from './JournalReplayRunner';
 
@@ -68,7 +68,7 @@ export class WalkForwardRunner {
             stepMs,
             startTs,
             endTs,
-            meta: createMeta('metrics', { ts: endTs }),
+                meta: createMeta('metrics', { tsEvent: asTsMs(endTs) }),
         };
         this.bus.publish('metrics:walkforward_summary', summary);
         return summary;

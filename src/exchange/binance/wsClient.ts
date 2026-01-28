@@ -1,7 +1,7 @@
 import WebSocket from 'ws';
 import { logger } from '../../infra/logger';
 import { m } from '../../core/logMarkers';
-import { createMeta, eventBus, nowMs, type EventBus } from '../../core/events/EventBus';
+import { asSeq, asTsMs, createMeta, eventBus, nowMs, type EventBus } from '../../core/events/EventBus';
 import { normalizeSymbol } from '../../core/market/symbols';
 import type {
     KlineEvent,
@@ -26,6 +26,16 @@ import {
     mapTradeRaw,
 } from '../normalizers/rawAdapters';
 
+const toErrorMessage = (err: unknown): string => {
+    if (!err) return 'unknown error';
+    if (err instanceof Error) return err.message;
+    try {
+        return JSON.stringify(err);
+    } catch {
+        return String(err);
+    }
+};
+
 export interface BinanceWsClientOptions {
     streamId?: string;
     marketType?: MarketType;
@@ -46,6 +56,7 @@ type DepthUpdate = {
     eventTs: number;
     firstUpdateId: number;
     lastUpdateId: number;
+    prevUpdateId?: number;
     bids: OrderbookLevel[];
     asks: OrderbookLevel[];
 };
@@ -323,7 +334,12 @@ export class BinancePublicWsClient {
             tradeTs,
             exchangeTs: tradeTs,
             marketType: this.marketType,
-            meta: createMeta('market', { ts: tradeTs }),
+            meta: createMeta('market', {
+                tsEvent: asTsMs(tradeTs),
+                tsExchange: asTsMs(tradeTs),
+                tsIngest: asTsMs(this.now()),
+                streamId: this.streamId,
+            }),
         } as TradeEvent;
         this.bus.publish('market:trade', tradeEvent);
 
@@ -335,12 +351,13 @@ export class BinancePublicWsClient {
         const symbol = String(payload.s ?? 'n/a');
         const firstUpdateId = toOptionalNumber(payload.U);
         const lastUpdateId = toOptionalNumber(payload.u);
+        const prevUpdateId = toOptionalNumber(payload.pu);
         const eventTs = toOptionalNumber(payload.E);
         if (firstUpdateId === undefined || lastUpdateId === undefined || eventTs === undefined) return;
 
         const bids = parseDepthLevels(payload.b);
         const asks = parseDepthLevels(payload.a);
-        const update: DepthUpdate = { symbol, eventTs, firstUpdateId, lastUpdateId, bids, asks };
+        const update: DepthUpdate = { symbol, eventTs, firstUpdateId, lastUpdateId, prevUpdateId, bids, asks };
 
         this.bus.publish(
             'market:orderbook_delta_raw',
@@ -352,7 +369,7 @@ export class BinancePublicWsClient {
                 eventTs,
                 this.now(),
                 lastUpdateId,
-                firstUpdateId,
+                prevUpdateId ?? firstUpdateId,
                 { start: firstUpdateId, end: lastUpdateId },
                 this.marketType
             )
@@ -369,19 +386,23 @@ export class BinancePublicWsClient {
     private flushDepth(symbol: string, state: DepthState): void {
         if (!state.snapshot) return;
         const lastSnapshotId = state.snapshot.lastUpdateId;
+        const isFutures = this.marketType === 'futures';
         const sorted = state.buffered
             .slice()
             .sort((a, b) => a.firstUpdateId - b.firstUpdateId || a.lastUpdateId - b.lastUpdateId || a.eventTs - b.eventTs);
-        const usable = sorted.filter((evt) => evt.lastUpdateId > lastSnapshotId);
+        const usable = sorted.filter((evt) => (isFutures ? evt.lastUpdateId >= lastSnapshotId : evt.lastUpdateId > lastSnapshotId));
         state.buffered = usable;
 
         if (!state.snapshotEmitted) {
-            const firstIndex = usable.findIndex(
-                (evt) => evt.firstUpdateId <= lastSnapshotId + 1 && evt.lastUpdateId >= lastSnapshotId + 1
+            const firstIndex = usable.findIndex((evt) =>
+                isFutures
+                    ? evt.firstUpdateId <= lastSnapshotId && evt.lastUpdateId >= lastSnapshotId
+                    : evt.firstUpdateId <= lastSnapshotId + 1 && evt.lastUpdateId >= lastSnapshotId + 1
             );
             if (firstIndex === -1) {
-                if (usable.length > 0 && usable[0].firstUpdateId > lastSnapshotId + 1) {
-                    this.requestResync(symbol, 'gap', { lastSnapshotId });
+                const nextExpectedId = isFutures ? lastSnapshotId : lastSnapshotId + 1;
+                if (usable.length > 0 && usable[0].firstUpdateId > nextExpectedId) {
+                    this.requestResync(symbol, 'gap', { lastSnapshotId, nextUpdateId: usable[0].firstUpdateId });
                 }
                 this.depthState.set(symbol, state);
                 return;
@@ -396,7 +417,13 @@ export class BinancePublicWsClient {
                 marketType: this.marketType,
                 bids: state.snapshot.bids,
                 asks: state.snapshot.asks,
-                meta: createMeta('market', { ts: first.eventTs }),
+                meta: createMeta('market', {
+                    tsEvent: asTsMs(first.eventTs),
+                    tsExchange: asTsMs(first.eventTs),
+                    tsIngest: asTsMs(this.now()),
+                    sequence: asSeq(lastSnapshotId),
+                    streamId: this.streamId,
+                }),
             } as OrderbookL2SnapshotEvent;
             this.bus.publish('market:orderbook_l2_snapshot', snapshotEvent);
             state.snapshotEmitted = true;
@@ -405,11 +432,28 @@ export class BinancePublicWsClient {
         }
 
         for (const evt of state.buffered) {
-            if (state.lastUpdateId !== undefined && evt.lastUpdateId <= state.lastUpdateId) continue;
-            if (state.lastUpdateId !== undefined && evt.firstUpdateId > state.lastUpdateId + 1) {
-                this.requestResync(symbol, 'gap', { lastUpdateId: state.lastUpdateId, nextUpdateId: evt.firstUpdateId });
-                this.depthState.set(symbol, state);
-                return;
+            if (state.lastUpdateId !== undefined) {
+                const isStale = isFutures ? evt.lastUpdateId < state.lastUpdateId : evt.lastUpdateId <= state.lastUpdateId;
+                if (isStale) continue;
+                if (isFutures) {
+                    if (
+                        evt.prevUpdateId !== undefined &&
+                        state.lastUpdateId !== lastSnapshotId &&
+                        evt.prevUpdateId !== state.lastUpdateId
+                    ) {
+                        this.requestResync(symbol, 'out_of_order', {
+                            lastUpdateId: state.lastUpdateId,
+                            prevUpdateId: evt.prevUpdateId,
+                            updateId: evt.lastUpdateId,
+                        });
+                        this.depthState.set(symbol, state);
+                        return;
+                    }
+                } else if (evt.firstUpdateId > state.lastUpdateId + 1) {
+                    this.requestResync(symbol, 'gap', { lastUpdateId: state.lastUpdateId, nextUpdateId: evt.firstUpdateId });
+                    this.depthState.set(symbol, state);
+                    return;
+                }
             }
             state.lastUpdateId = evt.lastUpdateId;
             const delta: OrderbookL2DeltaEvent = {
@@ -420,7 +464,13 @@ export class BinancePublicWsClient {
                 marketType: this.marketType,
                 bids: evt.bids,
                 asks: evt.asks,
-                meta: createMeta('market', { ts: evt.eventTs }),
+                meta: createMeta('market', {
+                    tsEvent: asTsMs(evt.eventTs),
+                    tsExchange: asTsMs(evt.eventTs),
+                    tsIngest: asTsMs(this.now()),
+                    sequence: asSeq(evt.lastUpdateId),
+                    streamId: this.streamId,
+                }),
             } as OrderbookL2DeltaEvent;
             this.bus.publish('market:orderbook_l2_delta', delta);
         }
@@ -469,7 +519,12 @@ export class BinancePublicWsClient {
             volume,
             streamId: this.streamId,
             marketType: this.marketType,
-            meta: createMeta('market', { ts: endTs }),
+            meta: createMeta('market', {
+                tsEvent: asTsMs(endTs),
+                tsExchange: asTsMs(endTs),
+                tsIngest: asTsMs(this.now()),
+                streamId: this.streamId,
+            }),
         } as KlineEvent;
         this.bus.publish('market:kline', event);
 
@@ -506,7 +561,12 @@ export class BinancePublicWsClient {
             markPrice,
             indexPrice,
             exchangeTs: eventTs,
-            meta: createMeta('market', { ts: eventTs }),
+            meta: createMeta('market', {
+                tsEvent: asTsMs(eventTs),
+                tsExchange: asTsMs(eventTs),
+                tsIngest: asTsMs(this.now()),
+                streamId: this.streamId,
+            }),
         } as TickerEvent;
         this.bus.publish('market:ticker', evt);
 
@@ -534,7 +594,12 @@ export class BinancePublicWsClient {
             volume24h: payload.v !== undefined ? String(payload.v) : undefined,
             turnover24h: payload.q !== undefined ? String(payload.q) : undefined,
             exchangeTs: eventTs,
-            meta: createMeta('market', { ts: eventTs }),
+            meta: createMeta('market', {
+                tsEvent: asTsMs(eventTs),
+                tsExchange: asTsMs(eventTs),
+                tsIngest: asTsMs(this.now()),
+                streamId: this.streamId,
+            }),
         } as TickerEvent;
         this.bus.publish('market:ticker', evt);
     }
@@ -558,7 +623,12 @@ export class BinancePublicWsClient {
             notionalUsd: price !== undefined && size !== undefined ? price * size : undefined,
             exchangeTs: eventTs,
             marketType: this.marketType,
-            meta: createMeta('market', { ts: eventTs ?? this.now() }),
+            meta: createMeta('market', {
+                tsEvent: asTsMs(eventTs ?? this.now()),
+                tsExchange: eventTs !== undefined ? asTsMs(eventTs) : undefined,
+                tsIngest: asTsMs(this.now()),
+                streamId: this.streamId,
+            }),
         } as LiquidationEvent;
         this.bus.publish('market:liquidation', evt);
 
@@ -607,9 +677,11 @@ export class BinancePublicWsClient {
             reason,
             streamId: this.streamId,
             details,
-            meta: createMeta('market', { ts: this.now() }),
+            meta: createMeta('market', { tsEvent: asTsMs(this.now()), tsIngest: asTsMs(this.now()) }),
         });
-        void this.ensureDepthSnapshot(symbol);
+        this.ensureDepthSnapshot(symbol).catch((err) => {
+            logger.warn(m('warn', `[BinanceWS] depth snapshot failed for ${symbol}: ${(err as Error).message}`));
+        });
     }
 
     private resetDepthState(symbol: string): void {
@@ -625,7 +697,9 @@ export class BinancePublicWsClient {
     private refreshOrderbookSnapshots(): void {
         for (const symbol of this.orderbookSymbols) {
             this.resetDepthState(symbol);
-            void this.ensureDepthSnapshot(symbol);
+            this.ensureDepthSnapshot(symbol).catch((err) => {
+                logger.warn(m('warn', `[BinanceWS] depth snapshot failed for ${symbol}: ${(err as Error).message}`));
+            });
         }
     }
 
@@ -642,7 +716,10 @@ export class BinancePublicWsClient {
         logger.warn(m('warn', `[BinanceWS] reconnect in ${delay}ms (reason=${reason})`));
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
-            void this.connect();
+            this.connect().catch((err) => {
+                const msg = toErrorMessage(err);
+                logger.warn(m('warn', `[BinanceWS] reconnect failed: ${msg}`));
+            });
         }, delay);
     }
 

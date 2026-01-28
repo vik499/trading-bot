@@ -1,6 +1,7 @@
 import { logger } from '../infra/logger';
 import { m } from '../core/logMarkers';
 import {
+    asTsMs,
     createMeta,
     eventBus as defaultEventBus,
     type DataSourceDegraded,
@@ -115,7 +116,7 @@ export class GlobalDataGateway {
                 sourceId: providerId,
                 recoveredTs: ts,
                 lastErrorTs: state.lastErrorTs,
-                meta: createMeta('global_data', { ts }),
+                meta: createMeta('global_data', { tsEvent: asTsMs(ts) }),
             };
             this.bus.publish('data:sourceRecovered', evt);
         }
@@ -133,7 +134,7 @@ export class GlobalDataGateway {
             reason,
             lastSuccessTs: state.lastSuccessTs,
             consecutiveErrors: state.consecutiveErrors,
-            meta: createMeta('global_data', { ts }),
+            meta: createMeta('global_data', { tsEvent: asTsMs(ts) }),
         };
         this.bus.publish('data:sourceDegraded', evt);
         logger.warn(m('warn', `[GlobalDataGateway] source degraded provider=${providerId} reason=${reason}`));

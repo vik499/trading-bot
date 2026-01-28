@@ -20,6 +20,7 @@ describe('Orderbook gap detection -> resync', () => {
       eventBus: bus,
       restClient,
       supportsOrderbook: true,
+      marketType: 'spot',
     });
 
     await (client as any).ensureDepthSnapshot('BTCUSDT');

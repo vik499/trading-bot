@@ -180,7 +180,7 @@ export class SnapshotCoordinator {
     }
 
     private buildMeta(parent: EventMeta) {
-        return inheritMeta(parent, 'state', { ts: parent.ts });
+        return inheritMeta(parent, 'state', { tsEvent: parent.tsEvent ?? parent.ts });
     }
 
     private parseSnapshot(raw: string): SnapshotFile {

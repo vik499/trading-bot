@@ -1,6 +1,7 @@
 import { logger } from '../infra/logger';
 import { m } from '../core/logMarkers';
 import {
+    asTsMs,
     createMeta,
     eventBus as defaultEventBus,
     type DataMismatch,
@@ -173,7 +174,7 @@ export class GlobalDataQualityMonitor {
             lastTs: last,
             currentTs: evt.ts,
             expectedMs: expected,
-            meta: createMeta('global_data', { ts: evt.meta.ts }),
+            meta: createMeta('global_data', { tsEvent: asTsMs(evt.meta.tsEvent) }),
         };
         this.bus.publish('data:stale', payload);
         this.logThrottled(`${key}:stale`, evt.meta.ts, `[GlobalData] stale topic=${topic} symbol=${evt.symbol} deltaMs=${delta}`);
@@ -214,7 +215,7 @@ export class GlobalDataQualityMonitor {
                 ts: evt.ts,
                 values: Object.fromEntries(values),
                 thresholdPct: this.config.mismatchThresholdPct,
-                meta: createMeta('global_data', { ts: evt.meta.ts }),
+                meta: createMeta('global_data', { tsEvent: asTsMs(evt.meta.tsEvent) }),
             };
             this.bus.publish('data:mismatch', payload);
             this.logThrottled(
@@ -261,7 +262,7 @@ export class GlobalDataQualityMonitor {
             freshSourcesCount,
             staleSourcesDropped: staleSourcesDropped.length ? staleSourcesDropped : undefined,
             mismatchDetected,
-            meta: createMeta('global_data', { ts: evt.meta.ts }),
+            meta: createMeta('global_data', { tsEvent: asTsMs(evt.meta.tsEvent) }),
         };
         this.bus.publish('data:confidence', payload);
     }
@@ -298,7 +299,7 @@ export class GlobalDataQualityMonitor {
                 sourceId,
                 reason,
                 lastSuccessTs: state.lastSuccessTs,
-                meta: createMeta('global_data', { ts }),
+                meta: createMeta('global_data', { tsEvent: asTsMs(ts) }),
             });
         }
         this.degradedByKey.set(key, state);
@@ -313,7 +314,7 @@ export class GlobalDataQualityMonitor {
                 sourceId: state.sourceId,
                 recoveredTs: ts,
                 lastErrorTs: state.lastErrorTs,
-                meta: createMeta('global_data', { ts }),
+                meta: createMeta('global_data', { tsEvent: asTsMs(ts) }),
             });
             this.degradedByKey.delete(key);
             return;

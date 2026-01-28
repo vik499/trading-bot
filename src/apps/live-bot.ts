@@ -131,6 +131,10 @@ function getReadinessBucketMs(): number {
 }
 
 function getReadinessWarmupMs(): number {
+    const isDev = process.env.NODE_ENV !== 'production' || process.argv.includes('--dev');
+    if (isDev) {
+        return parseIntervalMs(process.env.BOT_READINESS_WARMUP_MS_DEV, 15_000);
+    }
     return parseIntervalMs(process.env.BOT_READINESS_WARMUP_MS, 30 * 60_000);
 }
 
@@ -144,6 +148,26 @@ function getReadinessLogMs(): number {
 
 function getReadinessStartupGraceMs(): number {
     return parseIntervalMs(process.env.BOT_READINESS_STARTUP_GRACE_MS, 10_000);
+}
+
+function getReadinessStabilityWindowMs(): number {
+    return parseIntervalMs(process.env.BOT_READINESS_STABILITY_WINDOW_MS, 10_000);
+}
+
+function getReadinessLagWindowMs(): number {
+    return parseIntervalMs(process.env.BOT_READINESS_LAG_WINDOW_MS, 30_000);
+}
+
+function getReadinessLagThresholdMs(): number {
+    return parseIntervalMs(process.env.BOT_READINESS_LAG_THRESHOLD_MS, 2_000);
+}
+
+function getReadinessLagEwmaAlpha(): number {
+    return parseNumber(process.env.BOT_READINESS_LAG_EWMA_ALPHA, 0.2);
+}
+
+function getReadinessTimebasePenaltyWindowMs(): number {
+    return parseIntervalMs(process.env.BOT_READINESS_TIMEBASE_PENALTY_WINDOW_MS, 10_000);
 }
 
 function getDerivativesStaleWindowMs(): number {
@@ -423,7 +447,7 @@ class LiveBotApp {
             new MarketGateway(okxWs, okxRestClient, eventBus, derivativesPoller, {
                 venue: 'okx',
                 marketType: 'futures',
-                topicFilter: (topic) => !topic.startsWith('kline.'),
+                topicFilter: (topic: string) => !topic.startsWith('kline.'),
             }),
         ];
         if (okxKlineWs) {
@@ -434,7 +458,7 @@ class LiveBotApp {
                     enableKlineBootstrap: false,
                     enableResync: false,
                     resyncStrategy: 'ignore',
-                    topicFilter: (topic) => topic.startsWith('kline.'),
+                    topicFilter: (topic: string) => topic.startsWith('kline.'),
                 })
             );
         }
@@ -471,7 +495,7 @@ class LiveBotApp {
                     enableResync: false,
                     venue: 'okx',
                     marketType: 'spot',
-                    topicFilter: (topic) => !topic.startsWith('kline.'),
+                    topicFilter: (topic: string) => !topic.startsWith('kline.'),
                 })
             );
             if (okxSpotKlineWs) {
@@ -482,7 +506,7 @@ class LiveBotApp {
                         resyncStrategy: 'ignore',
                         venue: 'okx',
                         marketType: 'spot',
-                        topicFilter: (topic) => topic.startsWith('kline.'),
+                        topicFilter: (topic: string) => topic.startsWith('kline.'),
                     })
                 );
             }
@@ -582,6 +606,11 @@ class LiveBotApp {
             derivativesStaleWindowMs,
             targetMarketType: getTargetMarketType(),
             startupGraceWindowMs: getReadinessStartupGraceMs(),
+            readinessStabilityWindowMs: getReadinessStabilityWindowMs(),
+            lagWindowMs: getReadinessLagWindowMs(),
+            lagThresholdMs: getReadinessLagThresholdMs(),
+            lagEwmaAlpha: getReadinessLagEwmaAlpha(),
+            timebasePenaltyWindowMs: getReadinessTimebasePenaltyWindowMs(),
         });
         const targetMarketType = readinessTargetMarketType;
         const symbols = readSymbols();

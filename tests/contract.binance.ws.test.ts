@@ -3,7 +3,15 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { BinancePublicWsClient } from '../src/exchange/binance/wsClient';
 import { createTestEventBus } from '../src/core/events/testing';
-import type { OrderbookLevel, OrderbookL2DeltaEvent, OrderbookL2SnapshotEvent, TradeEvent, KlineEvent, LiquidationEvent } from '../src/core/events/EventBus';
+import type {
+  MarketResyncRequested,
+  OrderbookLevel,
+  OrderbookL2DeltaEvent,
+  OrderbookL2SnapshotEvent,
+  TradeEvent,
+  KlineEvent,
+  LiquidationEvent,
+} from '../src/core/events/EventBus';
 
 const load = (name: string) =>
   JSON.parse(readFileSync(path.join(__dirname, 'fixtures', 'exchanges', 'binance', name), 'utf-8')) as Record<string, unknown>;
@@ -25,7 +33,7 @@ const toLevels = (raw: unknown): OrderbookLevel[] => {
 describe('Binance WS contracts', () => {
   it('maps aggTrade to market:trade', () => {
     const bus = createTestEventBus();
-    const client = new BinancePublicWsClient('ws://test', { eventBus: bus });
+    const client = new BinancePublicWsClient('ws://test', { eventBus: bus, marketType: 'spot' });
     const outputs: TradeEvent[] = [];
     bus.subscribe('market:trade', (evt) => outputs.push(evt));
 
@@ -56,7 +64,7 @@ describe('Binance WS contracts', () => {
 
   it('maps depthUpdate to orderbook snapshot + delta with injected snapshot', () => {
     const bus = createTestEventBus();
-    const client = new BinancePublicWsClient('ws://test', { eventBus: bus });
+    const client = new BinancePublicWsClient('ws://test', { eventBus: bus, marketType: 'spot' });
     const snapshots: OrderbookL2SnapshotEvent[] = [];
     const deltas: OrderbookL2DeltaEvent[] = [];
     bus.subscribe('market:orderbook_l2_snapshot', (evt) => snapshots.push(evt));
@@ -94,6 +102,39 @@ describe('Binance WS contracts', () => {
     expect(deltas).toHaveLength(1);
     expect(snapshots[0].updateId).toBe(0);
     expect(deltas[0].updateId).toBe(1);
+  });
+
+  it('processes futures depth updates with pu sequencing', async () => {
+    const bus = createTestEventBus();
+    const client = new BinancePublicWsClient('ws://test', {
+      eventBus: bus,
+      marketType: 'futures',
+      restClient: {
+        fetchDepthSnapshot: async () => ({ lastUpdateId: 10, bids: [], asks: [] }),
+      } as any,
+    });
+    const snapshots: OrderbookL2SnapshotEvent[] = [];
+    const deltas: OrderbookL2DeltaEvent[] = [];
+    const resyncs: MarketResyncRequested[] = [];
+    bus.subscribe('market:orderbook_l2_snapshot', (evt) => snapshots.push(evt));
+    bus.subscribe('market:orderbook_l2_delta', (evt) => deltas.push(evt));
+    bus.subscribe('market:resync_requested', (evt) => resyncs.push(evt));
+
+    await (client as any).ensureDepthSnapshot('BTCUSDT');
+
+    (client as any).handleDepth({ s: 'BTCUSDT', U: 10, u: 10, pu: 9, E: 1000, b: [], a: [] });
+    (client as any).handleDepth({ s: 'BTCUSDT', U: 11, u: 11, pu: 10, E: 1010, b: [], a: [] });
+
+    expect(snapshots).toHaveLength(1);
+    expect(deltas).toHaveLength(2);
+    expect(deltas[0].updateId).toBe(10);
+    expect(deltas[1].updateId).toBe(11);
+    expect(resyncs).toHaveLength(0);
+
+    (client as any).handleDepth({ s: 'BTCUSDT', U: 12, u: 12, pu: 9, E: 1020, b: [], a: [] });
+
+    expect(resyncs).toHaveLength(1);
+    expect(resyncs[0].reason).toBe('out_of_order');
   });
 
   it('maps liquidation to market:liquidation', () => {

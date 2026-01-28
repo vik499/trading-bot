@@ -108,7 +108,7 @@ export class LiquidityEngine {
       depthBid,
       depthAsk,
       imbalance,
-      meta: inheritMeta(parentMeta, 'analytics', { ts: parentMeta.ts }),
+      meta: inheritMeta(parentMeta, 'analytics', { tsEvent: parentMeta.tsEvent ?? parentMeta.ts }),
     };
 
     this.bus.publish('analytics:liquidity', payload);

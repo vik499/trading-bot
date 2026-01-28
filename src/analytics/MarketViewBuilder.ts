@@ -257,7 +257,7 @@ export class MarketViewBuilder {
             flow: state.flow,
             liquidity: state.liquidity,
             sourceTopics: Array.from(state.sourceTopics),
-            meta: inheritMeta(parentMeta, 'analytics', { ts: parentMeta.ts }),
+            meta: inheritMeta(parentMeta, 'analytics', { tsEvent: parentMeta.tsEvent ?? parentMeta.ts }),
         };
         this.bus.publish('analytics:market_view', payload);
     }

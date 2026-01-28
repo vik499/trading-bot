@@ -14,7 +14,17 @@ export interface ConfidenceInputs {
     sourceCap?: number;
 }
 
+export interface ConfidenceExplain {
+    score: number;
+    penalties: Array<{ reason: string; value: number }>;
+    inputs: Record<string, number | boolean | undefined>;
+}
+
 export function computeConfidenceScore(inputs: ConfidenceInputs): number {
+    return computeConfidenceExplain(inputs).score;
+}
+
+export function computeConfidenceExplain(inputs: ConfidenceInputs): ConfidenceExplain {
     const fresh = Math.max(0, inputs.freshSourcesCount ?? 0);
     const stale = Math.max(0, inputs.staleSourcesDroppedCount ?? 0);
     const expected = inputs.expectedSources ?? 0;
@@ -22,20 +32,62 @@ export function computeConfidenceScore(inputs: ConfidenceInputs): number {
 
     const base = expected > 0 ? clamp01(fresh / expected) : total > 0 ? clamp01(fresh / total) : 0;
 
+    const penalties: Array<{ reason: string; value: number }> = [];
     let score = base;
-    if (inputs.mismatchDetected) score *= 0.5;
-    if (inputs.gapDetected) score *= 0.7;
-    if (inputs.sequenceBroken) score *= 0.5;
-    if (inputs.lagDetected) score *= 0.8;
-    if (inputs.outlierDetected) score *= 0.8;
-    if (inputs.fallbackPenalty !== undefined) score *= clamp01(inputs.fallbackPenalty);
-    if (inputs.sourcePenalty !== undefined) score *= clamp01(inputs.sourcePenalty);
-
-    if (inputs.sourceCap !== undefined) {
-        score = Math.min(score, clamp01(inputs.sourceCap));
+    if (inputs.mismatchDetected) {
+        penalties.push({ reason: 'mismatchDetected', value: 0.5 });
+        score *= 0.5;
+    }
+    if (inputs.gapDetected) {
+        penalties.push({ reason: 'gapDetected', value: 0.7 });
+        score *= 0.7;
+    }
+    if (inputs.sequenceBroken) {
+        penalties.push({ reason: 'sequenceBroken', value: 0.5 });
+        score *= 0.5;
+    }
+    if (inputs.lagDetected) {
+        penalties.push({ reason: 'lagDetected', value: 0.8 });
+        score *= 0.8;
+    }
+    if (inputs.outlierDetected) {
+        penalties.push({ reason: 'outlierDetected', value: 0.8 });
+        score *= 0.8;
+    }
+    if (inputs.fallbackPenalty !== undefined) {
+        const penalty = clamp01(inputs.fallbackPenalty);
+        penalties.push({ reason: 'fallbackPenalty', value: penalty });
+        score *= penalty;
+    }
+    if (inputs.sourcePenalty !== undefined) {
+        const penalty = clamp01(inputs.sourcePenalty);
+        penalties.push({ reason: 'sourcePenalty', value: penalty });
+        score *= penalty;
     }
 
-    return clamp01(score);
+    if (inputs.sourceCap !== undefined) {
+        const cap = clamp01(inputs.sourceCap);
+        penalties.push({ reason: 'sourceCap', value: cap });
+        score = Math.min(score, cap);
+    }
+
+    return {
+        score: clamp01(score),
+        penalties,
+        inputs: {
+            freshSourcesCount: fresh,
+            expectedSources: expected || undefined,
+            staleSourcesDroppedCount: stale || undefined,
+            mismatchDetected: inputs.mismatchDetected ?? undefined,
+            gapDetected: inputs.gapDetected ?? undefined,
+            sequenceBroken: inputs.sequenceBroken ?? undefined,
+            lagDetected: inputs.lagDetected ?? undefined,
+            outlierDetected: inputs.outlierDetected ?? undefined,
+            fallbackPenalty: inputs.fallbackPenalty,
+            sourcePenalty: inputs.sourcePenalty,
+            sourceCap: inputs.sourceCap,
+        },
+    };
 }
 
 export type TrustContext = 'liquidation' | 'trade';

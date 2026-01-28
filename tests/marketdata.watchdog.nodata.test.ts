@@ -15,6 +15,7 @@ describe('MarketDataReadiness no-data watchdog', () => {
       noDataWindowMs: 500,
       logIntervalMs: 0,
       sourceRegistry: registry,
+      readinessStabilityWindowMs: 0,
     });
 
     const statuses: MarketDataStatusPayload[] = [];
@@ -47,6 +48,6 @@ describe('MarketDataReadiness no-data watchdog', () => {
 
     const last = statuses[statuses.length - 1];
     expect(last).toBeTruthy();
-    expect(last?.degradedReasons).toContain('LAG_TOO_HIGH');
+    expect(last?.degradedReasons).toContain('NO_DATA');
   });
 });

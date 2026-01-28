@@ -236,7 +236,7 @@ export class StrategyEngine {
     }
 
     private buildMeta(parent: EventMeta) {
-        return inheritMeta(parent, 'strategy', { ts: parent.ts });
+        return inheritMeta(parent, 'strategy', { tsEvent: parent.tsEvent ?? parent.ts });
     }
 
     private ensureState(symbol: string): SymbolState {

@@ -39,7 +39,7 @@ export class InMemoryFeatureStore implements FeatureStore {
                 symbol: features.symbol,
                 featureVersion: 'v1',
                 features: featuresMap,
-                meta: inheritMeta(features.meta, 'research', { ts: features.meta.ts }),
+                meta: inheritMeta(features.meta, 'research', { tsEvent: features.meta.tsEvent ?? features.meta.ts }),
             };
             this.recordFeatureVector(recorded);
             this.bus.publish('research:featureVectorRecorded', recorded);

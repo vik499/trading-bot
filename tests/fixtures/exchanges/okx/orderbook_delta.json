@@ -1,1 +1,1 @@
-{"arg":{"channel":"books","instId":"BTC-USDT-SWAP"},"action":"update","data":[{"ts":"1700000001000","bids":[["100","2"]],"asks":[["101","1"]]}]}
+{"arg":{"channel":"books","instId":"BTC-USDT-SWAP"},"action":"update","data":[{"ts":"1700000001000","seqId":"2","prevSeqId":"1","bids":[["100","2"]],"asks":[["101","1"]]}]}

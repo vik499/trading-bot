@@ -127,7 +127,7 @@ export class BacktestMetricsCollector {
   }
 
   private buildMeta(parent: EventMeta): EventMeta {
-    return inheritMeta(parent, 'metrics', { ts: parent.ts });
+    return inheritMeta(parent, 'metrics', { tsEvent: parent.tsEvent ?? parent.ts });
   }
 
   private subscribe<T extends keyof import('../core/events/EventBus').BotEventMap>(
