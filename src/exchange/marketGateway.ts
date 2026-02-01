@@ -8,6 +8,7 @@ import {
     nowMs,
     type EventMeta,
     type EventBus,
+    type StreamSource,
     type Kline,
     type KlineBootstrapCompleted,
     type KlineBootstrapFailed,
@@ -301,6 +302,7 @@ export class MarketGateway {
             }
 
             const sourceId = normalizeKlineSourceId(this.restClient.streamId ?? 'unknown');
+            const metaSource = isStreamSource(sourceId) ? sourceId : 'market';
             const marketType =
                 payload.marketType ??
                 this.asKnownMarketType(this.restClient.marketType) ??
@@ -312,7 +314,7 @@ export class MarketGateway {
                     tf: kline.tf ?? payload.tf,
                     streamId: sourceId,
                     marketType,
-                    meta: createMeta('market', {
+                    meta: createMeta(metaSource, {
                         tsEvent: asTsMs(kline.endTs),
                         tsIngest: asTsMs(nowMs()),
                         correlationId: payload.meta.correlationId,
@@ -507,6 +509,10 @@ function normalizeKlineSourceId(streamId: string): string {
         return streamId.replace('.kline', '');
     }
     return streamId;
+}
+
+function isStreamSource(value: string): value is StreamSource {
+    return value.startsWith('bybit.') || value.startsWith('binance.') || value.startsWith('okx.');
 }
 
 function readFlagFromEnv(name: string, fallback = true): boolean {

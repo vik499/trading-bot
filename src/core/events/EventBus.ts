@@ -25,6 +25,8 @@ export const asTsMs = (value: number): TsMs => value as TsMs;
 export const asSeq = (value: number): Seq => value as Seq;
 
 // Откуда пришло событие/команда (помогает понимать, кто инициировал действие)
+export type StreamSource = `${'bybit' | 'binance' | 'okx'}.${string}`;
+
 export type EventSource =
     | 'cli'
     | 'telegram'
@@ -32,6 +34,7 @@ export type EventSource =
     | 'market'
     | 'binance'
     | 'okx'
+    | StreamSource
     | 'global_data'
     | 'replay'
     | 'analytics'
