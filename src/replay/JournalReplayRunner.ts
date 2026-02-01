@@ -2,6 +2,7 @@ import { createReadStream, type Dirent } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import readline from 'node:readline';
+import { inferMarketTypeFromStreamId } from '../core/market/symbols';
 import {
   createMeta,
   eventBus,
@@ -379,60 +380,155 @@ export class JournalReplayRunner {
 
       const metaTs = resolveReplayMetaTs(record);
       if (record.topic === 'market:ticker') {
+        const raw = record.payload as TickerEvent;
+        const streamId = raw.streamId ?? record.streamId;
+        const marketType = raw.marketType ?? inferMarketTypeFromStreamId(streamId) ?? 'futures';
         const payload: TickerEvent = {
-          ...(record.payload as TickerEvent),
-          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
+          ...raw,
+          streamId,
+          marketType,
+          meta: createMeta('replay', {
+            tsEvent: asTsMs(metaTs),
+            tsIngest: asTsMs(record.tsIngest),
+            tsExchange: raw.meta?.tsExchange,
+            sequence: raw.meta?.sequence,
+            streamId,
+            correlationId: raw.meta?.correlationId,
+          }),
         };
         this.bus.publish('market:ticker', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:kline') {
+        const raw = record.payload as KlineEvent;
+        const streamId = raw.streamId ?? record.streamId;
+        const marketType = raw.marketType ?? inferMarketTypeFromStreamId(streamId) ?? 'futures';
         const payload: KlineEvent = {
-          ...(record.payload as KlineEvent),
-          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
+          ...raw,
+          streamId,
+          marketType,
+          meta: createMeta('replay', {
+            tsEvent: asTsMs(metaTs),
+            tsIngest: asTsMs(record.tsIngest),
+            tsExchange: raw.meta?.tsExchange,
+            sequence: raw.meta?.sequence,
+            streamId,
+            correlationId: raw.meta?.correlationId,
+          }),
         };
         this.bus.publish('market:kline', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:trade') {
+        const raw = record.payload as TradeEvent;
+        const streamId = raw.streamId ?? record.streamId;
+        const marketType = raw.marketType ?? inferMarketTypeFromStreamId(streamId) ?? 'futures';
         const payload: TradeEvent = {
-          ...(record.payload as TradeEvent),
-          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
+          ...raw,
+          streamId,
+          marketType,
+          meta: createMeta('replay', {
+            tsEvent: asTsMs(metaTs),
+            tsIngest: asTsMs(record.tsIngest),
+            tsExchange: raw.meta?.tsExchange,
+            sequence: raw.meta?.sequence,
+            streamId,
+            correlationId: raw.meta?.correlationId,
+          }),
         };
         this.bus.publish('market:trade', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:orderbook_l2_snapshot') {
+        const raw = record.payload as OrderbookL2SnapshotEvent;
+        const streamId = raw.streamId ?? record.streamId;
+        const marketType = raw.marketType ?? inferMarketTypeFromStreamId(streamId) ?? 'futures';
         const payload: OrderbookL2SnapshotEvent = {
-          ...(record.payload as OrderbookL2SnapshotEvent),
-          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
+          ...raw,
+          streamId,
+          marketType,
+          meta: createMeta('replay', {
+            tsEvent: asTsMs(metaTs),
+            tsIngest: asTsMs(record.tsIngest),
+            tsExchange: raw.meta?.tsExchange,
+            sequence: raw.meta?.sequence,
+            streamId,
+            correlationId: raw.meta?.correlationId,
+          }),
         };
         this.bus.publish('market:orderbook_l2_snapshot', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:orderbook_l2_delta') {
+        const raw = record.payload as OrderbookL2DeltaEvent;
+        const streamId = raw.streamId ?? record.streamId;
+        const marketType = raw.marketType ?? inferMarketTypeFromStreamId(streamId) ?? 'futures';
         const payload: OrderbookL2DeltaEvent = {
-          ...(record.payload as OrderbookL2DeltaEvent),
-          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
+          ...raw,
+          streamId,
+          marketType,
+          meta: createMeta('replay', {
+            tsEvent: asTsMs(metaTs),
+            tsIngest: asTsMs(record.tsIngest),
+            tsExchange: raw.meta?.tsExchange,
+            sequence: raw.meta?.sequence,
+            streamId,
+            correlationId: raw.meta?.correlationId,
+          }),
         };
         this.bus.publish('market:orderbook_l2_delta', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:oi') {
         const raw = record.payload as OpenInterestEvent;
+        const streamId = raw.streamId ?? record.streamId;
+        const marketType = raw.marketType ?? inferMarketTypeFromStreamId(streamId) ?? 'futures';
         const payload: OpenInterestEvent = {
           ...raw,
+          streamId,
+          marketType,
           openInterestUnit: raw.openInterestUnit ?? 'base',
-          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
+          meta: createMeta('replay', {
+            tsEvent: asTsMs(metaTs),
+            tsIngest: asTsMs(record.tsIngest),
+            tsExchange: raw.meta?.tsExchange,
+            sequence: raw.meta?.sequence,
+            streamId,
+            correlationId: raw.meta?.correlationId,
+          }),
         };
         this.bus.publish('market:oi', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:funding') {
+        const raw = record.payload as FundingRateEvent;
+        const streamId = raw.streamId ?? record.streamId;
+        const marketType = raw.marketType ?? inferMarketTypeFromStreamId(streamId) ?? 'futures';
         const payload: FundingRateEvent = {
-          ...(record.payload as FundingRateEvent),
-          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
+          ...raw,
+          streamId,
+          marketType,
+          meta: createMeta('replay', {
+            tsEvent: asTsMs(metaTs),
+            tsIngest: asTsMs(record.tsIngest),
+            tsExchange: raw.meta?.tsExchange,
+            sequence: raw.meta?.sequence,
+            streamId,
+            correlationId: raw.meta?.correlationId,
+          }),
         };
         this.bus.publish('market:funding', payload);
         stats.emittedCount += 1;
       } else if (record.topic === 'market:liquidation') {
+        const raw = record.payload as LiquidationEvent;
+        const streamId = raw.streamId ?? record.streamId;
+        const marketType = raw.marketType ?? inferMarketTypeFromStreamId(streamId) ?? 'futures';
         const payload: LiquidationEvent = {
-          ...(record.payload as LiquidationEvent),
-          meta: createMeta('replay', { tsEvent: asTsMs(metaTs) }),
+          ...raw,
+          streamId,
+          marketType,
+          meta: createMeta('replay', {
+            tsEvent: asTsMs(metaTs),
+            tsIngest: asTsMs(record.tsIngest),
+            tsExchange: raw.meta?.tsExchange,
+            sequence: raw.meta?.sequence,
+            streamId,
+            correlationId: raw.meta?.correlationId,
+          }),
         };
         this.bus.publish('market:liquidation', payload);
         stats.emittedCount += 1;

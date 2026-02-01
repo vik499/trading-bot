@@ -87,11 +87,13 @@ const makeTrade = (ts: number): TradeEvent => ({
 describe('Integration readiness reaches READY (futures only)', () => {
   it('reaches READY with synthetic futures stream', () => {
     const bus = createTestEventBus();
+    const NOW = 2000;
     const readiness = new MarketDataReadiness(bus, {
       bucketMs: 1000,
       warmingWindowMs: 1000,
       logIntervalMs: 0,
       targetMarketType: 'futures',
+      now: () => NOW,
       expectedSourcesByBlock: {
         price: ['binance.usdm.public'],
         flow: ['binance.usdm.public'],

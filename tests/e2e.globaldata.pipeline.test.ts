@@ -54,7 +54,7 @@ describe('E2E global data pipeline', () => {
       tradeTs: 900,
       exchangeTs: 900,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 1000 }),
+      meta: createMeta('market', { tsEvent: 900, tsIngest: 1000, streamId: 's1' }),
     };
     const trade2: TradeEvent = {
       symbol: 'BTCUSDT',
@@ -65,7 +65,7 @@ describe('E2E global data pipeline', () => {
       tradeTs: 1900,
       exchangeTs: 1900,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 2100 }),
+      meta: createMeta('market', { tsEvent: 1900, tsIngest: 2100, streamId: 's1' }),
     };
     bus.publish('market:trade', trade1);
     bus.publish('market:trade', trade2);
@@ -75,16 +75,17 @@ describe('E2E global data pipeline', () => {
       streamId: 's1',
       updateId: 1,
       exchangeTs: 2500,
+      marketType: 'futures',
       bids: [{ price: 100, size: 1 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 2500 }),
+      meta: createMeta('market', { tsEvent: 2500, tsIngest: 2500, streamId: 's1' }),
     };
     bus.publish('market:orderbook_l2_snapshot', snapshot);
     bus.publish('market:orderbook_l2_snapshot', {
       ...snapshot,
       updateId: 2,
       exchangeTs: 3200,
-      meta: createMeta('market', { ts: 3200 }),
+      meta: createMeta('market', { tsEvent: 3200, tsIngest: 3200, streamId: 's1' }),
     });
 
     const liq1: LiquidationEvent = {
@@ -95,7 +96,8 @@ describe('E2E global data pipeline', () => {
       size: 1,
       notionalUsd: 100,
       exchangeTs: 2600,
-      meta: createMeta('market', { ts: 2600 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 2600, tsIngest: 2600, streamId: 's1' }),
     };
     const liq2: LiquidationEvent = {
       symbol: 'BTCUSDT',
@@ -105,7 +107,8 @@ describe('E2E global data pipeline', () => {
       size: 1,
       notionalUsd: 200,
       exchangeTs: 3100,
-      meta: createMeta('market', { ts: 3100 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 3100, tsIngest: 3100, streamId: 's1' }),
     };
     bus.publish('market:liquidation', liq1);
     bus.publish('market:liquidation', liq2);
@@ -113,9 +116,10 @@ describe('E2E global data pipeline', () => {
     const ticker: TickerEvent = {
       symbol: 'BTCUSDT',
       streamId: 's1',
+      marketType: 'futures',
       indexPrice: '100',
       exchangeTs: 3200,
-      meta: createMeta('market', { ts: 3200 }),
+      meta: createMeta('market', { tsEvent: 3200, tsIngest: 3200, streamId: 's1' }),
     };
     bus.publish('market:ticker', ticker);
 

@@ -97,7 +97,7 @@ export class LiquidityAggregator {
     private onSnapshot(evt: OrderbookL2SnapshotEvent): void {
         if (!evt.streamId) return;
         const normalizedSymbol = normalizeSymbol(evt.symbol);
-        const normalizedMarketType = normalizeMarketType(evt.marketType ?? 'unknown');
+        const normalizedMarketType = normalizeMarketType(evt.marketType);
         const key = this.key(normalizedSymbol, normalizedMarketType);
         const state = this.ensureState(key, evt.streamId);
         state.bids = toLevelMap(evt.bids);
@@ -113,7 +113,7 @@ export class LiquidityAggregator {
     private onDelta(evt: OrderbookL2DeltaEvent): void {
         if (!evt.streamId) return;
         const normalizedSymbol = normalizeSymbol(evt.symbol);
-        const normalizedMarketType = normalizeMarketType(evt.marketType ?? 'unknown');
+        const normalizedMarketType = normalizeMarketType(evt.marketType);
         const key = this.key(normalizedSymbol, normalizedMarketType);
         const state = this.ensureState(key, evt.streamId);
         if (!state.hasSnapshot || state.status === 'RESYNCING') {
@@ -202,6 +202,7 @@ export class LiquidityAggregator {
         sources: Map<string, VenueLiquidity>
     ): void {
         const normalizedSymbol = normalizeSymbol(symbol);
+        if (marketType === 'unknown') return;
         let bestBid = 0;
         let bestAsk = 0;
         let spread = 0;

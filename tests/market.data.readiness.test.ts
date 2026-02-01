@@ -17,11 +17,12 @@ import { MarketDataReadiness } from '../src/observability/MarketDataReadiness';
 const makePrice = (ts: number, confidenceScore = 0.9): MarketPriceCanonicalEvent => ({
   symbol: 'BTCUSDT',
   ts,
+  marketType: 'futures',
   indexPrice: 100,
   sourcesUsed: ['s1'],
   freshSourcesCount: 1,
   confidenceScore,
-  meta: createMeta('global_data', { ts }),
+  meta: createMeta('global_data', { tsEvent: ts, tsIngest: ts }),
 });
 
 const makeCvd = (ts: number, confidenceScore = 0.9): MarketCvdAggEvent => ({
@@ -36,7 +37,7 @@ const makeCvd = (ts: number, confidenceScore = 0.9): MarketCvdAggEvent => ({
   sourcesUsed: ['s1'],
   confidenceScore,
   marketType: 'spot',
-  meta: createMeta('global_data', { ts }),
+  meta: createMeta('global_data', { tsEvent: ts, tsIngest: ts }),
 });
 
 const makeLiquidity = (ts: number, confidenceScore = 0.9): MarketLiquidityAggEvent => ({
@@ -51,7 +52,8 @@ const makeLiquidity = (ts: number, confidenceScore = 0.9): MarketLiquidityAggEve
   depthMethod: 'levels',
   sourcesUsed: ['s1'],
   confidenceScore,
-  meta: createMeta('global_data', { ts }),
+  marketType: 'futures',
+  meta: createMeta('global_data', { tsEvent: ts, tsIngest: ts }),
 });
 
 const makeOi = (ts: number, confidenceScore = 0.9): MarketOpenInterestAggEvent => ({
@@ -61,7 +63,8 @@ const makeOi = (ts: number, confidenceScore = 0.9): MarketOpenInterestAggEvent =
   openInterestUnit: 'base',
   sourcesUsed: ['s1'],
   confidenceScore,
-  meta: createMeta('global_data', { ts }),
+  marketType: 'futures',
+  meta: createMeta('global_data', { tsEvent: ts, tsIngest: ts }),
 });
 
 const makeFunding = (ts: number, confidenceScore = 0.9): MarketFundingAggEvent => ({
@@ -70,7 +73,8 @@ const makeFunding = (ts: number, confidenceScore = 0.9): MarketFundingAggEvent =
   fundingRate: 0.0001,
   sourcesUsed: ['s1'],
   confidenceScore,
-  meta: createMeta('global_data', { ts }),
+  marketType: 'futures',
+  meta: createMeta('global_data', { tsEvent: ts, tsIngest: ts }),
 });
 
 const makeLiq = (ts: number, confidenceScore = 0.9): MarketLiquidationsAggEvent => ({
@@ -81,7 +85,8 @@ const makeLiq = (ts: number, confidenceScore = 0.9): MarketLiquidationsAggEvent 
   unit: 'usd',
   sourcesUsed: ['s1'],
   confidenceScore,
-  meta: createMeta('global_data', { ts }),
+  marketType: 'futures',
+  meta: createMeta('global_data', { tsEvent: ts, tsIngest: ts }),
 });
 
 const makeTrade = (ts: number, marketType: 'spot' | 'futures', streamId: string): TradeEvent => ({
@@ -93,7 +98,7 @@ const makeTrade = (ts: number, marketType: 'spot' | 'futures', streamId: string)
   tradeTs: ts,
   exchangeTs: ts,
   marketType,
-  meta: createMeta('market', { ts }),
+  meta: createMeta('market', { tsEvent: ts, tsIngest: ts, streamId }),
 });
 
 const makeLagTrade = (tsEvent: number, tsIngest: number): TradeEvent => ({
@@ -462,7 +467,8 @@ describe('MarketDataReadiness', () => {
     readiness.stop();
   });
 
-  it('computes lag from ingestTs-tsEvent', () => {
+  it('degrades on processing lag', () => {
+    let now = 10_000;
     const bus = createTestEventBus();
     const readiness = new MarketDataReadiness(bus, {
       bucketMs: 1000,
@@ -470,8 +476,9 @@ describe('MarketDataReadiness', () => {
       expectedSources: 1,
       logIntervalMs: 0,
       readinessStabilityWindowMs: 0,
-      lagThresholdMs: 1000,
-      lagWindowMs: 10_000,
+      lagThresholdMs: 2000,
+      lagWindowMs: 30_000,
+      now: () => now,
       expectedSourcesByBlock: {
         price: ['s1'],
         flow: [],
@@ -483,11 +490,162 @@ describe('MarketDataReadiness', () => {
     bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
     readiness.start();
 
-    bus.publish('market:trade', makeLagTrade(1000, 4000));
+    bus.publish('market:trade', makeLagTrade(now, now));
+    now += 3001;
     bus.publish('market:price_canonical', makePrice(2000));
 
     const last = outputs[outputs.length - 1];
+    expect(last.degraded).toBe(true);
     expect(last.degradedReasons).toContain('LAG_TOO_HIGH');
+
+    readiness.stop();
+  });
+
+  it('does not degrade on exchange lag, warns instead', () => {
+    const NOW = 1_700_000_000_000;
+    const bus = createTestEventBus();
+    const readiness = new MarketDataReadiness(bus, {
+      bucketMs: 1000,
+      warmingWindowMs: 0,
+      expectedSources: 1,
+      logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
+      lagThresholdMs: 2000,
+      lagWindowMs: 30_000,
+      now: () => NOW,
+      expectedSourcesByBlock: {
+        price: ['s1'],
+        flow: [],
+        liquidity: [],
+        derivatives: [],
+      },
+    });
+    const outputs: MarketDataStatusPayload[] = [];
+    bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
+    readiness.start();
+
+    for (let i = 0; i < 5; i += 1) {
+      bus.publish('market:trade', makeLagTrade(NOW - 3001, NOW));
+    }
+    bus.publish('market:price_canonical', makePrice(NOW));
+
+    const last = outputs[outputs.length - 1];
+    expect(last.degraded).toBe(false);
+    expect(last.degradedReasons).not.toContain('LAG_TOO_HIGH');
+    expect(last.warnings).toContain('EXCHANGE_LAG_TOO_HIGH');
+
+    readiness.stop();
+  });
+
+  it('filters backfill exchange lag samples', () => {
+    const NOW = 1_700_000_000_000;
+    const bus = createTestEventBus();
+    const readiness = new MarketDataReadiness(bus, {
+      bucketMs: 1000,
+      warmingWindowMs: 0,
+      expectedSources: 1,
+      logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
+      lagThresholdMs: 2000,
+      lagWindowMs: 30_000,
+      now: () => NOW,
+      expectedSourcesByBlock: {
+        price: ['s1'],
+        flow: [],
+        liquidity: [],
+        derivatives: [],
+      },
+    });
+    const outputs: MarketDataStatusPayload[] = [];
+    bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
+    readiness.start();
+
+    const backfillTs = NOW - 24 * 60 * 60 * 1000;
+    for (let i = 0; i < 5; i += 1) {
+      bus.publish('market:trade', makeLagTrade(backfillTs, NOW));
+    }
+    bus.publish('market:price_canonical', makePrice(NOW));
+
+    const last = outputs[outputs.length - 1];
+    expect(last.warnings).not.toContain('EXCHANGE_LAG_TOO_HIGH');
+    expect(last.exchangeLagP95Ms).toBeUndefined();
+
+    readiness.stop();
+  });
+
+  it('ignores backfilled raw events for exchange lag sampling', () => {
+    const NOW = 1_700_000_000_000;
+    const bus = createTestEventBus();
+    const readiness = new MarketDataReadiness(bus, {
+      bucketMs: 1000,
+      warmingWindowMs: 0,
+      expectedSources: 1,
+      logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
+      lagThresholdMs: 2000,
+      lagWindowMs: 30_000,
+      now: () => NOW,
+      expectedSourcesByBlock: {
+        price: ['s1'],
+        flow: [],
+        liquidity: [],
+        derivatives: [],
+      },
+    });
+    const outputs: MarketDataStatusPayload[] = [];
+    bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
+    readiness.start();
+
+    const backfillTs = NOW - 24 * 60 * 60 * 1000;
+    bus.publish('market:funding', {
+      symbol: 'BTCUSDT',
+      fundingRate: 0.0001,
+      marketType: 'futures',
+      streamId: 's1',
+      exchangeTs: backfillTs,
+      meta: createMeta('market', { tsEvent: backfillTs, tsIngest: NOW, streamId: 's1' }),
+    });
+    bus.publish('market:price_canonical', makePrice(NOW));
+
+    const last = outputs[outputs.length - 1];
+    expect(last.warnings).not.toContain('EXCHANGE_LAG_TOO_HIGH');
+    expect(last.exchangeLagP95Ms).toBeUndefined();
+
+    readiness.stop();
+  });
+
+  it('keeps live exchange lag warnings', () => {
+    const NOW = 1_700_000_000_000;
+    const bus = createTestEventBus();
+    const readiness = new MarketDataReadiness(bus, {
+      bucketMs: 1000,
+      warmingWindowMs: 0,
+      expectedSources: 1,
+      logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
+      lagThresholdMs: 2000,
+      lagWindowMs: 30_000,
+      now: () => NOW,
+      expectedSourcesByBlock: {
+        price: ['s1'],
+        flow: [],
+        liquidity: [],
+        derivatives: [],
+      },
+    });
+    const outputs: MarketDataStatusPayload[] = [];
+    bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
+    readiness.start();
+
+    for (let i = 0; i < 5; i += 1) {
+      bus.publish('market:trade', makeLagTrade(NOW - 3001, NOW));
+    }
+    bus.publish('market:price_canonical', makePrice(NOW));
+
+    const last = outputs[outputs.length - 1];
+    expect(last.warnings).toContain('EXCHANGE_LAG_TOO_HIGH');
+    expect(last.exchangeLagP95Ms).toBeDefined();
+    expect(last.exchangeLagP95Ms ?? 0).toBeGreaterThan(2000);
 
     readiness.stop();
   });
@@ -516,6 +674,82 @@ describe('MarketDataReadiness', () => {
 
     const last = outputs[outputs.length - 1];
     expect(last.degraded).toBe(false);
+
+    readiness.stop();
+  });
+
+  it('tracks unexpected raw venues without inflating used count', () => {
+    const bus = createTestEventBus();
+    const readiness = new MarketDataReadiness(bus, {
+      bucketMs: 1000,
+      warmingWindowMs: 0,
+      logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
+      expectedSourcesByBlock: {
+        price: ['bybit', 'binance'],
+        flow: ['bybit', 'binance'],
+        liquidity: ['bybit', 'binance'],
+        derivatives: [],
+      },
+      expectedFlowTypes: ['spot'],
+      expectedDerivativeKinds: [],
+    });
+    const outputs: MarketDataStatusPayload[] = [];
+    bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
+    readiness.start();
+
+    bus.publish('market:trade', makeTrade(1000, 'spot', 'bybit'));
+    bus.publish('market:trade', makeTrade(1000, 'spot', 'binance'));
+    bus.publish('market:trade', makeTrade(1000, 'spot', 'okx'));
+
+    const bucketTs = 1000;
+    bus.publish('market:price_canonical', { ...makePrice(bucketTs), sourcesUsed: ['bybit'], marketType: 'spot' });
+    bus.publish('market:cvd_spot_agg', { ...makeCvd(bucketTs), sourcesUsed: ['bybit'], marketType: 'spot' });
+    bus.publish('market:liquidity_agg', { ...makeLiquidity(bucketTs), sourcesUsed: ['bybit'], marketType: 'spot' });
+
+    const last = outputs[outputs.length - 1];
+    expect(last.expectedSourcesRaw).toBe(2);
+    expect(last.activeSourcesRaw).toBe(2);
+    expect(last.rawSourcesSeen).toEqual(['binance', 'bybit', 'okx']);
+    expect(last.rawSourcesUsed).toEqual(['binance', 'bybit']);
+    expect(last.rawSourcesUnexpected).toEqual(['okx']);
+
+    readiness.stop();
+  });
+
+  it('uses streamId for raw sources (not venue)', () => {
+    const bus = createTestEventBus();
+    const streamId = 'bybit.public.linear.v5';
+    const readiness = new MarketDataReadiness(bus, {
+      bucketMs: 1000,
+      warmingWindowMs: 0,
+      logIntervalMs: 0,
+      readinessStabilityWindowMs: 0,
+      expectedSourcesByBlock: {
+        price: [streamId],
+        flow: [streamId],
+        liquidity: [streamId],
+        derivatives: [],
+      },
+      expectedFlowTypes: ['spot'],
+      expectedDerivativeKinds: [],
+    });
+    const outputs: MarketDataStatusPayload[] = [];
+    bus.subscribe('system:market_data_status', (evt) => outputs.push(evt));
+    readiness.start();
+
+    bus.publish('market:trade', makeTrade(1000, 'spot', streamId));
+    bus.publish('market:trade', makeTrade(1000, 'spot', 'bybit'));
+
+    const bucketTs = 1000;
+    bus.publish('market:price_canonical', { ...makePrice(bucketTs), sourcesUsed: [streamId], marketType: 'spot' });
+    bus.publish('market:cvd_spot_agg', { ...makeCvd(bucketTs), sourcesUsed: [streamId], marketType: 'spot' });
+    bus.publish('market:liquidity_agg', { ...makeLiquidity(bucketTs), sourcesUsed: [streamId], marketType: 'spot' });
+
+    const last = outputs[outputs.length - 1];
+    expect(last.rawSourcesSeen).toEqual(['bybit', streamId]);
+    expect(last.rawSourcesUsed).toEqual([streamId]);
+    expect(last.rawSourcesUsed).not.toContain('bybit');
 
     readiness.stop();
   });

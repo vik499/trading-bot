@@ -11,6 +11,7 @@ import {
     type FundingRateEvent,
     type Kline,
     type KlineInterval,
+    type KnownMarketType,
     type MarketType,
     type OpenInterestEvent,
     type OrderbookLevel,
@@ -164,7 +165,19 @@ export class BinancePublicRestClient {
             throw new BinanceRestError('Binance REST klines response is not an array', { ...responseMeta });
         }
 
-        const klines = payload.map((row) => parseKlineRow(row, params.symbol, params.interval));
+        const marketType = this.marketType ?? 'futures';
+        if (marketType === 'unknown') {
+            logger.warn(m('warn', `[BinanceREST] klines skipped for ${params.symbol}: marketType=unknown`));
+            return {
+                klines: [],
+                meta: {
+                    ...responseMeta,
+                    listLength: 0,
+                },
+            };
+        }
+        const knownMarketType: KnownMarketType = marketType;
+        const klines = payload.map((row) => parseKlineRow(row, params.symbol, params.interval, this.streamId, knownMarketType));
         return {
             klines,
             meta: {
@@ -299,7 +312,22 @@ export class BinanceOpenInterestCollector implements OpenInterestCollector {
         this.abortControllers.set(symbol, controller);
         try {
             const data = await this.restClient.fetchOpenInterest({ symbol, signal: controller.signal });
-            const meta = createMeta('binance', { tsEvent: asTsMs(data.ts) });
+            const meta = createMeta('binance', {
+                tsEvent: asTsMs(data.ts),
+                tsIngest: asTsMs(this.now()),
+                tsExchange: asTsMs(data.ts),
+                streamId: this.streamId,
+            });
+            const marketType = this.restClient.marketType ?? 'futures';
+            if (marketType === 'unknown') {
+                this.logErrorThrottled(
+                    `oi:${symbol}:marketType`,
+                    `[BinanceREST] open interest skipped for ${symbol}: marketType=unknown`
+                );
+                this.resetBackoff(symbol);
+                return;
+            }
+            const knownMarketType: KnownMarketType = marketType;
 
             if (this.lastEmittedTs.get(symbol) === data.ts) {
                 this.resetBackoff(symbol);
@@ -313,13 +341,13 @@ export class BinanceOpenInterestCollector implements OpenInterestCollector {
                 openInterestUnit: 'contracts',
                 openInterestValueUsd: undefined,
                 exchangeTs: data.ts,
-                marketType: this.restClient.marketType,
+                marketType: knownMarketType,
                 meta,
             };
             this.bus.publish('market:oi', payload);
             this.bus.publish(
                 'market:open_interest_raw',
-                mapOpenInterestRaw('binance', symbol, data.openInterest, data.ts, this.now(), undefined, this.restClient.marketType)
+                mapOpenInterestRaw('binance', symbol, data.openInterest, data.ts, this.now(), undefined, marketType)
             );
             this.lastEmittedTs.set(symbol, data.ts);
             this.resetBackoff(symbol);
@@ -446,7 +474,22 @@ export class BinanceFundingCollector implements OpenInterestCollector {
         this.abortControllers.set(symbol, controller);
         try {
             const data = await this.restClient.fetchPremiumIndex({ symbol, signal: controller.signal });
-            const meta = createMeta('binance', { tsEvent: asTsMs(data.ts) });
+            const meta = createMeta('binance', {
+                tsEvent: asTsMs(data.ts),
+                tsIngest: asTsMs(this.now()),
+                tsExchange: asTsMs(data.ts),
+                streamId: this.streamId,
+            });
+            const marketType = this.restClient.marketType ?? 'futures';
+            if (marketType === 'unknown') {
+                this.logErrorThrottled(
+                    `funding:${symbol}:marketType`,
+                    `[BinanceREST] funding skipped for ${symbol}: marketType=unknown`
+                );
+                this.resetBackoff(symbol);
+                return;
+            }
+            const knownMarketType: KnownMarketType = marketType;
 
             if (this.lastEmittedTs.get(symbol) === data.ts) {
                 this.resetBackoff(symbol);
@@ -463,13 +506,13 @@ export class BinanceFundingCollector implements OpenInterestCollector {
                 fundingRate: data.fundingRate,
                 exchangeTs: data.ts,
                 nextFundingTs: data.nextFundingTs,
-                marketType: this.restClient.marketType,
+                marketType: knownMarketType,
                 meta,
             };
             this.bus.publish('market:funding', payload);
             this.bus.publish(
                 'market:funding_raw',
-                mapFundingRaw('binance', symbol, data.fundingRate, data.ts, this.now(), data.nextFundingTs, this.restClient.marketType)
+                mapFundingRaw('binance', symbol, data.fundingRate, data.ts, this.now(), data.nextFundingTs, marketType)
             );
             this.lastEmittedTs.set(symbol, data.ts);
             this.resetBackoff(symbol);
@@ -706,7 +749,7 @@ function intervalToTf(interval: KlineInterval): string {
     return `${minutes}m`;
 }
 
-function parseKlineRow(row: unknown, symbol: string, interval: KlineInterval): Kline {
+function parseKlineRow(row: unknown, symbol: string, interval: KlineInterval, streamId: string, marketType: KnownMarketType): Kline {
     if (!Array.isArray(row) || row.length < 6) {
         throw new BinanceRestError('Binance REST kline row invalid', { rowPreview: JSON.stringify(row) });
     }
@@ -719,6 +762,8 @@ function parseKlineRow(row: unknown, symbol: string, interval: KlineInterval): K
     const volume = toNumber(row[5], 'volume');
     return {
         symbol,
+        streamId,
+        marketType,
         interval,
         tf: intervalToTf(interval),
         startTs,

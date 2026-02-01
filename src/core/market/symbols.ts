@@ -1,9 +1,11 @@
-import type { MarketType } from '../events/EventBus';
+import type { KnownMarketType, MarketType } from '../events/EventBus';
 
 export function normalizeSymbol(symbol: string): string {
     return symbol.trim().toUpperCase();
 }
 
+export function normalizeMarketType(marketType: KnownMarketType): KnownMarketType;
+export function normalizeMarketType(marketType?: MarketType): MarketType;
 export function normalizeMarketType(marketType?: MarketType): MarketType {
     return marketType ?? 'unknown';
 }

@@ -13,7 +13,7 @@ import type {
     KlineEvent,
     KlineInterval,
     LiquidationEvent,
-    MarketType,
+    KnownMarketType,
     VenueId,
     OrderbookL2DeltaEvent,
     OrderbookL2SnapshotEvent,
@@ -30,13 +30,14 @@ import {
     mapOrderbookSnapshotRaw,
     mapTradeRaw,
 } from '../normalizers/rawAdapters';
+import { inferMarketTypeFromStreamId } from '../../core/market/symbols';
 
 type WsClientOptions = {
     pingIntervalMs?: number;
     watchdogMs?: number;
     now?: () => number;
     streamId?: string;
-    marketType?: MarketType;
+    marketType?: KnownMarketType;
     supportsLiquidations?: boolean;
     eventBus?: EventBus;
 };
@@ -45,6 +46,14 @@ type WsConnState = 'idle' | 'connecting' | 'open' | 'closing';
 
 const DEFAULT_STREAM_ID = 'bybit.public.linear.v5';
 const DEFAULT_ORDERBOOK_DEPTH = 50;
+const SUBSCRIBE_ACK_TIMEOUT_MS = 8_000;
+
+type SubscribeAttempt = {
+    reqId: string;
+    keys: string[];
+    createdAtMs: number;
+    epoch: number;
+};
 
 function toErrorMessage(err: unknown): string {
     if (err instanceof Error) return err.message;
@@ -52,6 +61,53 @@ function toErrorMessage(err: unknown): string {
         return JSON.stringify(err);
     } catch {
         return String(err);
+    }
+}
+
+class BybitSubscriptionManager {
+    private readonly desired = new Map<string, string>();
+    private readonly active = new Set<string>();
+    private readonly pending = new Set<string>();
+
+    requestSubscribe(topic: string): boolean {
+        const key = topic;
+        if (this.desired.has(key)) return false;
+        this.desired.set(key, topic);
+        return true;
+    }
+
+    buildDiff(): Array<{ key: string; topic: string }> {
+        const already = new Set<string>([...this.active, ...this.pending]);
+        const diffKeys = Array.from(this.desired.keys()).filter((key) => !already.has(key));
+        diffKeys.sort();
+        return diffKeys.map((key) => ({ key, topic: this.desired.get(key)! }));
+    }
+
+    markPending(keys: string[]): void {
+        keys.forEach((key) => this.pending.add(key));
+    }
+
+    markActive(keys: string[]): void {
+        keys.forEach((key) => {
+            this.pending.delete(key);
+            this.active.add(key);
+        });
+    }
+
+    markFailed(keys: string[]): void {
+        keys.forEach((key) => {
+            this.pending.delete(key);
+            this.active.delete(key);
+        });
+    }
+
+    onClose(): void {
+        this.pending.clear();
+        this.active.clear();
+    }
+
+    counts(): { desired: number; active: number; pending: number } {
+        return { desired: this.desired.size, active: this.active.size, pending: this.pending.size };
     }
 }
 
@@ -88,7 +144,12 @@ export class BybitPublicWsClient {
     private hasOpened = false;
 
     // Запоминаем подписки, чтобы при reconnect пере-подписаться
-    private readonly subscriptions = new Set<string>();
+    private readonly subscriptions = new BybitSubscriptionManager();
+    private reconcileInFlight = false;
+    private reconcileQueued = false;
+    private subscribeAttempt: SubscribeAttempt | null = null;
+    private subscribeAckTimer: NodeJS.Timeout | null = null;
+    private subscribeReqCounter = 0;
 
     // URL WebSocket-сервера Bybit.
     private readonly url: string;
@@ -129,7 +190,7 @@ export class BybitPublicWsClient {
 
     private readonly now: () => number;
     private readonly streamId: string;
-    private readonly marketType?: MarketType;
+    private readonly marketType?: KnownMarketType;
     private readonly supportsLiquidations: boolean;
     private readonly bus: EventBus;
     private readonly venue: VenueId = 'bybit';
@@ -183,6 +244,7 @@ export class BybitPublicWsClient {
         this.isConnecting = false;
         this.connectPromise = null;
         this.hasOpened = false;
+        this.clearSubscribeAttempt();
 
         // Если мы не в ручном disconnect — возвращаем авто-реконнект в нормальный режим
         // (при ручном disconnect autoReconnect отключаем выше, в disconnect())
@@ -204,6 +266,7 @@ export class BybitPublicWsClient {
         this.lastErrorMessage = undefined;
         this.lastErrorAt = undefined;
         this.lastErrorEpoch = undefined;
+        this.subscriptions.onClose();
 
         logger.info(m('cleanup', `[BybitWS] Cleanup: ${reason}`));
     }
@@ -267,6 +330,36 @@ export class BybitPublicWsClient {
 
     private markPing(): void {
         this.lastPingAt = this.now();
+    }
+
+    private nextSubscribeReqId(): string {
+        this.subscribeReqCounter += 1;
+        return `sub-${this.connEpoch}-${this.subscribeReqCounter}`;
+    }
+
+    private clearSubscribeAttempt(): void {
+        if (this.subscribeAckTimer) {
+            clearTimeout(this.subscribeAckTimer);
+            this.subscribeAckTimer = null;
+        }
+        this.subscribeAttempt = null;
+    }
+
+    private startSubscribeAckTimer(attempt: SubscribeAttempt): void {
+        if (this.subscribeAckTimer) clearTimeout(this.subscribeAckTimer);
+        const { reqId, epoch } = attempt;
+        this.subscribeAckTimer = setTimeout(() => {
+            const current = this.subscribeAttempt;
+            if (!current || current.reqId !== reqId || current.epoch !== epoch) return;
+            const age = Math.max(0, this.now() - current.createdAtMs);
+            logger.warn(m('warn', `[BybitWS] subscribe ack timeout req_id=${reqId} age=${age}ms`));
+            this.clearSubscribeAttempt();
+            try {
+                this.socket?.close();
+            } catch {
+                // ignore
+            }
+        }, SUBSCRIBE_ACK_TIMEOUT_MS);
     }
 
     private formatMs(ms: number): string {
@@ -379,12 +472,7 @@ export class BybitPublicWsClient {
                 this.startHeartbeat(epoch);
 
                 // Авто-повтор подписок после reconnect
-                if (this.subscriptions.size > 0) {
-                    for (const topic of this.subscriptions) {
-                        this.sendJson({ op: 'subscribe', args: [topic] });
-                        logger.info(m('connect', `[BybitWS] Re-subscribe: ${topic}`));
-                    }
-                }
+                this.flushSubscriptions();
 
                 safeResolve();
             };
@@ -569,15 +657,18 @@ export class BybitPublicWsClient {
     // ------------------------------------------------------------------------
     subscribeTicker(symbol: string): void {
         const topic = `tickers.${symbol}`;
-        this.subscriptions.add(topic);
+        const added = this.subscriptions.requestSubscribe(topic);
 
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-            logger.info(m('ws', `[BybitWS] WebSocket не открыт — подписка сохранена и будет отправлена при подключении: ${topic}`));
+            if (added) {
+                logger.info(
+                    m('ws', `[BybitWS] WebSocket не открыт — подписка сохранена и будет отправлена при подключении: ${topic}`)
+                );
+            }
             return;
         }
 
-        this.sendJson({ op: 'subscribe', args: [topic] });
-        logger.info(m('connect', `[BybitWS] Подписка отправлена: ${topic}`));
+        this.flushSubscriptions();
     }
 
     // ------------------------------------------------------------------------
@@ -585,15 +676,18 @@ export class BybitPublicWsClient {
     // ------------------------------------------------------------------------
     subscribeTrades(symbol: string): void {
         const topic = `publicTrade.${symbol}`;
-        this.subscriptions.add(topic);
+        const added = this.subscriptions.requestSubscribe(topic);
 
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-            logger.info(m('ws', `[BybitWS] WebSocket не открыт — подписка сохранена и будет отправлена при подключении: ${topic}`));
+            if (added) {
+                logger.info(
+                    m('ws', `[BybitWS] WebSocket не открыт — подписка сохранена и будет отправлена при подключении: ${topic}`)
+                );
+            }
             return;
         }
 
-        this.sendJson({ op: 'subscribe', args: [topic] });
-        logger.info(m('connect', `[BybitWS] Подписка отправлена: ${topic}`));
+        this.flushSubscriptions();
     }
 
     // ------------------------------------------------------------------------
@@ -601,15 +695,18 @@ export class BybitPublicWsClient {
     // ------------------------------------------------------------------------
     subscribeOrderbook(symbol: string, depth = DEFAULT_ORDERBOOK_DEPTH): void {
         const topic = `orderbook.${depth}.${symbol}`;
-        this.subscriptions.add(topic);
+        const added = this.subscriptions.requestSubscribe(topic);
 
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-            logger.info(m('ws', `[BybitWS] WebSocket не открыт — подписка сохранена и будет отправлена при подключении: ${topic}`));
+            if (added) {
+                logger.info(
+                    m('ws', `[BybitWS] WebSocket не открыт — подписка сохранена и будет отправлена при подключении: ${topic}`)
+                );
+            }
             return;
         }
 
-        this.sendJson({ op: 'subscribe', args: [topic] });
-        logger.info(m('connect', `[BybitWS] Подписка отправлена: ${topic}`));
+        this.flushSubscriptions();
     }
 
     // ------------------------------------------------------------------------
@@ -617,15 +714,18 @@ export class BybitPublicWsClient {
     // ------------------------------------------------------------------------
     subscribeKlines(symbol: string, interval: KlineInterval): void {
         const topic = `kline.${toBybitKlineInterval(interval)}.${symbol}`;
-        this.subscriptions.add(topic);
+        const added = this.subscriptions.requestSubscribe(topic);
 
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-            logger.info(m('ws', `[BybitWS] WebSocket не открыт — подписка сохранена и будет отправлена при подключении: ${topic}`));
+            if (added) {
+                logger.info(
+                    m('ws', `[BybitWS] WebSocket не открыт — подписка сохранена и будет отправлена при подключении: ${topic}`)
+                );
+            }
             return;
         }
 
-        this.sendJson({ op: 'subscribe', args: [topic] });
-        logger.info(m('connect', `[BybitWS] Подписка отправлена: ${topic}`));
+        this.flushSubscriptions();
     }
 
     // ------------------------------------------------------------------------
@@ -634,15 +734,69 @@ export class BybitPublicWsClient {
     subscribeLiquidations(symbol: string): void {
         if (!this.supportsLiquidations) return;
         const topic = `allLiquidation.${symbol}`;
-        this.subscriptions.add(topic);
+        const added = this.subscriptions.requestSubscribe(topic);
 
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-            logger.info(m('ws', `[BybitWS] WebSocket не открыт — подписка сохранена и будет отправлена при подключении: ${topic}`));
+            if (added) {
+                logger.info(
+                    m('ws', `[BybitWS] WebSocket не открыт — подписка сохранена и будет отправлена при подключении: ${topic}`)
+                );
+            }
             return;
         }
 
-        this.sendJson({ op: 'subscribe', args: [topic] });
-        logger.info(m('connect', `[BybitWS] Подписка отправлена: ${topic}`));
+        this.flushSubscriptions();
+    }
+
+    private flushSubscriptions(): void {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+        if (this.subscribeAttempt) {
+            this.reconcileQueued = true;
+            return;
+        }
+        if (this.reconcileInFlight) {
+            this.reconcileQueued = true;
+            return;
+        }
+        this.reconcileInFlight = true;
+        try {
+            const diff = this.subscriptions.buildDiff();
+            if (diff.length === 0) return;
+
+            const args = diff.map((entry) => entry.topic);
+            const keys = diff.map((entry) => entry.key);
+
+            this.subscriptions.markPending(keys);
+            const reqId = this.nextSubscribeReqId();
+            const ok = this.sendJson({ op: 'subscribe', args, req_id: reqId });
+            if (!ok) {
+                this.subscriptions.markFailed(keys);
+                return;
+            }
+
+            const attempt: SubscribeAttempt = {
+                reqId,
+                keys,
+                createdAtMs: this.now(),
+                epoch: this.connEpoch,
+            };
+            this.subscribeAttempt = attempt;
+            this.startSubscribeAckTimer(attempt);
+
+            const counts = this.subscriptions.counts();
+            logger.info(
+                m(
+                    'connect',
+                    `[BybitWS] subscribe diff=${diff.length} desired=${counts.desired} active=${counts.active} pending=${counts.pending}`
+                )
+            );
+        } finally {
+            this.reconcileInFlight = false;
+            if (this.reconcileQueued) {
+                this.reconcileQueued = false;
+                this.flushSubscriptions();
+            }
+        }
     }
 
     private makeMeta(source: EventSource, tsEvent?: number, tsExchange?: number, sequence?: number): EventMeta {
@@ -654,6 +808,43 @@ export class BybitPublicWsClient {
             sequence: sequence !== undefined ? asSeq(sequence) : undefined,
             streamId: this.streamId,
         });
+    }
+
+    private resolveMarketType(): KnownMarketType {
+        return this.marketType ?? this.asKnownMarketType(inferMarketTypeFromStreamId(this.streamId)) ?? 'futures';
+    }
+
+    private asKnownMarketType(value?: string): KnownMarketType | undefined {
+        if (value === 'spot' || value === 'futures') return value;
+        return undefined;
+    }
+
+    private handleSubscribeAck(params: { reqId: string; success: boolean; retMsg?: string }): void {
+        const attempt = this.subscribeAttempt;
+        if (!attempt || !params.reqId || params.reqId !== attempt.reqId) {
+            logger.debug(m('ws', `[BybitWS] subscribe ack ignored req_id=${params.reqId || 'n/a'}`));
+            return;
+        }
+
+        this.clearSubscribeAttempt();
+
+        if (params.success) {
+            this.subscriptions.markActive(attempt.keys);
+        } else {
+            this.subscriptions.markFailed(attempt.keys);
+            const msg = params.retMsg ? ` ret_msg=${params.retMsg}` : '';
+            logger.error(m('error', `[BybitWS] subscribe failed req_id=${params.reqId}${msg}`));
+            try {
+                this.socket?.close();
+            } catch {
+                // ignore
+            }
+        }
+
+        if (this.reconcileQueued) {
+            this.reconcileQueued = false;
+            this.flushSubscriptions();
+        }
     }
 
     private handleMessage(text: string): void {
@@ -680,6 +871,14 @@ export class BybitPublicWsClient {
 
         // Системные сообщения (ack на subscribe и т.п.)
         if (typeof parsed?.success === 'boolean' || parsed?.ret_msg) {
+            if (parsed?.op === 'subscribe') {
+                const reqIdRaw = parsed?.req_id;
+                const reqId = typeof reqIdRaw === 'string' ? reqIdRaw : reqIdRaw !== undefined ? String(reqIdRaw) : '';
+                const success = Boolean(parsed?.success);
+                const retMsg = parsed?.ret_msg ? String(parsed.ret_msg) : undefined;
+                this.handleSubscribeAck({ reqId, success, retMsg });
+                return;
+            }
             const preview = text.length > 300 ? `${text.slice(0, 300)}…` : text;
             logger.info(m('ws', `[BybitWS] Системное сообщение: ${preview}`));
             return;
@@ -703,7 +902,7 @@ export class BybitPublicWsClient {
             const tickerEvent: TickerEvent = {
                 symbol: String(ticker.symbol ?? parsed.topic.split('.')[1]),
                 streamId: this.streamId,
-                marketType: this.marketType,
+                marketType: this.resolveMarketType(),
                 lastPrice: toStr(ticker.lastPrice ?? ticker.last_price),
                 markPrice: toStr(ticker.markPrice ?? ticker.mark_price),
                 indexPrice: toStr(ticker.indexPrice ?? ticker.index_price),
@@ -769,7 +968,7 @@ export class BybitPublicWsClient {
                     size,
                     tradeTs,
                     exchangeTs: tradeTs,
-                    marketType: this.marketType,
+                    marketType: this.resolveMarketType(),
                     meta,
                 };
                 this.bus.publish('market:trade', tradeEvent);
@@ -819,7 +1018,7 @@ export class BybitPublicWsClient {
                     streamId: this.streamId,
                     updateId,
                     exchangeTs,
-                    marketType: this.marketType,
+                    marketType: this.resolveMarketType(),
                     bids,
                     asks,
                     meta,
@@ -837,7 +1036,7 @@ export class BybitPublicWsClient {
                     streamId: this.streamId,
                     updateId,
                     exchangeTs,
-                    marketType: this.marketType,
+                    marketType: this.resolveMarketType(),
                     bids,
                     asks,
                     meta,
@@ -863,6 +1062,11 @@ export class BybitPublicWsClient {
             const interval = fromBybitKlineInterval(parts[1]);
             const symbol = String(parts[2] ?? 'n/a');
             const tf = interval ? intervalToTf(interval) : undefined;
+            const marketType = this.resolveMarketType();
+            if (!isKnownMarketType(marketType)) {
+                logger.warn(m('warn', `[BybitWS] kline skipped for ${symbol}: marketType=${marketType ?? 'unknown'}`));
+                return;
+            }
 
             for (const row of rows) {
                 if (!row || typeof row !== 'object') continue;
@@ -902,7 +1106,7 @@ export class BybitPublicWsClient {
                     close,
                     volume,
                     streamId: this.streamId,
-                    marketType: this.marketType,
+                    marketType,
                     meta: this.makeMeta('market', endTs, endTs),
                 };
                 this.bus.publish('market:kline', event);
@@ -921,7 +1125,7 @@ export class BybitPublicWsClient {
                     true,
                     endTs,
                     this.now(),
-                    this.marketType
+                    marketType
                 );
                 this.bus.publish('market:candle_raw', rawEvt);
             }
@@ -956,7 +1160,7 @@ export class BybitPublicWsClient {
                     size,
                     notionalUsd: price !== undefined && size !== undefined ? price * size : undefined,
                     exchangeTs,
-                    marketType: this.marketType,
+                    marketType: this.resolveMarketType(),
                     meta: this.makeMeta('market', exchangeTs ?? parsed.ts, exchangeTs),
                 };
                 this.bus.publish('market:liquidation', payload);
@@ -980,18 +1184,20 @@ export class BybitPublicWsClient {
     // ------------------------------------------------------------------------
     // sendJson
     // ------------------------------------------------------------------------
-    private sendJson(payload: unknown, opts: { silent?: boolean } = {}): void {
+    private sendJson(payload: unknown, opts: { silent?: boolean } = {}): boolean {
         const silent = Boolean(opts.silent);
 
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
             if (!silent) logger.error('[BybitWS] Нельзя отправить сообщение: WebSocket не открыт');
-            return;
+            return false;
         }
 
         try {
             this.socket.send(JSON.stringify(payload));
+            return true;
         } catch (err) {
             if (!silent) logger.error(`[BybitWS] Ошибка отправки сообщения: ${toErrorMessage(err)}`);
+            return false;
         }
     }
 
@@ -1114,6 +1320,10 @@ function intervalToTf(interval: KlineInterval): string {
     if (minutes % 1440 === 0) return `${minutes / 1440}d`;
     if (minutes % 60 === 0) return `${minutes / 60}h`;
     return `${minutes}m`;
+}
+
+function isKnownMarketType(value: unknown): value is KnownMarketType {
+    return value === 'spot' || value === 'futures';
 }
 
 const BYBIT_KLINE_INTERVALS: Set<KlineInterval> = new Set([

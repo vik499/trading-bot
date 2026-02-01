@@ -76,8 +76,15 @@ describe('EventTap', () => {
 
     const ticker: TickerEvent = {
       symbol: 'ETHUSDT',
+      streamId: 'bybit.public.linear.v5',
+      marketType: 'futures',
       lastPrice: '100',
-      meta: createMeta('market', { ts: 1000, correlationId: 'cid-1' }),
+      meta: createMeta('market', {
+        tsEvent: 1000,
+        tsIngest: 1000,
+        streamId: 'bybit.public.linear.v5',
+        correlationId: 'cid-1',
+      }),
     };
     bus.publish('market:ticker', ticker);
 

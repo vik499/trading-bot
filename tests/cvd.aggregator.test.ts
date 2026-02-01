@@ -23,7 +23,7 @@ describe('CvdAggregator', () => {
       cvdDelta: delta,
       unit: 'base',
       exchangeTs: ts,
-      meta: createMeta('market', { ts }),
+      meta: createMeta('market', { tsEvent: ts, tsIngest: ts, streamId }),
     });
 
     bus.publish('market:cvd_spot', make('s1', 1000, 10, 1));
@@ -46,7 +46,7 @@ describe('CvdAggregator', () => {
       cvdDelta: 3,
       unit: 'base',
       exchangeTs: 4000,
-      meta: createMeta('market', { ts: 4000 }),
+      meta: createMeta('market', { tsEvent: 4000, tsIngest: 4000, streamId: 's1' }),
     });
 
     const last = spotAgg[spotAgg.length - 1];

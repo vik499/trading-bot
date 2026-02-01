@@ -20,7 +20,8 @@ describe('OpenInterestAggregator multi-source', () => {
       openInterest: 100,
       openInterestUnit: 'base',
       exchangeTs: 1_000,
-      meta: createMeta('market', { ts: 1_000 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_000, tsIngest: 1_000, streamId: 'bybit' }),
     });
 
     bus.publish('market:oi', {
@@ -29,7 +30,8 @@ describe('OpenInterestAggregator multi-source', () => {
       openInterest: 200,
       openInterestUnit: 'base',
       exchangeTs: 1_100,
-      meta: createMeta('market', { ts: 1_100 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_100, tsIngest: 1_100, streamId: 'binance' }),
     });
 
     bus.publish('market:oi', {
@@ -38,7 +40,8 @@ describe('OpenInterestAggregator multi-source', () => {
       openInterest: 500,
       openInterestUnit: 'contracts',
       exchangeTs: 1_200,
-      meta: createMeta('market', { ts: 1_200 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_200, tsIngest: 1_200, streamId: 'okx' }),
     });
 
     const last = outputs[outputs.length - 1];

@@ -11,6 +11,7 @@ import {
     type FundingRateEvent,
     type Kline,
     type KlineInterval,
+    type KnownMarketType,
     type MarketType,
     type OpenInterestEvent,
 } from '../../core/events/EventBus';
@@ -116,7 +117,23 @@ export class BybitPublicRestClient {
         }
 
         const intervalMs = intervalToMs(params.interval);
-        const klines = list.map((row) => parseKlineRow(row, params.symbol, params.interval, intervalMs));
+        const marketType = this.marketType ?? 'futures';
+        if (marketType === 'unknown') {
+            logger.warn(m('warn', `[BybitREST] klines skipped for ${params.symbol}: marketType=unknown`));
+            return {
+                klines: [],
+                meta: {
+                    ...responseMeta,
+                    retCode,
+                    retMsg,
+                    listLength: 0,
+                },
+            };
+        }
+        const knownMarketType: KnownMarketType = marketType;
+        const klines = list.map((row) =>
+            parseKlineRow(row, params.symbol, params.interval, intervalMs, this.streamId, knownMarketType)
+        );
         return {
             klines,
             meta: {
@@ -241,7 +258,14 @@ export class BybitPublicRestClient {
     }
 }
 
-function parseKlineRow(row: unknown, symbol: string, interval: KlineInterval, intervalMs: number): Kline {
+function parseKlineRow(
+    row: unknown,
+    symbol: string,
+    interval: KlineInterval,
+    intervalMs: number,
+    streamId: string,
+    marketType: KnownMarketType
+): Kline {
     if (!Array.isArray(row) || row.length < 6) {
         throw new BybitRestError('Bybit REST kline row invalid', { rowPreview: JSON.stringify(row) });
     }
@@ -255,7 +279,7 @@ function parseKlineRow(row: unknown, symbol: string, interval: KlineInterval, in
     const endTs = startTs + intervalMs;
     const tf = intervalToTf(interval);
 
-    return { symbol, interval, tf, startTs, endTs, open, high, low, close, volume };
+    return { symbol, streamId, marketType, interval, tf, startTs, endTs, open, high, low, close, volume };
 }
 
 function parseOpenInterestRow(row: unknown): { openInterest: number; ts: number } {
@@ -565,14 +589,26 @@ export class BybitDerivativesRestPoller implements OpenInterestCollector {
         this.oiAbortControllers.set(symbol, controller);
         try {
             const data = await this.restClient.fetchOpenInterest({ symbol, intervalTime: this.oiIntervalTime, signal: controller.signal });
-            const meta = createMeta('market', { tsEvent: asTsMs(data.ts) });
+            const meta = createMeta('market', {
+                tsEvent: asTsMs(data.ts),
+                tsIngest: asTsMs(this.now()),
+                tsExchange: asTsMs(data.ts),
+                streamId: this.streamId,
+            });
+            const marketType = this.restClient.marketType ?? 'futures';
+            if (marketType === 'unknown') {
+                this.logErrorThrottled(`oi:${symbol}:marketType`, `[BybitREST] open interest skipped for ${symbol}: marketType=unknown`);
+                this.resetOiBackoff(symbol);
+                return;
+            }
+            const knownMarketType: KnownMarketType = marketType;
             const payload: OpenInterestEvent = {
                 symbol,
                 streamId: this.streamId,
                 openInterest: data.openInterest,
                 openInterestUnit: 'contracts',
                 exchangeTs: data.ts,
-                marketType: this.restClient.marketType,
+                marketType: knownMarketType,
                 meta,
             };
             this.bus.publish('market:oi', payload);
@@ -604,7 +640,19 @@ export class BybitDerivativesRestPoller implements OpenInterestCollector {
         this.fundingAbortControllers.set(symbol, controller);
         try {
             const data = await this.restClient.fetchFundingRate({ symbol, signal: controller.signal });
-            const meta = createMeta('market', { tsEvent: asTsMs(data.ts) });
+            const meta = createMeta('market', {
+                tsEvent: asTsMs(data.ts),
+                tsIngest: asTsMs(this.now()),
+                tsExchange: asTsMs(data.ts),
+                streamId: this.streamId,
+            });
+            const marketType = this.restClient.marketType ?? 'futures';
+            if (marketType === 'unknown') {
+                this.logErrorThrottled(`funding:${symbol}:marketType`, `[BybitREST] funding skipped for ${symbol}: marketType=unknown`);
+                this.resetFundingBackoff(symbol);
+                return;
+            }
+            const knownMarketType: KnownMarketType = marketType;
             if (this.lastFundingTs.get(symbol) === data.ts) {
                 this.resetFundingBackoff(symbol);
                 return;
@@ -615,7 +663,7 @@ export class BybitDerivativesRestPoller implements OpenInterestCollector {
                 fundingRate: data.fundingRate,
                 exchangeTs: data.ts,
                 nextFundingTs: data.nextFundingTs,
-                marketType: this.restClient.marketType,
+                marketType: knownMarketType,
                 meta,
             };
             this.bus.publish('market:funding', payload);

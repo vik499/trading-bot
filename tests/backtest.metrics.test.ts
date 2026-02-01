@@ -45,13 +45,17 @@ describe('BacktestMetricsCollector', () => {
 
     bus.publish('market:ticker', {
       symbol: 'TESTUSD',
+      streamId: 'bybit.public.linear.v5',
+      marketType: 'futures',
       lastPrice: '100',
-      meta: createMeta('market', { ts: 1100 }),
+      meta: createMeta('market', { tsEvent: 1100, tsIngest: 1100, streamId: 'bybit.public.linear.v5' }),
     });
     bus.publish('market:ticker', {
       symbol: 'TESTUSD',
+      streamId: 'bybit.public.linear.v5',
+      marketType: 'futures',
       lastPrice: '101',
-      meta: createMeta('market', { ts: 1400 }),
+      meta: createMeta('market', { tsEvent: 1400, tsIngest: 1400, streamId: 'bybit.public.linear.v5' }),
     });
 
     // realized pnl path: +10 -> +15 -> -5 -> -2 (max dd from peak 15 to -2 = 17)

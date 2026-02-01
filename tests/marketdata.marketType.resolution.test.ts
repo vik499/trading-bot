@@ -23,7 +23,7 @@ describe('MarketDataReadiness marketType resolution', () => {
       bids: [],
       asks: [],
       marketType: 'futures',
-      meta: createMeta('market', { ts: 1_000 }),
+      meta: createMeta('market', { tsEvent: 1_000, tsIngest: 1_000, streamId: 'binance.usdm.public' }),
     };
 
     bus.publish('market:orderbook_l2_snapshot', evt);
@@ -51,7 +51,8 @@ describe('MarketDataReadiness marketType resolution', () => {
       exchangeTs: 2_000,
       bids: [],
       asks: [],
-      meta: createMeta('market', { ts: 2_000 }),
+      marketType: 'spot',
+      meta: createMeta('market', { tsEvent: 2_000, tsIngest: 2_000, streamId: 'binance.spot.public' }),
     };
 
     bus.publish('market:orderbook_l2_snapshot', evt);

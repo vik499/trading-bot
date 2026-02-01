@@ -11,6 +11,7 @@ import {
     type FundingRateEvent,
     type Kline,
     type KlineInterval,
+    type KnownMarketType,
     type MarketType,
     type OpenInterestEvent,
     type OpenInterestUnit,
@@ -220,7 +221,16 @@ export class OkxPublicRestClient {
             throw new OkxRestError('OKX REST kline response is not an array', { ...responseMeta, code, msg });
         }
 
-        const klines = rows.map((row) => parseKlineRow(row, params.symbol, params.interval));
+        const marketType = this.marketType ?? 'futures';
+        if (marketType === 'unknown') {
+            logger.warn(m('warn', `[OKXREST] klines skipped for ${params.symbol}: marketType=unknown`));
+            return {
+                klines: [],
+                meta: { ...responseMeta, code, msg },
+            };
+        }
+        const knownMarketType: KnownMarketType = marketType;
+        const klines = rows.map((row) => parseKlineRow(row, params.symbol, params.interval, this.streamId, knownMarketType));
         return {
             klines,
             meta: { ...responseMeta, code, msg },
@@ -320,7 +330,19 @@ export class OkxOpenInterestCollector implements OpenInterestCollector {
         this.abortControllers.set(symbol, controller);
         try {
             const data = await this.restClient.fetchOpenInterest({ instId, signal: controller.signal });
-            const meta = createMeta('okx', { tsEvent: asTsMs(data.ts) });
+            const meta = createMeta('okx', {
+                tsEvent: asTsMs(data.ts),
+                tsIngest: asTsMs(this.now()),
+                tsExchange: asTsMs(data.ts),
+                streamId: this.streamId,
+            });
+            const marketType = this.restClient.marketType ?? 'futures';
+            if (marketType === 'unknown') {
+                this.logErrorThrottled(`oi:${instId}:marketType`, `[OKXREST] open interest skipped for ${instId}: marketType=unknown`);
+                this.resetBackoff(symbol);
+                return;
+            }
+            const knownMarketType: KnownMarketType = marketType;
 
             if (this.lastEmittedTs.get(symbol) === data.ts) {
                 this.resetBackoff(symbol);
@@ -334,13 +356,13 @@ export class OkxOpenInterestCollector implements OpenInterestCollector {
                 openInterestUnit: data.openInterestUnit,
                 openInterestValueUsd: data.openInterestValueUsd,
                 exchangeTs: data.ts,
-                marketType: this.restClient.marketType,
+                marketType: knownMarketType,
                 meta,
             };
             this.bus.publish('market:oi', payload);
             this.bus.publish(
                 'market:open_interest_raw',
-                mapOpenInterestRaw('okx', instId, data.openInterest, data.ts, this.now(), data.openInterestValueUsd, this.restClient.marketType)
+                mapOpenInterestRaw('okx', instId, data.openInterest, data.ts, this.now(), data.openInterestValueUsd, marketType)
             );
             this.lastEmittedTs.set(symbol, data.ts);
             this.resetBackoff(symbol);
@@ -470,7 +492,19 @@ export class OkxFundingCollector implements OpenInterestCollector {
         this.abortControllers.set(symbol, controller);
         try {
             const data = await this.restClient.fetchFundingRate({ instId, signal: controller.signal });
-            const meta = createMeta('okx', { tsEvent: asTsMs(data.ts) });
+            const meta = createMeta('okx', {
+                tsEvent: asTsMs(data.ts),
+                tsIngest: asTsMs(this.now()),
+                tsExchange: asTsMs(data.fundingTime ?? data.ts),
+                streamId: this.streamId,
+            });
+            const marketType = this.restClient.marketType ?? 'futures';
+            if (marketType === 'unknown') {
+                this.logErrorThrottled(`funding:${instId}:marketType`, `[OKXREST] funding skipped for ${instId}: marketType=unknown`);
+                this.resetBackoff(symbol);
+                return;
+            }
+            const knownMarketType: KnownMarketType = marketType;
 
             if (this.lastEmittedTs.get(symbol) === data.ts) {
                 this.resetBackoff(symbol);
@@ -483,13 +517,13 @@ export class OkxFundingCollector implements OpenInterestCollector {
                 fundingRate: data.fundingRate,
                 exchangeTs: data.fundingTime ?? data.ts,
                 nextFundingTs: data.nextFundingTime,
-                marketType: this.restClient.marketType,
+                marketType: knownMarketType,
                 meta,
             };
             this.bus.publish('market:funding', payload);
             this.bus.publish(
                 'market:funding_raw',
-                mapFundingRaw('okx', instId, data.fundingRate, data.fundingTime ?? data.ts, this.now(), data.nextFundingTime, this.restClient.marketType)
+                mapFundingRaw('okx', instId, data.fundingRate, data.fundingTime ?? data.ts, this.now(), data.nextFundingTime, marketType)
             );
             this.lastEmittedTs.set(symbol, data.ts);
             this.resetBackoff(symbol);
@@ -744,7 +778,7 @@ function intervalToMs(interval: KlineInterval): number {
     return minutes * 60_000;
 }
 
-function parseKlineRow(row: unknown, symbol: string, interval: KlineInterval): Kline {
+function parseKlineRow(row: unknown, symbol: string, interval: KlineInterval, streamId: string, marketType: KnownMarketType): Kline {
     if (!Array.isArray(row) || row.length < 6) {
         throw new OkxRestError('OKX REST kline row invalid', { rowPreview: JSON.stringify(row) });
     }
@@ -757,6 +791,8 @@ function parseKlineRow(row: unknown, symbol: string, interval: KlineInterval): K
     const endTs = startTs + intervalToMs(interval);
     return {
         symbol,
+        streamId,
+        marketType,
         interval,
         tf: intervalToTf(interval),
         startTs,

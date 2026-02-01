@@ -6,11 +6,12 @@ import { createMeta, type MarketPriceCanonicalEvent, type TickerEvent } from '..
 const makeTicker = (ts: number, overrides: Partial<TickerEvent> = {}): TickerEvent => ({
   symbol: 'BTCUSDT',
   streamId: 's1',
+  marketType: 'futures',
   indexPrice: '100',
   markPrice: '99.5',
   lastPrice: '100.2',
   exchangeTs: ts,
-  meta: createMeta('market', { ts }),
+  meta: createMeta('market', { tsEvent: ts, tsIngest: ts, streamId: 's1' }),
   ...overrides,
 });
 

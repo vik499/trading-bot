@@ -18,6 +18,7 @@ import { MarketDataReadiness } from '../src/observability/MarketDataReadiness';
 const SYMBOL = 'BTCUSDT';
 const STREAM_ID = 'stream-1';
 const RUN_ID = 'run-readiness';
+const READINESS_NOW_TS = 10_000;
 
 function startPipeline(bus: ReturnType<typeof createTestEventBus>) {
   const outputs: MarketDataStatusPayload[] = [];
@@ -26,6 +27,7 @@ function startPipeline(bus: ReturnType<typeof createTestEventBus>) {
     warmingWindowMs: 0,
     expectedSources: 1,
     logIntervalMs: 0,
+    now: () => READINESS_NOW_TS,
   });
 
   const oiAggregator = new OpenInterestAggregator(bus, { ttlMs: 5_000 });
@@ -88,7 +90,7 @@ describe('MarketDataReadiness replay determinism', () => {
       tradeTs: 900,
       exchangeTs: 900,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 900 }),
+      meta: createMeta('market', { tsEvent: 900, tsIngest: 900, streamId: STREAM_ID }),
     };
     const trade2: TradeEvent = {
       symbol: SYMBOL,
@@ -99,7 +101,7 @@ describe('MarketDataReadiness replay determinism', () => {
       tradeTs: 1100,
       exchangeTs: 1100,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 1100 }),
+      meta: createMeta('market', { tsEvent: 1100, tsIngest: 1100, streamId: STREAM_ID }),
     };
     bus.publish('market:trade', trade1);
     bus.publish('market:trade', trade2);
@@ -109,15 +111,16 @@ describe('MarketDataReadiness replay determinism', () => {
       streamId: STREAM_ID,
       updateId: 1,
       exchangeTs: 900,
+      marketType: 'futures',
       bids: [{ price: 100, size: 1 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 900 }),
+      meta: createMeta('market', { tsEvent: 900, tsIngest: 900, streamId: STREAM_ID }),
     };
     const orderbook2: OrderbookL2SnapshotEvent = {
       ...orderbook1,
       updateId: 2,
       exchangeTs: 1100,
-      meta: createMeta('market', { ts: 1100 }),
+      meta: createMeta('market', { tsEvent: 1100, tsIngest: 1100, streamId: STREAM_ID }),
     };
     bus.publish('market:orderbook_l2_snapshot', orderbook1);
     bus.publish('market:orderbook_l2_snapshot', orderbook2);
@@ -130,7 +133,8 @@ describe('MarketDataReadiness replay determinism', () => {
       size: 1,
       notionalUsd: 100,
       exchangeTs: 500,
-      meta: createMeta('market', { ts: 500 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 500, tsIngest: 500, streamId: STREAM_ID }),
     };
     const liq2: LiquidationEvent = {
       symbol: SYMBOL,
@@ -140,7 +144,8 @@ describe('MarketDataReadiness replay determinism', () => {
       size: 1,
       notionalUsd: 100,
       exchangeTs: 1500,
-      meta: createMeta('market', { ts: 1500 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1500, tsIngest: 1500, streamId: STREAM_ID }),
     };
     bus.publish('market:liquidation', liq1);
     bus.publish('market:liquidation', liq2);
@@ -151,7 +156,8 @@ describe('MarketDataReadiness replay determinism', () => {
       openInterest: 10,
       openInterestUnit: 'base',
       exchangeTs: 1000,
-      meta: createMeta('market', { ts: 1000 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId: STREAM_ID }),
     };
     bus.publish('market:oi', oi);
 
@@ -160,16 +166,18 @@ describe('MarketDataReadiness replay determinism', () => {
       streamId: STREAM_ID,
       fundingRate: 0.0001,
       exchangeTs: 1000,
-      meta: createMeta('market', { ts: 1000 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId: STREAM_ID }),
     };
     bus.publish('market:funding', funding);
 
     const ticker: TickerEvent = {
       symbol: SYMBOL,
       streamId: STREAM_ID,
+      marketType: 'futures',
       indexPrice: '100',
       exchangeTs: 1000,
-      meta: createMeta('market', { ts: 1000 }),
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId: STREAM_ID }),
     };
     bus.publish('market:ticker', ticker);
 

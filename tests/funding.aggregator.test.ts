@@ -19,7 +19,8 @@ describe('FundingAggregator', () => {
       streamId: 'bybit',
       fundingRate: 0.01,
       exchangeTs: 1_000,
-      meta: createMeta('market', { ts: 1_000 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_000, tsIngest: 1_000, streamId: 'bybit' }),
     });
 
     bus.publish('market:funding', {
@@ -27,7 +28,8 @@ describe('FundingAggregator', () => {
       streamId: 'binance',
       fundingRate: 0.03,
       exchangeTs: 1_100,
-      meta: createMeta('market', { ts: 1_100 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_100, tsIngest: 1_100, streamId: 'binance' }),
     });
 
     bus.publish('market:funding', {
@@ -35,7 +37,8 @@ describe('FundingAggregator', () => {
       streamId: 'okx',
       fundingRate: 0.02,
       exchangeTs: 1_150,
-      meta: createMeta('market', { ts: 1_150 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_150, tsIngest: 1_150, streamId: 'okx' }),
     });
 
     const weighted = outputs[outputs.length - 1];
@@ -49,7 +52,8 @@ describe('FundingAggregator', () => {
       streamId: 'binance',
       fundingRate: 0.02,
       exchangeTs: 12_500,
-      meta: createMeta('market', { ts: 12_500 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 12_500, tsIngest: 12_500, streamId: 'binance' }),
     });
 
     const last = outputs[outputs.length - 1];
@@ -57,5 +61,27 @@ describe('FundingAggregator', () => {
     expect(last.venueBreakdown?.bybit).toBeUndefined();
     expect(last.venueBreakdown?.binance).toBe(0.02);
     expect(last.venueBreakdown?.okx).toBeUndefined();
+  });
+
+  it('uses local ingest time when tsIngest is missing', () => {
+    const NOW = 5_000;
+    const bus = createTestEventBus();
+    const agg = new FundingAggregator(bus, { ttlMs: 2_000, now: () => NOW });
+    const outputs: MarketFundingAggEvent[] = [];
+    bus.subscribe('market:funding_agg', (evt) => outputs.push(evt));
+    agg.start();
+
+    bus.publish('market:funding', {
+      symbol: 'BTCUSDT',
+      streamId: 'bybit',
+      fundingRate: 0.01,
+      exchangeTs: 1_000,
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_000, streamId: 'bybit' }),
+    });
+
+    const last = outputs[outputs.length - 1];
+    expect(last.meta.tsIngest).toBe(NOW);
+    expect(last.meta.tsIngest).not.toBe(last.meta.tsEvent);
   });
 });

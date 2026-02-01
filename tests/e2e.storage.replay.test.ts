@@ -231,8 +231,10 @@ describe('E2E storage + replay', () => {
       tsIngest: 1000,
       payload: {
         symbol: SYMBOL,
+        streamId: STREAM_ID,
+        marketType: 'futures',
         lastPrice: '100',
-        meta: createMeta('market', { ts: 1000 }),
+        meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId: STREAM_ID }),
       },
     };
     const runRecord = {
@@ -243,8 +245,10 @@ describe('E2E storage + replay', () => {
       tsIngest: 2000,
       payload: {
         symbol: SYMBOL,
+        streamId: STREAM_ID,
+        marketType: 'futures',
         lastPrice: '101',
-        meta: createMeta('market', { ts: 2000 }),
+        meta: createMeta('market', { tsEvent: 2000, tsIngest: 2000, streamId: STREAM_ID }),
       },
     };
 

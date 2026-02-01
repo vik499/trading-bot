@@ -6,7 +6,7 @@ import type {
     KlineEvent,
     KlineInterval,
     LiquidationEvent,
-    MarketType,
+    KnownMarketType,
     VenueId,
     OrderbookL2DeltaEvent,
     OrderbookL2SnapshotEvent,
@@ -27,7 +27,7 @@ import {
 
 export interface OkxWsClientOptions {
     streamId?: string;
-    marketType?: MarketType;
+    marketType?: KnownMarketType;
     pingIntervalMs?: number;
     reconnectMaxMs?: number;
     reconnectBaseMs?: number;
@@ -36,6 +36,8 @@ export interface OkxWsClientOptions {
     now?: () => number;
     supportsLiquidations?: boolean;
     eventBus?: EventBus;
+    instanceId?: string;
+    instanceIdFactory?: () => string;
 }
 
 type WsConnState = 'idle' | 'connecting' | 'open' | 'closing';
@@ -49,7 +51,102 @@ const DEFAULT_RECONNECT_BASE_MS = 500;
 const DEFAULT_RECONNECT_MAX_MS = 8_000;
 const DEFAULT_BACKOFF_RESET_MS = 20_000;
 
+let okxClientInstanceSeq = 0;
+const nextOkxClientInstanceId = (): string => {
+    okxClientInstanceSeq += 1;
+    return okxClientInstanceSeq.toString(36);
+};
+
+type OkxClientRegistryKey = string;
+const okxClientRegistry = new Map<OkxClientRegistryKey, OkxPublicWsClient>();
+
+export const buildOkxClientRegistryKey = (params: {
+    venue: VenueId;
+    streamId: string;
+    symbol?: string;
+    marketType?: KnownMarketType;
+}): string => `${params.venue}:${params.streamId}:${params.symbol ?? '*'}:${params.marketType ?? 'unknown'}`;
+
+export const resetOkxPublicWsClientRegistry = (): void => {
+    okxClientRegistry.clear();
+};
+
+export const getOkxPublicWsClient = (opts: OkxWsClientOptions & { url?: string; symbol?: string }): OkxPublicWsClient => {
+    const url = opts.url ?? DEFAULT_WS_URL;
+    const streamId = opts.streamId ?? DEFAULT_STREAM_ID;
+    const key = buildOkxClientRegistryKey({ venue: 'okx', streamId, symbol: opts.symbol, marketType: opts.marketType });
+    const cached = okxClientRegistry.get(key);
+    if (cached) return cached;
+    const client = new OkxPublicWsClient(url, opts);
+    logger.info(
+        m(
+            'connect',
+            `[OKXWS#${client.clientInstanceId}] creating OKXWS client id=${client.clientInstanceId} venue=okx streamId=${streamId} symbol=${opts.symbol ?? 'n/a'} marketType=${opts.marketType ?? 'unknown'}`
+        )
+    );
+    okxClientRegistry.set(key, client);
+    return client;
+};
+
+class OkxSubscriptionManager {
+    private readonly desired = new Map<string, OkxArg>();
+    private readonly active = new Set<string>();
+    private readonly pending = new Set<string>();
+
+    requestSubscribe(arg: OkxArg): boolean {
+        const key = buildSubKey(arg);
+        if (this.desired.has(key)) return false;
+        this.desired.set(key, arg);
+        return true;
+    }
+
+    buildDiff(): Array<{ key: string; arg: OkxArg }> {
+        const pendingKeys = new Set<string>([...this.active, ...this.pending]);
+        const diffKeys = Array.from(this.desired.keys()).filter((key) => !pendingKeys.has(key));
+        diffKeys.sort();
+        return diffKeys.map((key) => ({ key, arg: this.desired.get(key)! }));
+    }
+
+    markPending(keys: string[]): void {
+        keys.forEach((key) => this.pending.add(key));
+    }
+
+    markActive(key: string): void {
+        this.pending.delete(key);
+        this.active.add(key);
+    }
+
+    remove(key: string): void {
+        this.desired.delete(key);
+        this.pending.delete(key);
+        this.active.delete(key);
+    }
+
+    onOpen(): void {
+        this.pending.clear();
+        this.active.clear();
+    }
+
+    onClose(): void {
+        this.pending.clear();
+        this.active.clear();
+    }
+
+    desiredCount(): number {
+        return this.desired.size;
+    }
+
+    activeCount(): number {
+        return this.active.size;
+    }
+
+    pendingCount(): number {
+        return this.pending.size;
+    }
+}
+
 export class OkxPublicWsClient {
+    public readonly clientInstanceId: string;
     private socket: WebSocket | null = null;
     private state: WsConnState = 'idle';
     private connectPromise: Promise<void> | null = null;
@@ -61,8 +158,9 @@ export class OkxPublicWsClient {
     private lastReconnectDelayMs?: number;
     private lastProtocolError: { event: string; code?: string; msg?: string } | null = null;
     private lastError?: string;
-    private readonly subscriptions = new Set<string>();
-    private readonly sentSubscriptions = new Set<string>();
+    private readonly subscriptions = new OkxSubscriptionManager();
+    private reconcileInFlight = false;
+    private reconcileQueued = false;
     private readonly orderbookSeq = new Map<string, number>();
     private readonly orderbookSnapshotReady = new Set<string>();
     private readonly orderbookLastAppliedAt = new Map<string, number>();
@@ -73,8 +171,8 @@ export class OkxPublicWsClient {
     private readonly lastResyncAt = new Map<string, number>();
 
     private readonly url: string;
-    private readonly streamId: string;
-    private readonly marketType?: MarketType;
+    public readonly streamId: string;
+    public readonly marketType?: KnownMarketType;
     private readonly pingIntervalMs: number;
     private readonly resyncCooldownMs: number;
     private readonly resyncMinGapCount: number;
@@ -103,6 +201,8 @@ export class OkxPublicWsClient {
         this.reconnectBaseMs = Math.max(100, opts.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS);
         this.reconnectMaxMs = Math.max(this.reconnectBaseMs, opts.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS);
         this.backoffResetMs = Math.max(1_000, opts.backoffResetMs ?? DEFAULT_BACKOFF_RESET_MS);
+        this.clientInstanceId = opts.instanceId ?? (opts.instanceIdFactory ? opts.instanceIdFactory() : nextOkxClientInstanceId());
+        logger.info(m('connect', `[OKXWS#${this.clientInstanceId}] created streamId=${this.streamId} marketType=${this.marketType ?? 'unknown'}`));
     }
 
     async connect(): Promise<void> {
@@ -111,6 +211,7 @@ export class OkxPublicWsClient {
 
         this.state = 'connecting';
         this.isDisconnecting = false;
+        logger.info(m('connect', `[OKXWS#${this.clientInstanceId}] connect start`));
 
         this.connectPromise = new Promise((resolve, reject) => {
             const socket = new WebSocket(this.url);
@@ -122,7 +223,7 @@ export class OkxPublicWsClient {
                 this.state = 'idle';
                 this.connectPromise = null;
                 this.stopPing();
-                this.sentSubscriptions.clear();
+                this.subscriptions.onClose();
                 if (!this.isDisconnecting) {
                     this.scheduleReconnect(reason);
                 }
@@ -136,11 +237,11 @@ export class OkxPublicWsClient {
                 this.orderbookPendingResync.clear();
                 this.orderbookGapCount.clear();
                 this.orderbookGapWindowStart.clear();
-                this.sentSubscriptions.clear();
+                this.subscriptions.onOpen();
                 this.scheduleStableReset();
                 this.startPing();
                 this.flushSubscriptions();
-                logger.info(m('ok', '[OKXWS] connection open'));
+                logger.info(m('ok', `[OKXWS#${this.clientInstanceId}] connection open`));
                 resolve();
             });
 
@@ -157,14 +258,14 @@ export class OkxPublicWsClient {
                     : '';
                 const lastErrorText = this.lastError ? ` lastErrorText=${this.lastError}` : '';
                 logger.warn(
-                    m('warn', `[OKXWS] close code=${code}${reasonText ? ` reason=${reasonText}` : ''}${lastError}${lastErrorText}`)
+                    m('warn', `[OKXWS#${this.clientInstanceId}] close code=${code}${reasonText ? ` reason=${reasonText}` : ''}${lastError}${lastErrorText}`)
                 );
                 this.clearStableReset();
                 cleanup('close');
             });
 
             socket.on('error', (err) => {
-                logger.warn(m('warn', `[OKXWS] error: ${(err as Error).message}`));
+                logger.warn(m('warn', `[OKXWS#${this.clientInstanceId}] error: ${(err as Error).message}`));
                 this.clearStableReset();
                 if (this.state === 'connecting') {
                     cleanup('connect-error');
@@ -183,7 +284,7 @@ export class OkxPublicWsClient {
         this.orderbookPendingResync.clear();
         this.orderbookGapCount.clear();
         this.orderbookGapWindowStart.clear();
-        this.sentSubscriptions.clear();
+        this.subscriptions.onClose();
         if (!this.socket) return;
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
@@ -251,27 +352,36 @@ export class OkxPublicWsClient {
 
     private subscribe(arg: OkxArg): void {
         const normalized = this.normalizeSubArg(arg);
-        const key = buildSubKey(normalized);
-        if (this.subscriptions.has(key)) {
-            if (this.sentSubscriptions.has(key)) return;
-        } else {
-            this.subscriptions.add(key);
-        }
-        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-        if (this.sentSubscriptions.has(key)) return;
-        this.sendJson({ op: 'subscribe', args: [normalized] });
-        this.sentSubscriptions.add(key);
+        this.subscriptions.requestSubscribe(normalized);
+        this.flushSubscriptions();
     }
 
     private flushSubscriptions(): void {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-        if (this.subscriptions.size === 0) return;
-        const pending = Array.from(this.subscriptions).filter((entry) => !this.sentSubscriptions.has(entry));
-        if (pending.length === 0) return;
-        const args: OkxArg[] = pending.map((entry) => JSON.parse(entry) as OkxArg);
-        this.sendJson({ op: 'subscribe', args });
-        pending.forEach((entry) => this.sentSubscriptions.add(entry));
-        logger.info(m('connect', `[OKXWS] subscribed ${args.length} channels`));
+        if (this.reconcileInFlight) {
+            this.reconcileQueued = true;
+            return;
+        }
+        this.reconcileInFlight = true;
+        try {
+            const diff = this.subscriptions.buildDiff();
+            if (diff.length === 0) return;
+            const args = diff.map((entry) => entry.arg);
+            this.sendJson({ op: 'subscribe', args });
+            this.subscriptions.markPending(diff.map((entry) => entry.key));
+            logger.info(
+                m(
+                    'connect',
+                    `[OKXWS#${this.clientInstanceId}] subscribe diff=${diff.length} totalDesired=${this.subscriptions.desiredCount()} active=${this.subscriptions.activeCount()} pending=${this.subscriptions.pendingCount()}`
+                )
+            );
+        } finally {
+            this.reconcileInFlight = false;
+            if (this.reconcileQueued) {
+                this.reconcileQueued = false;
+                this.flushSubscriptions();
+            }
+        }
     }
 
     private onMessage(raw: string): void {
@@ -291,23 +401,28 @@ export class OkxPublicWsClient {
             if (event === 'error') {
                 const argPreview = arg ? ` arg=${JSON.stringify(arg)}` : '';
                 logger.warn(
-                    m('warn', `[OKXWS] event=${event}${code ? ` code=${code}` : ''}${msg ? ` msg=${msg}` : ''}${argPreview}`)
+                    m('warn', `[OKXWS#${this.clientInstanceId}] event=${event}${code ? ` code=${code}` : ''}${msg ? ` msg=${msg}` : ''}${argPreview}`)
                 );
                 if (code === '60018' && arg?.channel && arg?.instId) {
                     const channel = String(arg.channel);
                     const instId = String(arg.instId);
                     const instType = arg.instType ? String(arg.instType) : toOkxInstType(this.marketType);
                     const subKey = buildSubKey({ channel, instId, instType: instType as OkxInstType });
-                    this.subscriptions.delete(subKey);
-                    this.sentSubscriptions.delete(subKey);
+                    this.subscriptions.remove(subKey);
                     this.lastError = `error:${code}:${msg ?? ''}`;
                 }
                 this.lastProtocolError = { event, code, msg };
             } else if (event === 'subscribe' || event === 'unsubscribe') {
-                logger.debug(m('ws', `[OKXWS] event=${event}${code ? ` code=${code}` : ''}`));
+                if (event === 'subscribe' && arg?.channel && arg?.instId) {
+                    const channel = String(arg.channel);
+                    const instId = String(arg.instId);
+                    const instType = arg.instType ? String(arg.instType) : toOkxInstType(this.marketType);
+                    this.subscriptions.markActive(buildSubKey({ channel, instId, instType: instType as OkxInstType }));
+                }
+                logger.debug(m('ws', `[OKXWS#${this.clientInstanceId}] event=${event}${code ? ` code=${code}` : ''}`));
             } else {
                 logger.info(
-                    m('ws', `[OKXWS] event=${event}${code ? ` code=${code}` : ''}${msg ? ` msg=${msg}` : ''}`)
+                    m('ws', `[OKXWS#${this.clientInstanceId}] event=${event}${code ? ` code=${code}` : ''}${msg ? ` msg=${msg}` : ''}`)
                 );
             }
 
@@ -390,6 +505,11 @@ export class OkxPublicWsClient {
     private handleKlines(instId: string, channel: string, rows: unknown[]): void {
         const interval = toKlineInterval(channel);
         if (!interval) return;
+        const marketType = this.marketType ?? detectMarketType(instId);
+        if (!isKnownMarketType(marketType)) {
+            logger.warn(m('warn', `[OKXWS#${this.clientInstanceId}] kline skipped for ${instId}: marketType=${marketType ?? 'unknown'}`));
+            return;
+        }
         for (const row of rows) {
             if (!Array.isArray(row) || row.length < 6) continue;
             const startTs = toOptionalNumber(row[0]);
@@ -413,6 +533,7 @@ export class OkxPublicWsClient {
             }
 
             const endTs = startTs + intervalToMs(interval);
+            const sourceId = normalizeKlineSourceId(this.streamId);
             const evt: KlineEvent = {
                 symbol: normalizeOkxSymbol(instId),
                 interval,
@@ -424,15 +545,15 @@ export class OkxPublicWsClient {
                 low,
                 close,
                 volume,
-                streamId: this.streamId,
-                marketType: this.marketType ?? detectMarketType(instId),
+                streamId: sourceId,
+                marketType,
                 meta: createMeta('market', {
                     tsEvent: asTsMs(endTs),
                     tsExchange: asTsMs(endTs),
                     tsIngest: asTsMs(this.now()),
-                    streamId: this.streamId,
+                    streamId: sourceId,
                 }),
-            } as KlineEvent;
+            };
             this.bus.publish('market:kline', evt);
 
             const rawEvt = mapCandleRaw(
@@ -449,7 +570,7 @@ export class OkxPublicWsClient {
                 true,
                 endTs,
                 this.now(),
-                this.marketType
+                marketType
             );
             this.bus.publish('market:candle_raw', rawEvt);
         }
@@ -745,12 +866,12 @@ export class OkxPublicWsClient {
         const jitter = Math.floor(base * 0.2 * stableJitterFactor(`okx:${reason}`, this.reconnectAttempts));
         const delay = Math.min(this.reconnectMaxMs, base + jitter);
         this.lastReconnectDelayMs = delay;
-        logger.warn(m('warn', `[OKXWS] reconnect in ${delay}ms (reason=${reason})`));
+        logger.warn(m('warn', `[OKXWS#${this.clientInstanceId}] reconnect in ${delay}ms (reason=${reason})`));
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
             this.connect().catch((err) => {
                 const msg = toErrorMessage(err);
-                logger.warn(m('warn', `[OKXWS] reconnect failed: ${msg}`));
+                logger.warn(m('warn', `[OKXWS#${this.clientInstanceId}] reconnect failed: ${msg}`));
             });
         }, delay);
     }
@@ -784,7 +905,7 @@ function buildSubKey(arg: OkxArg): string {
     return JSON.stringify({ channel: arg.channel, instId: arg.instId, instType: arg.instType });
 }
 
-function toOkxInstId(symbol: string, marketType?: MarketType): string | undefined {
+function toOkxInstId(symbol: string, marketType?: KnownMarketType): string | undefined {
     const raw = symbol.trim().toUpperCase();
     if (!raw) return undefined;
     if (raw.includes('-')) return raw;
@@ -795,14 +916,18 @@ function toOkxInstId(symbol: string, marketType?: MarketType): string | undefine
     return `${base}-SWAP`;
 }
 
-function toOkxInstType(marketType?: MarketType): OkxInstType {
+function toOkxInstType(marketType?: KnownMarketType): OkxInstType {
     return marketType === 'spot' ? 'SPOT' : 'SWAP';
 }
 
-function detectMarketType(instId: string): MarketType {
+function detectMarketType(instId: string): KnownMarketType {
     const upper = instId.toUpperCase();
     if (upper.includes('SWAP') || upper.includes('FUTURE')) return 'futures';
     return 'spot';
+}
+
+function isKnownMarketType(value: unknown): value is KnownMarketType {
+    return value === 'spot' || value === 'futures';
 }
 
 function parseLevels(raw: unknown): OrderbookLevel[] {
@@ -823,6 +948,10 @@ function toOptionalNumber(value: unknown): number | undefined {
     if (value === undefined || value === null) return undefined;
     const num = typeof value === 'number' ? value : Number(value);
     return Number.isFinite(num) ? num : undefined;
+}
+
+function normalizeKlineSourceId(streamId: string): string {
+    return streamId.endsWith('.kline') ? streamId.slice(0, -6) : streamId;
 }
 
 function toOkxCandleChannel(interval: KlineInterval): string | undefined {

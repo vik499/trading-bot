@@ -1,4 +1,13 @@
-import { inheritMeta, type AggregatedQualityFlags, type EventBus, type MarketCvdAggEvent, type MarketCvdEvent, type MarketType } from '../core/events/EventBus';
+import {
+    asTsMs,
+    createMeta,
+    nowMs,
+    type AggregatedQualityFlags,
+    type EventBus,
+    type KnownMarketType,
+    type MarketCvdAggEvent,
+    type MarketCvdEvent,
+} from '../core/events/EventBus';
 import { computeConfidenceScore, getSourceTrustAdjustments } from '../core/confidence';
 import { stableRecordFromEntries, stableSortStrings } from '../core/determinism';
 import { sourceRegistry } from '../core/market/SourceRegistry';
@@ -9,6 +18,9 @@ export interface CvdAggregatorOptions {
     ttlMs?: number;
     providerId?: string;
     weights?: Record<string, number>;
+    unitMultipliers?: Record<string, number>;
+    signOverrides?: Record<string, number>;
+    now?: () => number;
 }
 
 interface SourceState {
@@ -24,7 +36,10 @@ export class CvdAggregator {
     private readonly ttlMs: number;
     private readonly providerId: string;
     private readonly weights: Record<string, number>;
-    private readonly sources = new Map<string, Map<MarketType, Map<string, SourceState>>>();
+    private readonly unitMultipliers: Record<string, number>;
+    private readonly signOverrides: Record<string, number>;
+    private readonly now: () => number;
+    private readonly sources = new Map<string, Map<KnownMarketType, Map<string, SourceState>>>();
     private unsubscribe?: () => void;
 
     constructor(bus: EventBus, options: CvdAggregatorOptions = {}) {
@@ -32,6 +47,9 @@ export class CvdAggregator {
         this.ttlMs = Math.max(1_000, options.ttlMs ?? 120_000);
         this.providerId = options.providerId ?? 'local_cvd_agg';
         this.weights = options.weights ?? {};
+        this.unitMultipliers = options.unitMultipliers ?? {};
+        this.signOverrides = options.signOverrides ?? {};
+        this.now = options.now ?? nowMs;
     }
 
     start(): void {
@@ -51,11 +69,11 @@ export class CvdAggregator {
         this.unsubscribe = undefined;
     }
 
-    private onCvd(evt: MarketCvdEvent, marketType: MarketType): void {
+    private onCvd(evt: MarketCvdEvent, marketType: KnownMarketType): void {
         if (!evt.streamId) return;
         const symbol = evt.symbol;
         const normalizedSymbol = normalizeSymbol(symbol);
-        const ts = evt.meta.ts;
+        const ts = evt.meta.tsEvent;
         const byType = this.sources.get(symbol) ?? new Map();
         const byStream = byType.get(marketType) ?? new Map();
         byStream.set(evt.streamId, {
@@ -82,7 +100,6 @@ export class CvdAggregator {
             ts,
             cvd: aggregate.cvdTotal,
             cvdDelta: aggregate.cvdDelta,
-            cvdSpot: marketType === 'spot' ? aggregate.cvdTotal : undefined,
             cvdFutures: marketType === 'futures' ? aggregate.cvdTotal : undefined,
             bucketStartTs: evt.bucketStartTs,
             bucketEndTs: evt.bucketEndTs,
@@ -98,7 +115,11 @@ export class CvdAggregator {
             confidenceScore: aggregate.confidenceScore,
             provider: this.providerId,
             marketType,
-            meta: inheritMeta(evt.meta, 'global_data', { ts }),
+            meta: createMeta('global_data', {
+                tsEvent: asTsMs(ts),
+                tsIngest: asTsMs(evt.meta.tsIngest ?? this.now()),
+                correlationId: evt.meta.correlationId,
+            }),
         };
 
         if (marketType === 'spot') {
@@ -142,12 +163,14 @@ export class CvdAggregator {
                 continue;
             }
             const weight = this.weights[streamId] ?? 1;
-            weightedTotal += state.cvdTotal * weight;
+            const normalizedTotal = this.normalizeCvdValue(streamId, state.cvdTotal);
+            const normalizedDelta = this.normalizeCvdValue(streamId, state.cvdDelta);
+            weightedTotal += normalizedTotal * weight;
             if (state.bucketStartTs === bucketStartTs) {
-                weightedDelta += state.cvdDelta * weight;
+                weightedDelta += normalizedDelta * weight;
             }
             weightTotal += weight;
-            venueEntries.push([streamId, state.cvdTotal]);
+            venueEntries.push([streamId, normalizedTotal]);
             sourcesUsed.push(streamId);
             weightsEntries.push([streamId, weight]);
         }
@@ -180,5 +203,12 @@ export class CvdAggregator {
             mismatchDetected,
             confidenceScore,
         };
+    }
+
+    private normalizeCvdValue(streamId: string, value: number): number {
+        const multiplier = this.unitMultipliers[streamId] ?? 1;
+        const sign = this.signOverrides[streamId] ?? 1;
+        const normalizedSign = sign >= 0 ? 1 : -1;
+        return value * multiplier * normalizedSign;
     }
 }

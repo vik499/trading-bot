@@ -43,11 +43,11 @@ describe('EventJournal', () => {
     });
     journal.start();
 
-    const meta1 = createMeta('market', { ts: 1_700_000_000_000 });
-    const meta2 = createMeta('market', { ts: 1_700_000_000_500 });
+    const meta1 = createMeta('market', { tsEvent: 1_700_000_000_000, tsIngest: 1_700_000_000_000, streamId: 'test-stream' });
+    const meta2 = createMeta('market', { tsEvent: 1_700_000_000_500, tsIngest: 1_700_000_000_500, streamId: 'test-stream' });
 
-    bus.publish('market:ticker', { meta: meta1, symbol, exchangeTs: 1_700_000_000_000 });
-    bus.publish('market:ticker', { meta: meta2, symbol, exchangeTs: 1_700_000_000_400 });
+    bus.publish('market:ticker', { meta: meta1, symbol, streamId: 'test-stream', marketType: 'futures', exchangeTs: 1_700_000_000_000 });
+    bus.publish('market:ticker', { meta: meta2, symbol, streamId: 'test-stream', marketType: 'futures', exchangeTs: 1_700_000_000_400 });
 
     await wait(40);
     const filePath = journal.partitionPath(symbol, meta1.ts);
@@ -65,8 +65,8 @@ describe('EventJournal', () => {
     journal = createEventJournal(bus, { baseDir: tmpDir, streamId: 's1', runId, flushIntervalMs: 5, maxBatchSize: 1 });
     journal.start();
 
-    const meta = createMeta('market', { ts: Date.UTC(2023, 0, 2, 0, 0, 0) });
-    bus.publish('market:ticker', { meta, symbol, exchangeTs: meta.ts });
+    const meta = createMeta('market', { tsEvent: Date.UTC(2023, 0, 2, 0, 0, 0), tsIngest: Date.UTC(2023, 0, 2, 0, 0, 0), streamId: 's1' });
+    bus.publish('market:ticker', { meta, symbol, streamId: 's1', marketType: 'futures', exchangeTs: meta.ts });
 
     await wait(30);
     const expectedPath = path.join(tmpDir, 's1', symbol, 'market-ticker', runId, '2023-01-02.jsonl');
@@ -91,7 +91,9 @@ describe('EventJournal', () => {
       low: 99,
       close: 100.5,
       volume: 10,
-      meta: createMeta('market', { ts: startTs + 5 * 60_000 }),
+      streamId: 's1',
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: startTs + 5 * 60_000, tsIngest: startTs + 5 * 60_000, streamId: 's1' }),
     };
     const kline2: KlineEvent = {
       symbol,
@@ -104,7 +106,9 @@ describe('EventJournal', () => {
       low: 100,
       close: 101,
       volume: 12,
-      meta: createMeta('market', { ts: startTs + 10 * 60_000 }),
+      streamId: 's1',
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: startTs + 10 * 60_000, tsIngest: startTs + 10 * 60_000, streamId: 's1' }),
     };
 
     bus.publish('market:kline', kline1);
@@ -135,7 +139,12 @@ describe('EventJournal', () => {
       size: 0.5,
       tradeTs: Date.UTC(2023, 0, 2, 0, 0, 0),
       exchangeTs: Date.UTC(2023, 0, 2, 0, 0, 0),
-      meta: createMeta('market', { ts: Date.UTC(2023, 0, 2, 0, 0, 1) }),
+      marketType: 'futures',
+      meta: createMeta('market', {
+        tsEvent: Date.UTC(2023, 0, 2, 0, 0, 0),
+        tsIngest: Date.UTC(2023, 0, 2, 0, 0, 1),
+        streamId: 's1',
+      }),
     };
 
     bus.publish('market:trade', trade);
@@ -151,8 +160,8 @@ describe('EventJournal', () => {
 
     journal = createEventJournal(bus, { baseDir: tmpDir, streamId: 's1', runId: 'run-a', flushIntervalMs: 5, maxBatchSize: 1 });
     journal.start();
-    const metaA = createMeta('market', { ts: 1_000 });
-    bus.publish('market:ticker', { meta: metaA, symbol, exchangeTs: 1_000 });
+    const metaA = createMeta('market', { tsEvent: 1_000, tsIngest: 1_000, streamId: 's1' });
+    bus.publish('market:ticker', { meta: metaA, symbol, streamId: 's1', marketType: 'futures', exchangeTs: 1_000 });
     await wait(20);
     await journal.stop();
     const fileA = journal.partitionPath(symbol, metaA.ts);
@@ -160,8 +169,8 @@ describe('EventJournal', () => {
 
     journal = createEventJournal(bus, { baseDir: tmpDir, streamId: 's1', runId: 'run-b', flushIntervalMs: 5, maxBatchSize: 1 });
     journal.start();
-    const metaB = createMeta('market', { ts: 2_000 });
-    bus.publish('market:ticker', { meta: metaB, symbol, exchangeTs: 2_000 });
+    const metaB = createMeta('market', { tsEvent: 2_000, tsIngest: 2_000, streamId: 's1' });
+    bus.publish('market:ticker', { meta: metaB, symbol, streamId: 's1', marketType: 'futures', exchangeTs: 2_000 });
     await wait(20);
     await journal.stop();
     const fileB = journal.partitionPath(symbol, metaB.ts);
@@ -179,8 +188,8 @@ describe('EventJournal', () => {
     journal = createEventJournal(bus, { baseDir: tmpDir, runId, latencySpikeMs: 500, flushIntervalMs: 5, maxBatchSize: 1 });
     journal.start();
 
-    const meta = createMeta('market', { ts: 2_000 });
-    bus.publish('market:ticker', { meta, symbol, exchangeTs: 0 });
+    const meta = createMeta('market', { tsEvent: 2_000, tsIngest: 2_000, streamId: 's1' });
+    bus.publish('market:ticker', { meta, symbol, streamId: 's1', marketType: 'futures', exchangeTs: 0 });
 
     await wait(20);
     expect(spikes.length).toBe(1);
@@ -194,10 +203,10 @@ describe('EventJournal', () => {
     journal = createEventJournal(bus, { baseDir: tmpDir, runId, flushIntervalMs: 5, maxBatchSize: 1 });
     journal.start();
 
-    const meta1 = createMeta('market', { ts: 10 });
-    const meta2 = createMeta('market', { ts: 20 });
-    bus.publish('market:ticker', { meta: meta1, symbol, exchangeTs: 2000 });
-    bus.publish('market:ticker', { meta: meta2, symbol, exchangeTs: 1000 });
+    const meta1 = createMeta('market', { tsEvent: 10, tsIngest: 10, streamId: 's1' });
+    const meta2 = createMeta('market', { tsEvent: 20, tsIngest: 20, streamId: 's1' });
+    bus.publish('market:ticker', { meta: meta1, symbol, streamId: 's1', marketType: 'futures', exchangeTs: 2000 });
+    bus.publish('market:ticker', { meta: meta2, symbol, streamId: 's1', marketType: 'futures', exchangeTs: 1000 });
 
     await wait(20);
     expect(outOfOrder.length).toBe(1);
@@ -222,7 +231,9 @@ describe('EventJournal', () => {
       low: 1,
       close: 1,
       volume: 1,
-      meta: createMeta('market', { ts: 300_000 }),
+      streamId: 's1',
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 300_000, tsIngest: 300_000, streamId: 's1' }),
     };
     const klineB: KlineEvent = {
       symbol,
@@ -235,7 +246,9 @@ describe('EventJournal', () => {
       low: 1,
       close: 1,
       volume: 1,
-      meta: createMeta('market', { ts: 100_000 }),
+      streamId: 's1',
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 100_000, tsIngest: 100_000, streamId: 's1' }),
     };
     const klineOtherTf: KlineEvent = {
       symbol,
@@ -248,7 +261,9 @@ describe('EventJournal', () => {
       low: 1,
       close: 1,
       volume: 1,
-      meta: createMeta('market', { ts: 3_600_000 }),
+      streamId: 's1',
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 3_600_000, tsIngest: 3_600_000, streamId: 's1' }),
     };
 
     bus.publish('market:kline', klineA);
@@ -276,7 +291,8 @@ describe('EventJournal', () => {
       size: 1,
       tradeTs: 2_000,
       exchangeTs: 2_000,
-      meta: createMeta('market', { ts: 2_000 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 2_000, tsIngest: 2_000, streamId: 's1' }),
     };
     const tradeB: TradeEvent = {
       symbol,
@@ -287,7 +303,8 @@ describe('EventJournal', () => {
       size: 1,
       tradeTs: 1_000,
       exchangeTs: 1_000,
-      meta: createMeta('market', { ts: 2_500 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_000, tsIngest: 2_500, streamId: 's1' }),
     };
 
     bus.publish('market:trade', tradeA);
@@ -308,7 +325,7 @@ describe('EventJournal', () => {
     const appendMock = fsPromises.appendFile as unknown as ReturnType<typeof vi.fn>;
     appendMock.mockRejectedValueOnce(new Error('disk full'));
 
-    const meta = createMeta('market', { ts: 100 });
+    const meta = createMeta('market', { tsEvent: 100, tsIngest: 100, streamId: 's1' });
     bus.publish('market:ticker', { meta, symbol, exchangeTs: 50 });
 
     await wait(30);

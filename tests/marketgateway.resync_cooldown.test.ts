@@ -43,11 +43,11 @@ describe('MarketGateway resync cooldown', () => {
       symbol: 'BTCUSDT',
       channel: 'orderbook',
       reason: 'gap',
-      meta: createMeta('market', { ts: 1000 }),
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId: 'binance.usdm.public' }),
     };
     const second: MarketResyncRequested = {
       ...first,
-      meta: createMeta('market', { ts: 1500 }),
+      meta: createMeta('market', { tsEvent: 1500, tsIngest: 1500, streamId: 'binance.usdm.public' }),
     };
 
     bus.publish('market:resync_requested', first);

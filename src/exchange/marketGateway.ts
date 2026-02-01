@@ -5,6 +5,7 @@ import {
     createMeta,
     eventBus,
     inheritMeta,
+    nowMs,
     type EventMeta,
     type EventBus,
     type Kline,
@@ -20,10 +21,12 @@ import {
     type MarketErrorEvent,
     type MarketResyncRequested,
     type MarketSubscribeRequest,
+    type KnownMarketType,
     type MarketType,
     type VenueId,
 } from '../core/events/EventBus';
 import type { OpenInterestCollector } from '../core/market/OpenInterestCollector';
+import { inferMarketTypeFromStreamId } from '../core/market/symbols';
 import { BybitDerivativesRestPoller, BybitPublicRestClient, type KlineFetchResult } from './bybit/restClient';
 
 export interface MarketWsClient {
@@ -48,7 +51,7 @@ export interface MarketGatewayOptions {
     enableResync?: boolean;
     resyncStrategy?: 'reconnect' | 'ignore';
     venue?: VenueId;
-    marketType?: MarketType;
+    marketType?: KnownMarketType;
     resyncCooldownMs?: number;
     resyncLogCooldownMs?: number;
     resyncReasonCooldownMs?: number;
@@ -70,7 +73,7 @@ export class MarketGateway {
     private readonly enableResync: boolean;
     private readonly resyncStrategy: 'reconnect' | 'ignore';
     private readonly venue?: VenueId;
-    private readonly marketType?: MarketType;
+    private readonly marketType?: KnownMarketType;
     private readonly resyncCooldownMs: number;
     private readonly resyncLogCooldownMs: number;
     private readonly resyncReasonCooldownMs: number;
@@ -270,6 +273,8 @@ export class MarketGateway {
     }
 
     private async handleKlineBootstrap(payload: KlineBootstrapRequested): Promise<void> {
+        if (payload.venue && this.venue && payload.venue !== this.venue) return;
+        if (payload.marketType && this.marketType && payload.marketType !== this.marketType) return;
         const startedAt = payload.meta.ts;
         try {
             const result = await this.restClient.fetchKlines({
@@ -295,13 +300,24 @@ export class MarketGateway {
                 return;
             }
 
+            const sourceId = normalizeKlineSourceId(this.restClient.streamId ?? 'unknown');
+            const marketType =
+                payload.marketType ??
+                this.asKnownMarketType(this.restClient.marketType) ??
+                this.asKnownMarketType(inferMarketTypeFromStreamId(sourceId)) ??
+                'futures';
             for (const kline of ordered) {
                 const event: KlineEvent = {
                     ...kline,
                     tf: kline.tf ?? payload.tf,
-                    streamId: this.restClient.streamId,
-                    marketType: this.restClient.marketType,
-                    meta: inheritMeta(payload.meta, 'market', { tsEvent: asTsMs(kline.endTs) }),
+                    streamId: sourceId,
+                    marketType,
+                    meta: createMeta('market', {
+                        tsEvent: asTsMs(kline.endTs),
+                        tsIngest: asTsMs(nowMs()),
+                        correlationId: payload.meta.correlationId,
+                        streamId: sourceId,
+                    }),
                 };
                 this.bus.publish('market:kline', event);
             }
@@ -369,6 +385,11 @@ export class MarketGateway {
             .join(' ');
 
         logger.warn(m('warn', `[KlineBootstrap] empty response ${parts}`));
+    }
+
+    private asKnownMarketType(value?: MarketType): KnownMarketType | undefined {
+        if (value === 'spot' || value === 'futures') return value;
+        return undefined;
     }
 
     private async subscribeTopics(parentMeta: EventMeta, topics: string[]): Promise<void> {
@@ -479,6 +500,13 @@ function intervalToMs(interval: KlineInterval): number | undefined {
     const minutes = Number.parseInt(interval, 10);
     if (!Number.isFinite(minutes) || minutes <= 0) return undefined;
     return minutes * 60_000;
+}
+
+function normalizeKlineSourceId(streamId: string): string {
+    if (streamId.endsWith('.kline')) {
+        return streamId.replace('.kline', '');
+    }
+    return streamId;
 }
 
 function readFlagFromEnv(name: string, fallback = true): boolean {

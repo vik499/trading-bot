@@ -14,9 +14,10 @@ describe('PriceIndexAggregator', () => {
     const makeTicker = (streamId: string, ts: number, indexPrice: string): TickerEvent => ({
       symbol: 'BTCUSDT',
       streamId,
+      marketType: 'futures',
       indexPrice,
       exchangeTs: ts,
-      meta: createMeta('market', { ts }),
+      meta: createMeta('market', { tsEvent: ts, tsIngest: ts, streamId }),
     });
 
     bus.publish('market:ticker', makeTicker('s1', 1000, '100'));

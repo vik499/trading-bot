@@ -36,7 +36,7 @@ describe('Trade routing -> CVD aggregation', () => {
       tradeTs: 1_000,
       exchangeTs: 1_000,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 1_000 }),
+      meta: createMeta('market', { tsEvent: 1_000, tsIngest: 1_000, streamId: 'binance.usdm.public' }),
     } as TradeEvent;
     const trade2: TradeEvent = {
       symbol: 'BTCUSDT',
@@ -47,7 +47,7 @@ describe('Trade routing -> CVD aggregation', () => {
       tradeTs: 2_000,
       exchangeTs: 2_000,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 2_000 }),
+      meta: createMeta('market', { tsEvent: 2_000, tsIngest: 2_000, streamId: 'binance.usdm.public' }),
     } as TradeEvent;
 
     bus.publish('market:trade', trade1);

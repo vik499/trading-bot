@@ -3,8 +3,8 @@ import fs from 'fs';
 import path from 'path';
 import { logger } from '../infra/logger';
 import { BybitPublicWsClient } from '../exchange/bybit/wsClient';
-import { BinancePublicWsClient } from '../exchange/binance/wsClient';
-import { OkxPublicWsClient } from '../exchange/okx/wsClient';
+import { getBinancePublicWsClient } from '../exchange/binance/wsClient';
+import { getOkxPublicWsClient } from '../exchange/okx/wsClient';
 import { Orchestrator } from '../control/orchestrator';
 import {
     createMeta,
@@ -418,24 +418,47 @@ class LiveBotApp {
             marketType: 'futures',
             supportsLiquidations: true,
         });
-        const binanceWs = new BinancePublicWsClient('wss://fstream.binance.com/ws', {
+        const binanceWs = getBinancePublicWsClient({
+            url: 'wss://fstream.binance.com/ws',
             streamId: 'binance.usdm.public',
             marketType: 'futures',
             restClient: binanceRestClient,
             supportsLiquidations: true,
         });
-        const okxWs = new OkxPublicWsClient('wss://ws.okx.com:8443/ws/v5/public', {
+        logger.info(
+            m(
+                'connect',
+                `[MarketGateway] creating BinanceWS client id=${binanceWs.clientInstanceId} venue=binance streamId=binance.usdm.public symbol=n/a marketType=futures`
+            )
+        );
+        const okxWs = getOkxPublicWsClient({
+            url: 'wss://ws.okx.com:8443/ws/v5/public',
             streamId: 'okx.public.swap',
             marketType: 'futures',
             supportsLiquidations: true,
         });
+        logger.info(
+            m(
+                'connect',
+                `[MarketGateway] creating OKXWS client id=${okxWs.clientInstanceId} venue=okx streamId=${okxWs.streamId} symbol=n/a marketType=${okxWs.marketType ?? 'unknown'}`
+            )
+        );
         const okxKlineWs = okxEnableKlines
-            ? new OkxPublicWsClient('wss://ws.okx.com:8443/ws/v5/business', {
+            ? getOkxPublicWsClient({
+                  url: 'wss://ws.okx.com:8443/ws/v5/business',
                   streamId: 'okx.public.swap.kline',
                   marketType: 'futures',
                   supportsLiquidations: false,
               })
             : undefined;
+        if (okxKlineWs) {
+            logger.info(
+                m(
+                    'connect',
+                    `[MarketGateway] creating OKXWS client id=${okxKlineWs.clientInstanceId} venue=okx streamId=${okxKlineWs.streamId} symbol=n/a marketType=${okxKlineWs.marketType ?? 'unknown'}`
+                )
+            );
+        }
 
         this.marketGateways = [
             new MarketGateway(bybitWs, bybitRestClient, eventBus, derivativesPoller, { venue: 'bybit', marketType: 'futures' }),
@@ -464,24 +487,47 @@ class LiveBotApp {
         }
 
         if (enableSpot) {
-            const binanceSpotWs = new BinancePublicWsClient('wss://stream.binance.com:9443/ws', {
+            const binanceSpotWs = getBinancePublicWsClient({
+                url: 'wss://stream.binance.com:9443/ws',
                 streamId: 'binance.spot.public',
                 marketType: 'spot',
                 supportsLiquidations: false,
                 supportsOrderbook: false,
             });
-            const okxSpotWs = new OkxPublicWsClient('wss://ws.okx.com:8443/ws/v5/public', {
+            logger.info(
+                m(
+                    'connect',
+                    `[MarketGateway] creating BinanceWS client id=${binanceSpotWs.clientInstanceId} venue=binance streamId=binance.spot.public symbol=n/a marketType=spot`
+                )
+            );
+            const okxSpotWs = getOkxPublicWsClient({
+                url: 'wss://ws.okx.com:8443/ws/v5/public',
                 streamId: 'okx.public.spot',
                 marketType: 'spot',
                 supportsLiquidations: false,
             });
+            logger.info(
+                m(
+                    'connect',
+                    `[MarketGateway] creating OKXWS client id=${okxSpotWs.clientInstanceId} venue=okx streamId=${okxSpotWs.streamId} symbol=n/a marketType=${okxSpotWs.marketType ?? 'unknown'}`
+                )
+            );
             const okxSpotKlineWs = okxEnableKlines
-                ? new OkxPublicWsClient('wss://ws.okx.com:8443/ws/v5/business', {
+                ? getOkxPublicWsClient({
+                      url: 'wss://ws.okx.com:8443/ws/v5/business',
                       streamId: 'okx.public.spot.kline',
                       marketType: 'spot',
                       supportsLiquidations: false,
                   })
                 : undefined;
+            if (okxSpotKlineWs) {
+                logger.info(
+                    m(
+                        'connect',
+                        `[MarketGateway] creating OKXWS client id=${okxSpotKlineWs.clientInstanceId} venue=okx streamId=${okxSpotKlineWs.streamId} symbol=n/a marketType=${okxSpotKlineWs.marketType ?? 'unknown'}`
+                    )
+                );
+            }
             this.marketGateways.push(
                 new MarketGateway(binanceSpotWs, binanceRestClient, eventBus, derivativesPoller, {
                     enableKlineBootstrap: false,
@@ -591,7 +637,7 @@ class LiveBotApp {
         this.marketDataReadiness = new MarketDataReadiness(eventBus, {
             bucketMs: getReadinessBucketMs(),
             warmingWindowMs: getReadinessWarmupMs(),
-            expectedSources: getExpectedSources(),
+            expectedSources: Math.max(1, getExpectedSources()),
             expectedSourcesConfig,
             expectedSourcesByBlock: {
                 price: Object.keys(globalWeights),

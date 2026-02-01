@@ -101,8 +101,10 @@ describe('Production-like pipeline market -> analytics -> strategy -> risk', () 
     const correlationId = 'prod-pipeline-1';
     const ticker: TickerEvent = {
       symbol: 'TESTUSD',
+      streamId: 'bybit.public.linear.v5',
+      marketType: 'futures',
       lastPrice: '111',
-      meta: { ...createMeta('market'), correlationId },
+      meta: { ...createMeta('market', { tsEvent: 1, tsIngest: 1, streamId: 'bybit.public.linear.v5' }), correlationId },
     };
 
     const waitRisk = waitForEvent(bus, 'risk:approved_intent');

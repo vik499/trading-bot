@@ -1,4 +1,11 @@
-import { asTsMs, inheritMeta, type EventBus, type LiquidationEvent, type MarketLiquidationsAggEvent } from '../core/events/EventBus';
+import {
+    asTsMs,
+    createMeta,
+    nowMs,
+    type EventBus,
+    type LiquidationEvent,
+    type MarketLiquidationsAggEvent,
+} from '../core/events/EventBus';
 import { bucketCloseTs, bucketStartTs as bucketStartTsFromTs } from '../core/buckets';
 import { computeConfidenceScore, getSourceTrustAdjustments } from '../core/confidence';
 import { stableRecordFromEntries, stableSortStrings } from '../core/determinism';
@@ -11,6 +18,7 @@ export interface LiquidationAggregatorOptions {
     ttlMs?: number;
     providerId?: string;
     weights?: Record<string, number>;
+    now?: () => number;
 }
 
 interface SourceBucketState {
@@ -39,6 +47,7 @@ export class LiquidationAggregator {
     private readonly ttlMs: number;
     private readonly providerId: string;
     private readonly weights: Record<string, number>;
+    private readonly now: () => number;
     private readonly buckets = new Map<string, BucketState>();
     private unsubscribe?: () => void;
 
@@ -48,6 +57,7 @@ export class LiquidationAggregator {
         this.ttlMs = Math.max(1_000, options.ttlMs ?? 120_000);
         this.providerId = options.providerId ?? 'local_liq_agg';
         this.weights = options.weights ?? {};
+        this.now = options.now ?? nowMs;
     }
 
     start(): void {
@@ -64,11 +74,11 @@ export class LiquidationAggregator {
 
     private onLiquidation(evt: LiquidationEvent): void {
         if (!evt.streamId) return;
-        const ts = evt.meta.ts;
+        const ts = evt.meta.tsEvent;
         const bucketEndTs = bucketCloseTs(ts, this.bucketMs);
         const bucketStartTs = bucketStartTsFromTs(ts, this.bucketMs);
         const symbol = evt.symbol;
-        const marketType = normalizeMarketType(evt.marketType ?? 'futures');
+        const marketType = normalizeMarketType(evt.marketType);
         const key = `${symbol}:${marketType}`;
         const current = this.buckets.get(key);
 
@@ -208,7 +218,11 @@ export class LiquidationAggregator {
             bucketStartTs: bucket.bucketStartTs,
             bucketEndTs: bucket.bucketEndTs,
             bucketSizeMs: this.bucketMs,
-            meta: inheritMeta(bucket.lastMeta, 'global_data', { tsEvent: asTsMs(bucket.bucketEndTs) }),
+            meta: createMeta('global_data', {
+                tsEvent: asTsMs(bucket.bucketEndTs),
+                tsIngest: asTsMs(bucket.lastMeta.tsIngest ?? this.now()),
+                correlationId: bucket.lastMeta.correlationId,
+            }),
         };
         this.bus.publish('market:liquidations_agg', payload);
         sourceRegistry.markAggEmitted(

@@ -73,8 +73,10 @@ describe('EventBus pipeline market -> analytics -> research', () => {
   it('publishes feature vector once for a market ticker', async () => {
     const ticker: TickerEvent = {
       symbol: 'TESTUSD',
+      streamId: 'bybit.public.linear.v5',
+      marketType: 'futures',
       lastPrice: '101',
-      meta: createMeta('market'),
+      meta: createMeta('market', { tsEvent: 1, tsIngest: 1, streamId: 'bybit.public.linear.v5' }),
     };
 
     const wait = waitForEvent(bus, 'research:featureVectorRecorded');
@@ -91,8 +93,10 @@ describe('EventBus pipeline market -> analytics -> research', () => {
   it('preserves correlationId through analytics -> research chain', async () => {
     const ticker: TickerEvent = {
       symbol: 'TESTUSD',
+      streamId: 'bybit.public.linear.v5',
+      marketType: 'futures',
       lastPrice: '202',
-      meta: { ...createMeta('market'), correlationId: 'corr-123' },
+      meta: { ...createMeta('market', { tsEvent: 1, tsIngest: 1, streamId: 'bybit.public.linear.v5' }), correlationId: 'corr-123' },
     };
 
     const wait = waitForEvent(bus, 'research:featureVectorRecorded');

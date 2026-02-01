@@ -41,6 +41,7 @@ export interface GlobalDataQualityConfig {
     mismatchThresholdPct?: number;
     mismatchWindowMs?: number;
     logThrottleMs?: number;
+    mismatchBaselineEpsilon?: number;
 }
 
 type AggregatedEvent =
@@ -52,6 +53,18 @@ type AggregatedEvent =
     | MarketCvdAggEvent
     | MarketPriceIndexEvent
     | MarketPriceCanonicalEvent;
+
+interface MismatchInfo {
+    diffPct: number;
+    diffAbs: number;
+    baseline: number;
+    baselineEpsilon: number;
+    insufficientBaseline: boolean;
+    venueBreakdown?: Record<string, number>;
+    bucket?: string;
+    unit?: string;
+    resetHint?: string;
+}
 
 export class GlobalDataQualityMonitor {
     private readonly bus: EventBus;
@@ -77,6 +90,7 @@ export class GlobalDataQualityMonitor {
             firstTs: number;
             lastTs: number;
             active: boolean;
+            lastInfo?: MismatchInfo;
         }
     >();
     private readonly referencePriceBySymbol = new Map<string, { price: number; ts: number }>();
@@ -89,6 +103,7 @@ export class GlobalDataQualityMonitor {
             mismatchThresholdPct: Math.max(0, config.mismatchThresholdPct ?? 0.1),
             mismatchWindowMs: Math.max(0, config.mismatchWindowMs ?? 60_000),
             logThrottleMs: Math.max(0, config.logThrottleMs ?? 30_000),
+            mismatchBaselineEpsilon: Math.max(0, config.mismatchBaselineEpsilon ?? 1e-6),
         };
     }
 
@@ -192,10 +207,17 @@ export class GlobalDataQualityMonitor {
         const min = Math.min(...nums);
         const max = Math.max(...nums);
         if (min <= 0) return;
-        const diffPct = (max - min) / min;
+        const diff = max - min;
+        const baseline = min;
+        const baselineEpsilon = this.config.mismatchBaselineEpsilon;
+        const insufficientBaseline = Math.abs(baseline) < baselineEpsilon;
+        const diffPct = insufficientBaseline ? diff / baselineEpsilon : diff / baseline;
+        const mismatchDetected = insufficientBaseline
+            ? diff >= baselineEpsilon
+            : diffPct >= this.config.mismatchThresholdPct;
         const key = this.makeKey(topic, evt.symbol, evt.provider);
 
-        if (diffPct < this.config.mismatchThresholdPct) {
+        if (!mismatchDetected) {
             const state = this.mismatchByKey.get(key);
             if (state?.active) {
                 this.clearDegradedFlag(key, 'mismatch', evt.meta.ts);
@@ -206,6 +228,17 @@ export class GlobalDataQualityMonitor {
 
         const next = this.mismatchByKey.get(key) ?? { firstTs: evt.ts, lastTs: evt.ts, active: false };
         next.lastTs = evt.ts;
+        next.lastInfo = {
+            diffPct,
+            diffAbs: diff,
+            baseline,
+            baselineEpsilon,
+            insufficientBaseline,
+            venueBreakdown: Object.fromEntries(values),
+            bucket: this.describeBucket(evt),
+            unit: this.describeUnit(evt),
+            resetHint: this.describeResetHint(evt),
+        };
         this.mismatchByKey.set(key, next);
 
         if (!next.active && evt.ts - next.firstTs >= this.config.mismatchWindowMs) {
@@ -218,15 +251,67 @@ export class GlobalDataQualityMonitor {
                 meta: createMeta('global_data', { tsEvent: asTsMs(evt.meta.tsEvent) }),
             };
             this.bus.publish('data:mismatch', payload);
+            const diffLabel = insufficientBaseline ? 'insufficient_baseline' : diffPct.toFixed(4);
             this.logThrottled(
                 `${key}:mismatch`,
                 evt.meta.ts,
-                `[GlobalData] mismatch topic=${topic} symbol=${evt.symbol} diffPct=${diffPct.toFixed(4)}`
+                `[GlobalData] mismatch topic=${topic} symbol=${evt.symbol} diffPct=${diffLabel}`
             );
+            if (topic === 'market:cvd_futures_agg') {
+                this.logMismatchDiagnostics(key, evt.meta.ts, evt.symbol, topic, next.lastInfo);
+            }
             next.active = true;
             this.mismatchByKey.set(key, next);
             this.markDegraded(key, this.resolveSourceId(topic, evt), evt.ts, evt.meta.ts, 'mismatch');
         }
+    }
+
+    private logMismatchDiagnostics(
+        key: string,
+        ts: number,
+        symbol: string,
+        topic: string,
+        info?: MismatchInfo
+    ): void {
+        if (!info) return;
+        const breakdown = info.venueBreakdown ? JSON.stringify(info.venueBreakdown) : 'n/a';
+        const bucket = info.bucket ?? 'n/a';
+        const unit = info.unit ?? 'n/a';
+        const resetHint = info.resetHint ?? 'n/a';
+        const baselineNote = info.insufficientBaseline
+            ? `baseline<epsilon (${info.baseline.toFixed(8)}<${info.baselineEpsilon.toExponential(2)})`
+            : `baseline=${info.baseline.toFixed(8)}`;
+        const message =
+            `[GlobalData] mismatch diagnostics topic=${topic} symbol=${symbol} diffPct=${info.diffPct.toFixed(4)} ` +
+            `diffAbs=${info.diffAbs.toFixed(8)} ${baselineNote} unit=${unit} bucket=${bucket} reset=${resetHint} ` +
+            `venueBreakdown=${breakdown}`;
+        logger.debugThrottled(`${key}:mismatch:diag`, message, this.config.logThrottleMs);
+    }
+
+    private describeBucket(evt: AggregatedEvent): string | undefined {
+        if (!('bucketStartTs' in evt) || !('bucketEndTs' in evt)) return undefined;
+        const start = evt.bucketStartTs;
+        const end = evt.bucketEndTs;
+        if (typeof start !== 'number' || typeof end !== 'number') return undefined;
+        const size = 'bucketSizeMs' in evt ? evt.bucketSizeMs : undefined;
+        const sizeLabel = typeof size === 'number' ? `${size}ms` : 'n/a';
+        return `${start}-${end} (${sizeLabel})`;
+    }
+
+    private describeUnit(evt: AggregatedEvent): string | undefined {
+        if ('unit' in evt && typeof evt.unit === 'string') return evt.unit;
+        if ('openInterestUnit' in evt && typeof evt.openInterestUnit === 'string') return evt.openInterestUnit;
+        return undefined;
+    }
+
+    private describeResetHint(evt: AggregatedEvent): string | undefined {
+        if (!hasVenueBreakdown(evt)) return undefined;
+        if (!('cvdDelta' in evt)) return undefined;
+        if (!('cvd' in evt)) return undefined;
+        const total = typeof evt.cvd === 'number' ? evt.cvd : undefined;
+        const delta = typeof evt.cvdDelta === 'number' ? evt.cvdDelta : undefined;
+        if (total === undefined || delta === undefined) return undefined;
+        return Math.abs(total) < Math.abs(delta) ? 'total<delta (possible reset)' : 'no';
     }
 
     private hasReferencePrice(symbol: string, tsMeta: number): boolean {

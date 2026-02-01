@@ -25,7 +25,7 @@ describe('LiquidityAggregator reset on disconnected', () => {
       marketType: 'futures',
       bids: [{ price: 100, size: 1 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 1000 }),
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId: 'stream-1' }),
     };
     const delta: OrderbookL2DeltaEvent = {
       symbol: 'BTCUSDT',
@@ -35,7 +35,7 @@ describe('LiquidityAggregator reset on disconnected', () => {
       marketType: 'futures',
       bids: [{ price: 100, size: 2 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 2000 }),
+      meta: createMeta('market', { tsEvent: 2000, tsIngest: 2000, streamId: 'stream-1' }),
     };
 
     bus.publish('market:orderbook_l2_snapshot', snapshot);
@@ -44,7 +44,7 @@ describe('LiquidityAggregator reset on disconnected', () => {
     expect(emitted.length).toBeGreaterThanOrEqual(1);
 
     bus.publish('market:disconnected', {
-      meta: createMeta('market', { ts: 2500 }),
+      meta: createMeta('market', { tsEvent: 2500, tsIngest: 2500, streamId: 'stream-1' }),
     });
 
     const countBefore = emitted.length;
@@ -57,7 +57,7 @@ describe('LiquidityAggregator reset on disconnected', () => {
       marketType: 'futures',
       bids: [{ price: 100, size: 3 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 3000 }),
+      meta: createMeta('market', { tsEvent: 3000, tsIngest: 3000, streamId: 'stream-1' }),
     };
 
     bus.publish('market:orderbook_l2_delta', deltaAfterDisconnect);

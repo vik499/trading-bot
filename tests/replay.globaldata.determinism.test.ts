@@ -121,7 +121,7 @@ describe('Global data replay determinism', () => {
       tradeTs: 900,
       exchangeTs: 900,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 900 }),
+      meta: createMeta('market', { tsEvent: 900, tsIngest: 900, streamId: STREAM_ID }),
     };
     const trade2: TradeEvent = {
       symbol: SYMBOL,
@@ -132,7 +132,7 @@ describe('Global data replay determinism', () => {
       tradeTs: 1_900,
       exchangeTs: 1_900,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 1_900 }),
+      meta: createMeta('market', { tsEvent: 1_900, tsIngest: 1_900, streamId: STREAM_ID }),
     };
     bus.publish('market:trade', trade1);
     bus.publish('market:trade', trade2);
@@ -142,15 +142,16 @@ describe('Global data replay determinism', () => {
       streamId: STREAM_ID,
       updateId: 1,
       exchangeTs: 1_100,
+      marketType: 'futures',
       bids: [{ price: 100, size: 1 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 1_100 }),
+      meta: createMeta('market', { tsEvent: 1_100, tsIngest: 1_100, streamId: STREAM_ID }),
     };
     const orderbook2: OrderbookL2SnapshotEvent = {
       ...orderbook1,
       updateId: 2,
       exchangeTs: 2_100,
-      meta: createMeta('market', { ts: 2_100 }),
+      meta: createMeta('market', { tsEvent: 2_100, tsIngest: 2_100, streamId: STREAM_ID }),
     };
     bus.publish('market:orderbook_l2_snapshot', orderbook1);
     bus.publish('market:orderbook_l2_snapshot', orderbook2);
@@ -163,7 +164,8 @@ describe('Global data replay determinism', () => {
       size: 1,
       notionalUsd: 100,
       exchangeTs: 1_200,
-      meta: createMeta('market', { ts: 1_200 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_200, tsIngest: 1_200, streamId: STREAM_ID }),
     };
     const liq2: LiquidationEvent = {
       symbol: SYMBOL,
@@ -173,7 +175,8 @@ describe('Global data replay determinism', () => {
       size: 1,
       notionalUsd: 100,
       exchangeTs: 2_100,
-      meta: createMeta('market', { ts: 2_100 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 2_100, tsIngest: 2_100, streamId: STREAM_ID }),
     };
     bus.publish('market:liquidation', liq1);
     bus.publish('market:liquidation', liq2);
@@ -184,7 +187,8 @@ describe('Global data replay determinism', () => {
       openInterest: 10,
       openInterestUnit: 'base',
       exchangeTs: 1_300,
-      meta: createMeta('market', { ts: 1_300 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_300, tsIngest: 1_300, streamId: STREAM_ID }),
     };
     bus.publish('market:oi', oi);
 
@@ -194,18 +198,20 @@ describe('Global data replay determinism', () => {
       fundingRate: 0.0001,
       exchangeTs: 1_400,
       nextFundingTs: 2_400,
-      meta: createMeta('market', { ts: 1_400 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_400, tsIngest: 1_400, streamId: STREAM_ID }),
     };
     bus.publish('market:funding', funding);
 
     const ticker: TickerEvent = {
       symbol: SYMBOL,
       streamId: STREAM_ID,
+      marketType: 'futures',
       indexPrice: '100',
       markPrice: '99.5',
       lastPrice: '100.2',
       exchangeTs: 1_500,
-      meta: createMeta('market', { ts: 1_500 }),
+      meta: createMeta('market', { tsEvent: 1_500, tsIngest: 1_500, streamId: STREAM_ID }),
     };
     bus.publish('market:ticker', ticker);
 

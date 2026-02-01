@@ -2,6 +2,17 @@
 
 This document defines canonical measurement contracts for market data events.
 
+## Normalized market event meta
+
+Applies to: `market:ticker`, `market:kline`, `market:trade`, `market:orderbook_l2_snapshot`, `market:orderbook_l2_delta`, `market:oi`, `market:funding`, `market:liquidation`.
+
+Rules:
+- `marketType` must be a known value: `spot` or `futures`.
+- `streamId` is required and must match `meta.streamId`.
+- `meta.tsEvent` is required (event-time).
+- `meta.tsIngest` SHOULD be present (ingest-time). Some producers may omit it; consumers must handle missing.
+- Aggregators MUST NOT set `meta.tsIngest = meta.tsEvent`. If upstream `tsIngest` is missing, aggregators use local `now()`.
+
 ## Canonical price
 
 Topic: `market:price_canonical`
@@ -54,6 +65,7 @@ Fields:
 Rules:
 - Spot and futures are emitted separately.
 - USD normalization must be explicit via `unit`.
+- For aggregated CVD, `venueBreakdown` reflects normalized totals (after per-source unit/sign normalization when configured).
 
 ## Liquidations
 
@@ -127,6 +139,10 @@ Fields:
 - `warmingUp` / `warmingProgress` / `warmingWindowMs`
 - `activeSources` / `expectedSources`
 - `lastBucketTs`
+- `aggSourcesUsed` / `aggSourcesSeen` / `aggSourcesUnexpected` (optional diagnostics)
+- `rawSourcesUsed` / `rawSourcesSeen` / `rawSourcesUnexpected` (optional diagnostics)
+- `exchangeLagP95Ms` / `exchangeLagEwmaMs` (optional, ms)
+- `processingLagP95Ms` / `processingLagEwmaMs` (optional, ms)
 
 Rules:
 - Deterministic buckets (no wall clock).
@@ -134,3 +150,7 @@ Rules:
 - Missing inputs in a bucket lower confidence deterministically.
 - Readiness degradation uses critical blocks (default: price, flow, liquidity). Derivatives can be non-critical.
 - Critical blocks are configurable; derivatives can be treated as non-blocking when desired.
+- `LAG_TOO_HIGH` refers to processing lag only (system falling behind).
+- Exchange/transport lag (tsIngest - tsEvent) must never degrade readiness; it is surfaced as warning `EXCHANGE_LAG_TOO_HIGH` only.
+- Exchange lag stats ignore events older than 10 minutes to avoid backfill contaminating lag warnings.
+- Lag stats are expressed in milliseconds.

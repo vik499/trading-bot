@@ -20,7 +20,7 @@ describe('bucketCloseTs', () => {
       tradeTs: 999,
       exchangeTs: 999,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 999 }),
+      meta: createMeta('market', { tsEvent: 999, tsIngest: 999, streamId: 's1' }),
     });
 
     bus.publish('market:trade', {
@@ -32,7 +32,7 @@ describe('bucketCloseTs', () => {
       tradeTs: 1000,
       exchangeTs: 1000,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 1000 }),
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId: 's1' }),
     });
 
     expect(outputs).toHaveLength(1);

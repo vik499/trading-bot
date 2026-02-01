@@ -26,6 +26,13 @@ Raw bucket (`market:cvd_*`) fields:
 Aggregated (`market:cvd_*_agg`) fields:
 - `sourcesUsed`, `weightsUsed`, `qualityFlags.staleSourcesDropped`.
 
+## Normalization (units/sign)
+`CvdAggregator` supports per-stream normalization to align units and sign:
+- `unitMultipliers` — per-source multiplier to convert into base units.
+- `signOverrides` — per-source sign override to align buy/sell convention (e.g., invert a venue).
+
+When these overrides are used, `venueBreakdown` values reflect the normalized totals.
+
 ## Sources
 - Binance USDT-M WebSocket (aggTrade stream)
 - OKX public WebSocket trades channel

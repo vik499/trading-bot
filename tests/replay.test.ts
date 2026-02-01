@@ -14,8 +14,10 @@ const makeRecord = (seq: number, tsIngest: number, symbol: string) => ({
   tsIngest,
   payload: {
     symbol,
+    streamId: 'stream-1',
+    marketType: 'futures',
     lastPrice: String(seq),
-    meta: createMeta('market', { ts: tsIngest }),
+    meta: createMeta('market', { tsEvent: tsIngest, tsIngest, streamId: 'stream-1' }),
   },
 });
 
@@ -212,6 +214,8 @@ describe('JournalReplayRunner', () => {
       tsIngest: endTs,
       payload: {
         symbol: 'BTCUSDT',
+        streamId: 'stream-1',
+        marketType: 'futures',
         interval: '5',
         tf: '5m',
         startTs: endTs - 300_000,
@@ -221,7 +225,7 @@ describe('JournalReplayRunner', () => {
         low: 99,
         close: 100,
         volume: 1,
-        meta: createMeta('market', { ts: endTs }),
+        meta: createMeta('market', { tsEvent: endTs, tsIngest: endTs, streamId: 'stream-1' }),
       },
     });
 
@@ -257,13 +261,14 @@ describe('JournalReplayRunner', () => {
       payload: {
         symbol: 'BTCUSDT',
         streamId: 'stream-1',
+        marketType: 'futures',
         tradeId: `t-${seq}`,
         side: 'Buy',
         price: 100,
         size: 1,
         tradeTs,
         exchangeTs: tradeTs,
-        meta: createMeta('market', { ts: tsIngest }),
+        meta: createMeta('market', { tsEvent: tradeTs, tsIngest, streamId: 'stream-1' }),
       },
     });
 
@@ -299,9 +304,10 @@ describe('JournalReplayRunner', () => {
         streamId: 'stream-1',
         updateId: seq,
         exchangeTs,
+        marketType: 'futures',
         bids: [{ price: 100, size: 1 }],
         asks: [{ price: 101, size: 1 }],
-        meta: createMeta('market', { ts: tsIngest }),
+        meta: createMeta('market', { tsEvent: exchangeTs, tsIngest, streamId: 'stream-1' }),
       },
     });
 

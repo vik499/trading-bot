@@ -6,9 +6,10 @@ import { MarketDataReadiness } from '../src/observability/MarketDataReadiness';
 const buildPrice = (ts: number): MarketPriceCanonicalEvent => ({
   symbol: 'BTCUSDT',
   ts,
+  marketType: 'futures',
   sourcesUsed: ['bybit.public.linear.v5'],
   freshSourcesCount: 1,
-  meta: createMeta('global_data', { ts }),
+  meta: createMeta('global_data', { tsEvent: ts, tsIngest: ts }),
 });
 
 describe('MarketDataReadiness WS degrade/recover', () => {
@@ -27,7 +28,7 @@ describe('MarketDataReadiness WS degrade/recover', () => {
     readiness.start();
 
     const disconnect: MarketDisconnected = {
-      meta: createMeta('market', { ts: 1_000 }),
+      meta: createMeta('market', { tsEvent: 1_000, tsIngest: 1_000, streamId: 'bybit.public.linear.v5' }),
       reason: 'test disconnect',
     };
     bus.publish('market:disconnected', disconnect);
@@ -44,7 +45,9 @@ describe('MarketDataReadiness WS degrade/recover', () => {
       price: 100,
       size: 1,
       tradeTs: 1_500,
-      meta: createMeta('market', { ts: 1_500 }),
+      exchangeTs: 1_500,
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_500, tsIngest: 1_500, streamId: 'bybit.public.linear.v5' }),
     });
 
     bus.publish('market:price_canonical', buildPrice(3_500));

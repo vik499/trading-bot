@@ -26,3 +26,6 @@ Reason: OKX rejects candle subscriptions on public WS (error 60018). Klines are 
 
 ## Decision: OKX orderbook resync state machine
 Reason: OKX orderbook sequencing uses `prevSeqId` → `seqId` (not strict +1). We ignore deltas before the first snapshot, accept heartbeat updates (`prevSeqId == seqId`), and trigger resync only after repeated gaps within a window to avoid reconnect storms.
+
+## Decision: Binance WS client registry and subscription dedup
+Reason: Prevent duplicate Binance WS instances and repeated subscribe frames by caching clients per stream key and reconciling subscriptions deterministically on reconnect.

@@ -7,9 +7,12 @@ import type {
   EventSource,
   KlineInterval,
   KlineBootstrapRequested,
+  KnownMarketType,
   MarketConnectRequest,
+  MarketType,
   MarketSubscribeRequest,
   TickerEvent,
+  VenueId,
 } from '../core/events/EventBus';
 
 type CleanupFn = () => Promise<void> | void;
@@ -145,19 +148,41 @@ export class Orchestrator {
       eventBus.publish('market:subscribe', subscribePayload);
     }
 
+    const bootstrapTargets: Array<{ venue: VenueId; marketType: KnownMarketType }> = [];
+    if (!targetMarketType || targetMarketType === 'futures') {
+      bootstrapTargets.push(
+        { venue: 'bybit', marketType: 'futures' },
+        { venue: 'binance', marketType: 'futures' },
+        { venue: 'okx', marketType: 'futures' }
+      );
+    }
+    if (!targetMarketType || targetMarketType === 'spot') {
+      if (enableSpot) {
+        bootstrapTargets.push(
+          { venue: 'binance', marketType: 'spot' },
+          { venue: 'okx', marketType: 'spot' }
+        );
+      }
+    }
+
     const klineLimit = readKlineLimit();
     for (const symbol of symbols) {
       for (const tf of tfs) {
         const interval = tfToInterval(tf);
         if (!interval) continue;
-        const bootstrapPayload: KlineBootstrapRequested = {
-          meta: createMeta('system', { correlationId: bootCorrelationId }),
-          symbol,
-          interval,
-          tf,
-          limit: klineLimit,
-        };
-        eventBus.publish('market:kline_bootstrap_requested', bootstrapPayload);
+
+        for (const target of bootstrapTargets) {
+          const bootstrapPayload: KlineBootstrapRequested = {
+            meta: createMeta('system', { correlationId: bootCorrelationId }),
+            symbol,
+            interval,
+            tf,
+            limit: klineLimit,
+            venue: target.venue,
+            marketType: target.marketType,
+          };
+          eventBus.publish('market:kline_bootstrap_requested', bootstrapPayload);
+        }
       }
     }
 

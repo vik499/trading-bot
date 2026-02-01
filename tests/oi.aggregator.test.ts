@@ -20,7 +20,8 @@ describe('OpenInterestAggregator', () => {
       openInterest: 100,
       openInterestUnit: 'base',
       exchangeTs: 1_000,
-      meta: createMeta('market', { ts: 1_000, correlationId: 'corr-1' }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_000, tsIngest: 1_000, streamId: 'bybit', correlationId: 'corr-1' }),
     });
 
     bus.publish('market:oi', {
@@ -29,7 +30,8 @@ describe('OpenInterestAggregator', () => {
       openInterest: 200,
       openInterestUnit: 'base',
       exchangeTs: 1_100,
-      meta: createMeta('market', { ts: 1_100, correlationId: 'corr-2' }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_100, tsIngest: 1_100, streamId: 'binance', correlationId: 'corr-2' }),
     });
 
     const last = outputs[outputs.length - 1];
@@ -54,7 +56,8 @@ describe('OpenInterestAggregator', () => {
       openInterest: 100,
       openInterestUnit: 'base',
       exchangeTs: 1_000,
-      meta: createMeta('market', { ts: 1_000 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_000, tsIngest: 1_000, streamId: 'bybit' }),
     });
 
     bus.publish('market:oi', {
@@ -63,7 +66,8 @@ describe('OpenInterestAggregator', () => {
       openInterest: 50,
       openInterestUnit: 'base',
       exchangeTs: 25_000,
-      meta: createMeta('market', { ts: 25_000 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 25_000, tsIngest: 25_000, streamId: 'okx' }),
     });
 
     const last = outputs[outputs.length - 1];

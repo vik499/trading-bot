@@ -16,9 +16,10 @@ describe('L2 resync state machine', () => {
       streamId: 's1',
       updateId: 1,
       exchangeTs: 1000,
+      marketType: 'futures',
       bids: [{ price: 100, size: 1 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 1000 }),
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId: 's1' }),
     };
     bus.publish('market:orderbook_l2_delta', delta);
     expect(outputs).toHaveLength(0);
@@ -28,9 +29,10 @@ describe('L2 resync state machine', () => {
       streamId: 's1',
       updateId: 5,
       exchangeTs: 1500,
+      marketType: 'futures',
       bids: [{ price: 100, size: 1 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 1500 }),
+      meta: createMeta('market', { tsEvent: 1500, tsIngest: 1500, streamId: 's1' }),
     };
     bus.publish('market:orderbook_l2_snapshot', snapshot);
     expect(outputs).toHaveLength(0);
@@ -39,7 +41,7 @@ describe('L2 resync state machine', () => {
       ...snapshot,
       updateId: 6,
       exchangeTs: 2100,
-      meta: createMeta('market', { ts: 2100 }),
+      meta: createMeta('market', { tsEvent: 2100, tsIngest: 2100, streamId: 's1' }),
     });
 
     expect(outputs).toHaveLength(1);
@@ -59,9 +61,10 @@ describe('L2 resync state machine', () => {
       streamId: 's1',
       updateId: 10,
       exchangeTs: 1500,
+      marketType: 'futures',
       bids: [{ price: 100, size: 1 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 1500 }),
+      meta: createMeta('market', { tsEvent: 1500, tsIngest: 1500, streamId: 's1' }),
     };
     bus.publish('market:orderbook_l2_snapshot', snapshot1);
 
@@ -70,9 +73,10 @@ describe('L2 resync state machine', () => {
       streamId: 's2',
       updateId: 1,
       exchangeTs: 1600,
+      marketType: 'futures',
       bids: [{ price: 100, size: 1 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 1600 }),
+      meta: createMeta('market', { tsEvent: 1600, tsIngest: 1600, streamId: 's2' }),
     };
     bus.publish('market:orderbook_l2_delta', gapDelta);
 
@@ -80,7 +84,7 @@ describe('L2 resync state machine', () => {
       ...snapshot1,
       updateId: 11,
       exchangeTs: 2100,
-      meta: createMeta('market', { ts: 2100 }),
+      meta: createMeta('market', { tsEvent: 2100, tsIngest: 2100, streamId: 's1' }),
     });
 
     const last = outputs[outputs.length - 1];

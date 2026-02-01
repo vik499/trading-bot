@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import {
+  asTsMs,
   createMeta,
   type AnalyticsFlowEvent,
   type AnalyticsLiquidityEvent,
@@ -11,6 +12,7 @@ import {
   type FundingRateEvent,
   type KlineEvent,
   type KlineInterval,
+  type KnownMarketType,
   type MarketContextEvent,
   type OpenInterestEvent,
   type OpenInterestUnit,
@@ -46,6 +48,7 @@ export interface TestRuntimeOptions {
   runId?: string;
   streamId?: string;
   symbol?: string;
+  marketType?: KnownMarketType;
   startJournal?: boolean;
   startAnalytics?: boolean;
   startStrategy?: boolean;
@@ -94,6 +97,7 @@ export class TestRuntime {
   readonly runId: string;
   readonly streamId: string;
   readonly symbol: string;
+  readonly marketType: KnownMarketType;
   readonly clock: FakeClock;
 
   private readonly events: Record<string, unknown[]> = {};
@@ -111,6 +115,7 @@ export class TestRuntime {
     this.runId = options.runId ?? 'run-test';
     this.streamId = options.streamId ?? DEFAULT_STREAM_ID;
     this.symbol = options.symbol ?? DEFAULT_SYMBOL;
+    this.marketType = options.marketType ?? 'futures';
     this.clock = clock;
 
     this.attachCollectors();
@@ -233,9 +238,16 @@ export class TestRuntime {
     const ts = params.ts ?? this.clock.next();
     const event: TickerEvent = {
       symbol: params.symbol ?? this.symbol,
+      streamId: this.streamId,
+      marketType: this.marketType,
       lastPrice: params.lastPrice ?? '100',
       exchangeTs: params.exchangeTs ?? ts,
-      meta: createMeta('market', { ts, correlationId: params.correlationId }),
+      meta: createMeta('market', {
+        tsEvent: asTsMs(ts),
+        tsIngest: asTsMs(ts),
+        streamId: this.streamId,
+        correlationId: params.correlationId,
+      }),
     };
     this.bus.publish('market:ticker', event);
     return event;
@@ -262,6 +274,8 @@ export class TestRuntime {
     const base = params.close ?? 100;
     const event: KlineEvent = {
       symbol: params.symbol ?? this.symbol,
+      streamId: this.streamId,
+      marketType: this.marketType,
       interval,
       tf,
       startTs,
@@ -271,7 +285,12 @@ export class TestRuntime {
       low: params.low ?? base - 1,
       close: params.close ?? base,
       volume: params.volume ?? 1,
-      meta: createMeta('market', { ts: endTs, correlationId: params.correlationId }),
+      meta: createMeta('market', {
+        tsEvent: asTsMs(endTs),
+        tsIngest: asTsMs(endTs),
+        streamId: this.streamId,
+        correlationId: params.correlationId,
+      }),
     };
     this.bus.publish('market:kline', event);
     return event;
@@ -301,7 +320,13 @@ export class TestRuntime {
       size: params.size ?? 1,
       tradeTs,
       exchangeTs,
-      meta: createMeta('market', { ts, correlationId: params.correlationId }),
+      marketType: this.marketType,
+      meta: createMeta('market', {
+        tsEvent: asTsMs(tradeTs),
+        tsIngest: asTsMs(ts),
+        streamId: this.streamId,
+        correlationId: params.correlationId,
+      }),
     };
     this.bus.publish('market:trade', event);
     return event;
@@ -322,7 +347,12 @@ export class TestRuntime {
     const exchangeTs = params.exchangeTs ?? ts;
     const bids = params.bids ?? [{ price: 100, size: 1 }];
     const asks = params.asks ?? [{ price: 101, size: 1 }];
-    const meta = createMeta('market', { ts, correlationId: params.correlationId });
+    const meta = createMeta('market', {
+      tsEvent: asTsMs(exchangeTs),
+      tsIngest: asTsMs(ts),
+      streamId: this.streamId,
+      correlationId: params.correlationId,
+    });
 
     if (params.kind === 'delta') {
       const event: OrderbookL2DeltaEvent = {
@@ -330,6 +360,7 @@ export class TestRuntime {
         streamId: this.streamId,
         updateId,
         exchangeTs,
+        marketType: this.marketType,
         bids,
         asks,
         meta,
@@ -343,6 +374,7 @@ export class TestRuntime {
       streamId: this.streamId,
       updateId,
       exchangeTs,
+      marketType: this.marketType,
       bids,
       asks,
       meta,
@@ -369,7 +401,13 @@ export class TestRuntime {
       openInterestUnit: params.openInterestUnit ?? 'base',
       openInterestValueUsd: params.openInterestValueUsd,
       exchangeTs,
-      meta: createMeta('market', { ts, correlationId: params.correlationId }),
+      marketType: this.marketType,
+      meta: createMeta('market', {
+        tsEvent: asTsMs(exchangeTs),
+        tsIngest: asTsMs(ts),
+        streamId: this.streamId,
+        correlationId: params.correlationId,
+      }),
     };
     this.bus.publish('market:oi', event);
     return event;
@@ -391,7 +429,13 @@ export class TestRuntime {
       fundingRate: params.fundingRate ?? 0.0001,
       exchangeTs,
       nextFundingTs: params.nextFundingTs,
-      meta: createMeta('market', { ts, correlationId: params.correlationId }),
+      marketType: this.marketType,
+      meta: createMeta('market', {
+        tsEvent: asTsMs(exchangeTs),
+        tsIngest: asTsMs(ts),
+        streamId: this.streamId,
+        correlationId: params.correlationId,
+      }),
     };
     this.bus.publish('market:funding', event);
     return event;

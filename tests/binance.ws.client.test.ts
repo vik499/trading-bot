@@ -92,7 +92,8 @@ describe('BinancePublicWsClient', () => {
 
     client.subscribeTrades('BTCUSDT');
 
-    const subscriptions = Array.from((client as any).subscriptions.values());
+    const snap = (client as any).subscriptions.snapshot();
+    const subscriptions = [...snap.desired, ...snap.active, ...snap.pending];
     expect(subscriptions).toContain('btcusdt@aggTrade');
   });
 });

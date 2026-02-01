@@ -26,6 +26,7 @@ describe('LiquidityEngine', () => {
       streamId: 's1',
       updateId: 1,
       exchangeTs: 1000,
+      marketType: 'futures',
       bids: [
         { price: 100, size: 1 },
         { price: 99, size: 2 },
@@ -34,7 +35,7 @@ describe('LiquidityEngine', () => {
         { price: 101, size: 1.5 },
         { price: 102, size: 3 },
       ],
-      meta: createMeta('market', { ts: 1500, correlationId: 'corr-1' }),
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1500, streamId: 's1', correlationId: 'corr-1' }),
     };
 
     bus.publish('market:orderbook_l2_snapshot', snapshot);
@@ -47,7 +48,7 @@ describe('LiquidityEngine', () => {
     expect(evt.depthBid).toBe(3);
     expect(evt.depthAsk).toBe(4.5);
     expect(evt.imbalance).toBeCloseTo((3 - 4.5) / (3 + 4.5));
-    expect(evt.meta.ts).toBe(1500);
+    expect(evt.meta.ts).toBe(1000);
     expect(evt.meta.correlationId).toBe('corr-1');
   });
 });

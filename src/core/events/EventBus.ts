@@ -177,7 +177,8 @@ export interface RawEventMeta extends EventMeta {
 // Мы сознательно НЕ тащим сюда Bybit-специфичные структуры/названия.
 // Внутри бота мы работаем со стабильным контрактом.
 // ---------------------------------------------------------------------------
-export type MarketType = 'spot' | 'futures' | 'unknown';
+export type KnownMarketType = 'spot' | 'futures';
+export type MarketType = KnownMarketType | 'unknown';
 
 export type VenueId = 'bybit' | 'binance' | 'okx';
 
@@ -186,10 +187,10 @@ export interface TickerEvent extends BaseEvent {
     symbol: string;
 
     // Идентификатор источника (например bybit.public.linear.v5)
-    streamId?: string;
+    streamId: string;
 
     // Тип рынка (spot/futures)
-    marketType?: MarketType;
+    marketType: KnownMarketType;
 
     // Цена последней сделки/обновления (строка, потому что Bybit присылает числа как строки)
     lastPrice?: string;
@@ -222,8 +223,8 @@ export type KlineInterval = '1' | '3' | '5' | '15' | '30' | '60' | '120' | '240'
 
 export interface KlinePayload {
     symbol: string;
-    streamId?: string;
-    marketType?: MarketType;
+    streamId: string;
+    marketType: KnownMarketType;
     interval: KlineInterval;
     tf: string;
     startTs: number;
@@ -252,7 +253,7 @@ export interface TradeEvent extends BaseEvent {
     size: number;
     tradeTs: number;
     exchangeTs?: number;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +395,7 @@ export interface OrderbookL2SnapshotEvent extends BaseEvent {
     streamId: string;
     updateId: number;
     exchangeTs?: number;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
     bids: OrderbookLevel[];
     asks: OrderbookLevel[];
 }
@@ -404,7 +405,7 @@ export interface OrderbookL2DeltaEvent extends BaseEvent {
     streamId: string;
     updateId: number;
     exchangeTs?: number;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
     bids: OrderbookLevel[];
     asks: OrderbookLevel[];
 }
@@ -416,7 +417,7 @@ export interface OpenInterestEvent extends BaseEvent {
     openInterestUnit: OpenInterestUnit;
     openInterestValueUsd?: number;
     exchangeTs?: number;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
 }
 
 export type OpenInterestUnit = 'base' | 'contracts' | 'usd' | 'quote' | 'unknown';
@@ -427,7 +428,7 @@ export interface FundingRateEvent extends BaseEvent {
     fundingRate: number;
     exchangeTs?: number;
     nextFundingTs?: number;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
 }
 
 export interface LiquidationEvent extends BaseEvent {
@@ -438,7 +439,7 @@ export interface LiquidationEvent extends BaseEvent {
     size?: number;
     notionalUsd?: number;
     exchangeTs?: number;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
 }
 
 // ---------------------------------------------------------------------------
@@ -495,7 +496,7 @@ export interface MarketOpenInterestAggEvent extends BaseEvent, MarketAggBase {
     openInterestUnit: OpenInterestUnit;
     openInterestValueUsd?: number;
     priceTypeUsed?: CanonicalPriceType;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
     freshSourcesCount?: number;
     confidenceScore?: number;
     provider?: string;
@@ -506,7 +507,7 @@ export interface MarketFundingAggEvent extends BaseEvent, MarketAggBase {
     symbol: string;
     ts: number;
     fundingRate: number;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
     freshSourcesCount?: number;
     confidenceScore?: number;
     provider?: string;
@@ -520,7 +521,7 @@ export interface MarketLiquidationsAggEvent extends BaseEvent, MarketAggBase {
     liquidationNotional: number;
     unit: LiquidationUnit;
     sideBreakdown?: AggregatedSideBreakdown;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
     freshSourcesCount?: number;
     confidenceScore?: number;
     provider?: string;
@@ -546,7 +547,7 @@ export interface MarketVolumeAggEvent extends BaseEvent, MarketAggBase {
 export interface MarketCvdEvent extends BaseEvent {
     symbol: string;
     streamId: string;
-    marketType: MarketType;
+    marketType: KnownMarketType;
     bucketStartTs: number;
     bucketEndTs: number;
     bucketSizeMs: number;
@@ -562,7 +563,7 @@ export interface MarketCvdAggEvent extends BaseEvent, MarketAggBase {
     cvd: number;
     cvdSpot?: number;
     cvdFutures?: number;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
     unit?: CvdUnit;
     bucketSizeMs?: number;
     freshSourcesCount?: number;
@@ -578,7 +579,7 @@ export interface MarketPriceIndexEvent extends BaseEvent, MarketAggBase {
     symbol: string;
     ts: number;
     indexPrice: number;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
     freshSourcesCount?: number;
     confidenceScore?: number;
     provider?: string;
@@ -588,7 +589,7 @@ export interface MarketPriceIndexEvent extends BaseEvent, MarketAggBase {
 export interface MarketPriceCanonicalEvent extends BaseEvent {
     symbol: string;
     ts: number;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
     indexPrice?: number;
     markPrice?: number;
     lastPrice?: number;
@@ -619,7 +620,7 @@ export interface MarketLiquidityAggEvent extends BaseEvent, MarketAggBase {
     bucketStartTs?: number;
     bucketEndTs?: number;
     bucketSizeMs?: number;
-    marketType?: MarketType;
+    marketType: KnownMarketType;
     freshSourcesCount?: number;
     confidenceScore?: number;
     provider?: string;
@@ -794,7 +795,7 @@ export interface MarketConnectRequest extends BaseEvent {
     url?: string;
     subscriptions?: string[]; // например: ['tickers.BTCUSDT']
     venue?: VenueId;
-    marketType?: MarketType;
+    marketType?: KnownMarketType;
 }
 
 export interface MarketDisconnectRequest extends BaseEvent {
@@ -804,7 +805,7 @@ export interface MarketDisconnectRequest extends BaseEvent {
 export interface MarketSubscribeRequest extends BaseEvent {
     topics: string[]; // например: ['tickers.BTCUSDT']
     venue?: VenueId;
-    marketType?: MarketType;
+    marketType?: KnownMarketType;
 }
 
 export interface MarketConnected extends BaseEvent {
@@ -844,6 +845,8 @@ export interface KlineBootstrapRequested extends BaseEvent {
     tf: string;
     limit: number;
     sinceTs?: number;
+    venue?: VenueId;
+    marketType?: KnownMarketType;
 }
 
 export interface KlineBootstrapCompleted extends BaseEvent {
@@ -1146,6 +1149,16 @@ export interface MarketDataStatusPayload extends BaseEvent {
     activeSourcesRaw: number;
     expectedSourcesAgg: number;
     expectedSourcesRaw: number;
+    aggSourcesUsed?: string[];
+    aggSourcesSeen?: string[];
+    aggSourcesUnexpected?: string[];
+    rawSourcesUsed?: string[];
+    rawSourcesSeen?: string[];
+    rawSourcesUnexpected?: string[];
+    exchangeLagP95Ms?: number;
+    exchangeLagEwmaMs?: number;
+    processingLagP95Ms?: number;
+    processingLagEwmaMs?: number;
     lastBucketTs: number;
 }
 

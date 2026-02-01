@@ -1,5 +1,7 @@
 import {
-    inheritMeta,
+    asTsMs,
+    createMeta,
+    nowMs,
     type EventBus,
     type FundingRateEvent,
     type MarketFundingAggEvent,
@@ -14,6 +16,7 @@ export interface FundingAggregatorOptions {
     ttlMs?: number;
     providerId?: string;
     weights?: Record<string, number>;
+    now?: () => number;
 }
 
 interface SourceState {
@@ -26,6 +29,7 @@ export class FundingAggregator {
     private readonly ttlMs: number;
     private readonly providerId: string;
     private readonly weights: Record<string, number>;
+    private readonly now: () => number;
     private readonly sources = new Map<string, Map<string, SourceState>>();
     private unsubscribe?: () => void;
 
@@ -34,6 +38,7 @@ export class FundingAggregator {
         this.ttlMs = Math.max(10_000, options.ttlMs ?? 120_000);
         this.providerId = options.providerId ?? 'local_funding_agg';
         this.weights = options.weights ?? {};
+        this.now = options.now ?? nowMs;
     }
 
     start(): void {
@@ -51,9 +56,9 @@ export class FundingAggregator {
     private onFunding(evt: FundingRateEvent): void {
         const symbol = evt.symbol;
         const normalizedSymbol = normalizeSymbol(symbol);
-        const normalizedMarketType = normalizeMarketType(evt.marketType ?? 'futures');
+        const normalizedMarketType = normalizeMarketType(evt.marketType);
         const streamId = evt.streamId || 'unknown';
-        const ts = evt.meta.ts;
+        const ts = evt.meta.tsEvent;
         const sources = this.sources.get(symbol) ?? new Map<string, SourceState>();
         sources.set(streamId, { fundingRate: evt.fundingRate, ts });
         this.sources.set(symbol, sources);
@@ -84,7 +89,11 @@ export class FundingAggregator {
                 staleSourcesDropped: breakdown.staleSourcesDropped.length ? breakdown.staleSourcesDropped : undefined,
             },
             provider: this.providerId,
-            meta: inheritMeta(evt.meta, 'global_data', { ts }),
+            meta: createMeta('global_data', {
+                tsEvent: asTsMs(ts),
+                tsIngest: asTsMs(evt.meta.tsIngest ?? this.now()),
+                correlationId: evt.meta.correlationId,
+            }),
         };
         this.bus.publish('market:funding_agg', payload);
         sourceRegistry.markAggEmitted(

@@ -31,18 +31,20 @@ describe('MarketDataReadiness no-data watchdog', () => {
       size: 1,
       tradeTs: 1_000,
       exchangeTs: 1_000,
-      meta: createMeta('market', { ts: 1_000 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_000, tsIngest: 1_000, streamId: 'test-stream' }),
     };
     bus.publish('market:trade', trade);
 
     const price: MarketPriceCanonicalEvent = {
       symbol: 'BTCUSDT',
       ts: 3_000,
+      marketType: 'futures',
       lastPrice: 101,
       sourcesUsed: ['test-stream'],
       freshSourcesCount: 1,
       confidenceScore: 1,
-      meta: createMeta('global_data', { ts: 3_000 }),
+      meta: createMeta('global_data', { tsEvent: 3_000, tsIngest: 3_000 }),
     };
     bus.publish('market:price_canonical', price);
 

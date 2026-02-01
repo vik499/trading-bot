@@ -32,7 +32,7 @@ describe('MarketGateway resync storm protection', () => {
     const gateway = new MarketGateway(ws, undefined, bus, undefined, { resyncCooldownMs: 1_000, venue: 'binance' });
     gateway.start();
 
-    const meta = createMeta('market', { ts: 1_000 });
+    const meta = createMeta('market', { tsEvent: 1_000, tsIngest: 1_000, streamId: 'binance.usdm.public' });
     for (let i = 0; i < 5; i += 1) {
       const evt: MarketResyncRequested = {
         venue: 'binance',

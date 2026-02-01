@@ -30,7 +30,8 @@ describe('FlowEngine', () => {
       size: 2,
       tradeTs: 900,
       exchangeTs: 900,
-      meta: createMeta('market', { ts: 1000, correlationId: 'corr-1' }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 900, tsIngest: 1000, streamId: 's1', correlationId: 'corr-1' }),
     };
     bus.publish('market:trade', trade);
 
@@ -40,7 +41,8 @@ describe('FlowEngine', () => {
       openInterest: 1000,
       openInterestUnit: 'base',
       exchangeTs: 1500,
-      meta: createMeta('market', { ts: 2000, correlationId: 'corr-1' }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1500, tsIngest: 2000, streamId: 's1', correlationId: 'corr-1' }),
     };
     bus.publish('market:oi', oi);
 
@@ -49,23 +51,24 @@ describe('FlowEngine', () => {
       streamId: 's1',
       fundingRate: 0.0001,
       exchangeTs: 2500,
-      meta: createMeta('market', { ts: 3000, correlationId: 'corr-1' }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 2500, tsIngest: 3000, streamId: 's1', correlationId: 'corr-1' }),
     };
     bus.publish('market:funding', funding);
 
     expect(events.length).toBeGreaterThanOrEqual(3);
     const tradeFlow = events[0];
     expect(tradeFlow.meta.correlationId).toBe('corr-1');
-    expect(tradeFlow.meta.ts).toBe(1000);
+    expect(tradeFlow.meta.ts).toBe(900);
     expect(tradeFlow.cvdFutures).toBe(2);
     expect(tradeFlow.flowRegime).toBe('buyPressure');
 
     const oiFlow = events.find((evt) => evt.oi !== undefined);
     expect(oiFlow?.oi).toBe(1000);
-    expect(oiFlow?.meta.ts).toBe(2000);
+    expect(oiFlow?.meta.ts).toBe(1500);
 
     const fundingFlow = events.find((evt) => evt.fundingRate !== undefined);
     expect(fundingFlow?.fundingRate).toBe(0.0001);
-    expect(fundingFlow?.meta.ts).toBe(3000);
+    expect(fundingFlow?.meta.ts).toBe(2500);
   });
 });

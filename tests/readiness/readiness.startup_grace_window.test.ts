@@ -33,7 +33,7 @@ describe('MarketDataReadiness startup grace window', () => {
       sourcesUsed: ['s1'],
       confidenceScore: 0.9,
       marketType: 'futures',
-      meta: createMeta('global_data', { ts }),
+      meta: createMeta('global_data', { tsEvent: ts, tsIngest: ts }),
     });
 
     // Within grace window: missing price + ws disconnected should not degrade
@@ -44,7 +44,7 @@ describe('MarketDataReadiness startup grace window', () => {
         channel: 'orderbook',
         streamId: 'stream-1',
       },
-      meta: createMeta('market', { ts: 1000 }),
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId: 'stream-1' }),
     });
     bus.publish('market:cvd_futures_agg', makeCvd(1000));
 

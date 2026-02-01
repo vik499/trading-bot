@@ -4,6 +4,7 @@ import {
     asTsMs,
     createMeta,
     eventBus as defaultEventBus,
+    nowMs,
     type DataConfidence,
     type DataGapDetected,
     type DataMismatch,
@@ -35,6 +36,7 @@ import {
     type RawFeed,
     type SourceRegistrySnapshot,
 } from '../core/market/SourceRegistry';
+import { stableSortStrings } from '../core/determinism';
 import { inferMarketTypeFromStreamId, normalizeMarketType, normalizeSymbol } from '../core/market/symbols';
 import type { ExpectedSourcesConfig } from '../core/market/expectedSources';
 import { resolveExpectedSources } from '../core/market/expectedSources';
@@ -72,6 +74,7 @@ export interface MarketDataReadinessOptions {
         derivatives?: number;
     };
     criticalBlocks?: ReadinessBlock[];
+    now?: () => number;
     marketStatusJson?: boolean;
 }
 
@@ -100,7 +103,7 @@ type Reason =
     | 'NO_REF_PRICE'
     | 'WS_DISCONNECTED';
 
-type WarningReason = 'TIMEBASE_QUALITY_WARN' | 'NON_MONOTONIC_TIMEBASE';
+type WarningReason = 'TIMEBASE_QUALITY_WARN' | 'NON_MONOTONIC_TIMEBASE' | 'EXCHANGE_LAG_TOO_HIGH';
 
 const DEFAULT_BUCKET_MS = 1_000;
 const DEFAULT_WARMUP_MS = 30 * 60_000;
@@ -111,6 +114,7 @@ const DEFAULT_LAG_WINDOW_MS = 30_000;
 const DEFAULT_LAG_THRESHOLD_MS = 2_000;
 const DEFAULT_LAG_EWMA_ALPHA = 0.2;
 const DEFAULT_TIMEBASE_PENALTY_WINDOW_MS = 10_000;
+const EXCHANGE_LAG_MAX_EVENT_AGE_MS = 10 * 60 * 1000;
 const CRITICAL_BLOCK_THRESHOLD = 0.55;
 const OVERALL_THRESHOLD = 0.65;
 const TIMEBASE_CONFIDENCE_PENALTY = 0.9;
@@ -138,7 +142,7 @@ const REASON_ORDER: Reason[] = [
     'NO_REF_PRICE',
 ];
 
-const WARNING_ORDER: WarningReason[] = ['TIMEBASE_QUALITY_WARN', 'NON_MONOTONIC_TIMEBASE'];
+const WARNING_ORDER: WarningReason[] = ['TIMEBASE_QUALITY_WARN', 'NON_MONOTONIC_TIMEBASE', 'EXCHANGE_LAG_TOO_HIGH'];
 
 export class MarketDataReadiness {
     private readonly bus: EventBus;
@@ -167,6 +171,7 @@ export class MarketDataReadiness {
     private readonly criticalBlocks: Set<ReadinessBlock>;
     private readonly startupGraceWindowMs: number;
     private readonly marketStatusJson: boolean;
+    private readonly now: () => number;
 
     private started = false;
     private readonly unsubscribers: Array<() => void> = [];
@@ -182,9 +187,13 @@ export class MarketDataReadiness {
 
     private readonly dataConfidenceByTopic = new Map<string, DataConfidence>();
 
-    private readonly lagSamples: Array<{ ts: number; lagMs: number }> = [];
-    private lagEwma?: number;
-    private lastLagSampleTs?: number;
+    private readonly exchangeLagSamples: Array<{ ts: number; lagMs: number }> = [];
+    private exchangeLagEwma?: number;
+    private lastExchangeLagSampleTs?: number;
+    private readonly processingLagSamples: Array<{ ts: number; lagMs: number }> = [];
+    private processingLagEwma?: number;
+    private lastProcessingLagSampleTs?: number;
+    private lastProcessingLagIngestTs?: number;
 
     private readonly reasonSince = new Map<Reason, number>();
     private readonly warningSince = new Map<WarningReason, number>();
@@ -197,6 +206,7 @@ export class MarketDataReadiness {
     private lastStatus?: MarketDataStatusPayload;
     private lastSnapshot?: SourceRegistrySnapshot;
     private lastLogTs?: number;
+    private lastLogSignature?: string;
     private readonly missingExpectedLogged = new Set<string>();
 
     private wsDegraded = false;
@@ -246,6 +256,7 @@ export class MarketDataReadiness {
         this.weights = this.normalizeWeights(rawWeights, this.criticalBlocks);
         this.startupGraceWindowMs = Math.max(0, options.startupGraceWindowMs ?? 0);
         this.marketStatusJson = options.marketStatusJson ?? readFlag('MARKET_STATUS_JSON', false);
+        this.now = options.now ?? nowMs;
     }
 
     start(): void {
@@ -441,17 +452,18 @@ export class MarketDataReadiness {
         this.registry.markRawSeen({ symbol: normalizedSymbol, marketType: normalizedMarketType, feed }, sourceId, meta.tsEvent);
         this.lastSymbol = normalizedSymbol;
         this.lastMarketType = normalizedMarketType;
-        this.recordLagSample(meta.tsEvent, meta.tsIngest);
+        this.recordExchangeLagSample(meta.tsEvent, meta.tsIngest);
+        this.recordProcessingLagSample(meta.tsIngest);
         this.markWsFlow(meta.tsIngest ?? meta.tsEvent);
     }
 
     private onTickerRaw(evt: TickerEvent): void {
-        const inferred = evt.marketType ?? inferMarketTypeFromStreamId(evt.streamId);
-        const normalizedMarketType = normalizeMarketType(inferred);
+        const normalizedMarketType = normalizeMarketType(evt.marketType);
         if (!this.shouldTrackMarketType(normalizedMarketType)) return;
         const normalizedSymbol = normalizeSymbol(evt.symbol);
-        const sourceId = evt.streamId ?? 'unknown';
-        this.recordLagSample(evt.meta.tsEvent, evt.meta.tsIngest);
+        const sourceId = evt.streamId;
+        this.recordExchangeLagSample(evt.meta.tsEvent, evt.meta.tsIngest);
+        this.recordProcessingLagSample(evt.meta.tsIngest);
         if (evt.markPrice !== undefined) {
             this.registry.markRawSeen(
                 { symbol: normalizedSymbol, marketType: normalizedMarketType, feed: 'markPrice' },
@@ -535,9 +547,20 @@ export class MarketDataReadiness {
         const overallConfidence = this.computeOverallConfidence(blockConfidence);
         const derivedSources = this.deriveExpectedSources(snapshot);
         this.maybeLogMissingExpectedConfig(snapshot, derivedSources.missingConfig);
-        const activeSourcesAgg = this.countSources(snapshot.usedAgg);
-        const activeSourcesRaw = this.countSources(snapshot.usedRaw);
-        const { degradedReasons, warnings } = this.computeDegradedReasons(
+        const seenAggSources = stableSortStrings(this.unionSources(snapshot.usedAgg));
+        const seenRawSources = stableSortStrings(this.unionSources(snapshot.usedRaw));
+        const expectedAggSources = derivedSources.expectedAggSources;
+        const expectedRawSources = derivedSources.expectedRawSources;
+        const expectedAggSet = new Set(expectedAggSources);
+        const expectedRawSet = new Set(expectedRawSources);
+        const aggUsedSources = seenAggSources.filter((source) => expectedAggSet.has(source));
+        const rawUsedSources = seenRawSources.filter((source) => expectedRawSet.has(source));
+        const aggUnexpectedSources = seenAggSources.filter((source) => !expectedAggSet.has(source));
+        const rawUnexpectedSources = seenRawSources.filter((source) => !expectedRawSet.has(source));
+        const activeSourcesAgg = aggUsedSources.length;
+        const activeSourcesRaw = rawUsedSources.length;
+        const { degradedReasons, warnings, exchangeLagP95Ms, exchangeLagEwmaMs, processingLagP95Ms, processingLagEwmaMs } =
+            this.computeDegradedReasons(
             blockConfidence,
             overallConfidence,
             activeSourcesAgg,
@@ -560,6 +583,10 @@ export class MarketDataReadiness {
             degraded,
             degradedReasons,
             warnings,
+            exchangeLagP95Ms,
+            exchangeLagEwmaMs,
+            processingLagP95Ms,
+            processingLagEwmaMs,
             warmingUp,
             warmingProgress,
             warmingWindowMs,
@@ -569,8 +596,14 @@ export class MarketDataReadiness {
             activeSourcesRaw,
             expectedSourcesAgg: derivedSources.expectedAggCount,
             expectedSourcesRaw: derivedSources.expectedRawCount,
+            aggSourcesUsed: aggUsedSources,
+            aggSourcesSeen: seenAggSources,
+            aggSourcesUnexpected: aggUnexpectedSources.length ? aggUnexpectedSources : undefined,
+            rawSourcesUsed: rawUsedSources,
+            rawSourcesSeen: seenRawSources,
+            rawSourcesUnexpected: rawUnexpectedSources.length ? rawUnexpectedSources : undefined,
             lastBucketTs: bucketTs,
-            meta: createMeta('system', { tsEvent: asTsMs(bucketTs) }),
+            meta: createMeta('system', { tsEvent: asTsMs(bucketTs), tsIngest: asTsMs(this.resolveStatusIngestTs(bucketTs)) }),
         };
     }
 
@@ -632,7 +665,14 @@ export class MarketDataReadiness {
         missingConfig: boolean,
         snapshot: SourceRegistrySnapshot,
         bucketTs: number
-    ): { degradedReasons: string[]; warnings: string[] } {
+    ): {
+        degradedReasons: Reason[];
+        warnings: WarningReason[];
+        exchangeLagP95Ms?: number;
+        exchangeLagEwmaMs?: number;
+        processingLagP95Ms?: number;
+        processingLagEwmaMs?: number;
+    } {
         const reasons = new Set<Reason>();
         const warnings = new Set<WarningReason>();
         const withinStartupGrace =
@@ -700,9 +740,31 @@ export class MarketDataReadiness {
                 }
             }
         }
-        const lagNowTs = this.lastLagSampleTs ?? bucketTs;
-        const lagStats = this.computeLagStats(lagNowTs);
-        if (this.lagThresholdMs > 0 && lagStats.p95 !== undefined && lagStats.p95 > this.lagThresholdMs && !withinStartupGrace) {
+        const lagNowTs = this.lastExchangeLagSampleTs ?? bucketTs;
+        const exchangeLagStats = this.computeExchangeLagStats(lagNowTs);
+        // INVARIANT: exchange/transport lag MUST NOT degrade readiness. Degrade only on processing lag.
+        if (
+            this.lagThresholdMs > 0 &&
+            exchangeLagStats.p95 !== undefined &&
+            exchangeLagStats.p95 > this.lagThresholdMs &&
+            !withinStartupGrace
+        ) {
+            warnings.add('EXCHANGE_LAG_TOO_HIGH');
+        }
+        const processingNowTs = this.now();
+        if (
+            this.lastProcessingLagIngestTs !== undefined &&
+            (this.lastProcessingLagSampleTs === undefined || processingNowTs > this.lastProcessingLagSampleTs)
+        ) {
+            this.recordProcessingLagSample(this.lastProcessingLagIngestTs);
+        }
+        const processingLagStats = this.computeProcessingLagStats(processingNowTs);
+        if (
+            this.lagThresholdMs > 0 &&
+            processingLagStats.p95 !== undefined &&
+            processingLagStats.p95 > this.lagThresholdMs &&
+            !withinStartupGrace
+        ) {
             reasons.add('LAG_TOO_HIGH');
         }
         if (Array.from(this.gapByBlock.values()).some(Boolean)) reasons.add('GAPS_DETECTED');
@@ -729,6 +791,10 @@ export class MarketDataReadiness {
         return {
             degradedReasons: this.orderReasons(stableReasons),
             warnings: this.orderWarnings(stableWarnings),
+            exchangeLagP95Ms: exchangeLagStats.p95,
+            exchangeLagEwmaMs: exchangeLagStats.ewma,
+            processingLagP95Ms: processingLagStats.p95,
+            processingLagEwmaMs: processingLagStats.ewma,
         };
     }
 
@@ -762,21 +828,44 @@ export class MarketDataReadiness {
     }
 
     private deriveExpectedSources(snapshot: SourceRegistrySnapshot): {
+        expectedAggSources: string[];
+        expectedRawSources: string[];
         expectedAggCount: number;
         expectedRawCount: number;
         missingConfig: boolean;
     } {
         const expectedAggSources = this.unionSources(snapshot.expected);
+        const usedAggSources = this.unionSources(snapshot.usedAgg);
         const usedRawSources = this.unionSources(snapshot.usedRaw);
-        if (expectedAggSources.length === 0 && usedRawSources.length > 0) {
-            return {
-                expectedAggCount: usedRawSources.length,
-                expectedRawCount: usedRawSources.length,
-                missingConfig: true,
-            };
+        if (expectedAggSources.length === 0) {
+            if (this.expectedSources > 0) {
+                const orderedAgg = stableSortStrings(usedAggSources);
+                const orderedRaw = stableSortStrings(usedRawSources);
+                return {
+                    expectedAggSources: orderedAgg.slice(0, this.expectedSources),
+                    expectedRawSources: orderedRaw.slice(0, this.expectedSources),
+                    expectedAggCount: this.expectedSources,
+                    expectedRawCount: this.expectedSources,
+                    missingConfig: false,
+                };
+            }
+            if (usedAggSources.length > 0 || usedRawSources.length > 0) {
+                const fallbackAgg = usedAggSources.length ? usedAggSources : usedRawSources;
+                const fallbackRaw = usedRawSources.length ? usedRawSources : usedAggSources;
+                return {
+                    expectedAggSources: stableSortStrings(fallbackAgg),
+                    expectedRawSources: stableSortStrings(fallbackRaw),
+                    expectedAggCount: fallbackAgg.length,
+                    expectedRawCount: fallbackRaw.length,
+                    missingConfig: true,
+                };
+            }
         }
         const expectedCount = expectedAggSources.length || this.expectedSources;
+        const orderedExpected = stableSortStrings(expectedAggSources);
         return {
+            expectedAggSources: orderedExpected,
+            expectedRawSources: orderedExpected,
             expectedAggCount: expectedCount,
             expectedRawCount: expectedCount,
             missingConfig: false,
@@ -806,11 +895,11 @@ export class MarketDataReadiness {
         return max;
     }
 
-    private orderReasons(reasons: Set<Reason>): string[] {
+    private orderReasons(reasons: Set<Reason>): Reason[] {
         return REASON_ORDER.filter((r) => reasons.has(r));
     }
 
-    private orderWarnings(warnings: Set<WarningReason>): string[] {
+    private orderWarnings(warnings: Set<WarningReason>): WarningReason[] {
         return WARNING_ORDER.filter((w) => warnings.has(w));
     }
 
@@ -863,39 +952,108 @@ export class MarketDataReadiness {
         const shouldLog = this.shouldLog(ts, last, payload);
         if (!shouldLog) return;
 
+        const logSignature = this.buildLogSignature(payload);
+        if (logSignature === this.lastLogSignature) return;
+        this.lastLogSignature = logSignature;
+
         this.lastLogTs = ts;
 
         if (payload.degraded && !last?.degraded) {
             this.logDegradedTransition(payload);
         }
 
+        const summaryLine = this.buildSummaryLine(payload);
+        if (this.marketStatusJson) {
+            const snapshotLog = this.buildSnapshotLog(payload);
+            logger.debug(JSON.stringify(snapshotLog));
+        }
+        logger.info(summaryLine);
+    }
+
+    private buildSummaryLine(payload: MarketDataStatusPayload): string {
+        const symbol = this.lastSymbol ?? '';
+        const marketType = this.lastMarketType;
+        const shouldShowMarketType = marketType !== undefined && marketType !== 'unknown';
+        const hasContext = symbol.length > 0 && shouldShowMarketType;
+        const contextPrefix = hasContext ? `symbol=${symbol} marketType=${marketType}` : '';
+        const formatLag = (value?: number): string =>
+            value === undefined || !Number.isFinite(value) ? 'n/a' : Math.round(value).toString();
+        const lagExP95 = `lagExP95=${formatLag(payload.exchangeLagP95Ms)}`;
+        const lagExEwma = `lagExEwma=${formatLag(payload.exchangeLagEwmaMs)}`;
+        const lagPrP95 = `lagPrP95=${formatLag(payload.processingLagP95Ms)}`;
+        const lagPrEwma = `lagPrEwma=${formatLag(payload.processingLagEwmaMs)}`;
         const status = payload.warmingUp
             ? 'WARMING'
             : payload.degraded
               ? 'DEGRADED'
               : 'READY';
+        const aggUsed = payload.aggSourcesUsed?.length ?? payload.activeSourcesAgg;
+        const aggSeen = payload.aggSourcesSeen?.length ?? payload.activeSourcesAgg;
+        const rawUsed = payload.rawSourcesUsed?.length ?? payload.activeSourcesRaw;
+        const rawSeen = payload.rawSourcesSeen?.length ?? payload.activeSourcesRaw;
+        const aggUnexpected = payload.aggSourcesUnexpected?.join(',') ?? '';
+        const rawUnexpected = payload.rawSourcesUnexpected?.join(',') ?? '';
+        const reasons = payload.degradedReasons.length ? payload.degradedReasons.join(',') : '';
+        const warnings = payload.warnings?.length ? payload.warnings.join(',') : '';
+        return [
+            contextPrefix,
+            `MarketData status=${status}`,
+            `conf=${payload.overallConfidence.toFixed(2)}`,
+            `agg=${aggUsed}/${payload.expectedSourcesAgg}`,
+            `raw=${rawUsed}/${payload.expectedSourcesRaw}`,
+            `rawSeen=${rawSeen}`,
+            `price=${payload.blockConfidence.price.toFixed(2)}`,
+            `flow=${payload.blockConfidence.flow.toFixed(2)}`,
+            `liq=${payload.blockConfidence.liquidity.toFixed(2)}`,
+            `deriv=${payload.blockConfidence.derivatives.toFixed(2)}`,
+            `warm=${payload.warmingUp ? payload.warmingProgress.toFixed(2) : 'NO'}`,
+            `degraded=${payload.degraded ? 'YES' : 'NO'}`,
+            aggUnexpected ? `unexpectedAgg=${aggUnexpected}` : '',
+            rawUnexpected ? `unexpectedRaw=${rawUnexpected}` : '',
+            reasons ? `reasons=${reasons}` : '',
+            warnings ? `warnings=${warnings}` : '',
+            lagExP95,
+            lagExEwma,
+            lagPrP95,
+            lagPrEwma,
+        ]
+            .filter((part) => part.length > 0)
+            .join(' ');
+    }
 
-        const snapshotLog = this.buildSnapshotLog(payload);
-        if (this.marketStatusJson) {
-            const snapshotLog = this.buildSnapshotLog(payload);
-            logger.debug(JSON.stringify(snapshotLog));
-        }
-
-        const line = [
-            `Market Data: ${status} (confidence ${payload.overallConfidence.toFixed(2)})`,
-            `SourcesAgg: ${payload.activeSourcesAgg}/${payload.expectedSourcesAgg}`,
-            `SourcesRaw: ${payload.activeSourcesRaw}/${payload.expectedSourcesRaw}`,
-            `Price: ${payload.blockConfidence.price.toFixed(2)} | Flow: ${payload.blockConfidence.flow.toFixed(2)} | Liquidity: ${payload.blockConfidence.liquidity.toFixed(2)} | Derivatives: ${payload.blockConfidence.derivatives.toFixed(2)}`,
-            `Warming Up: ${payload.warmingUp ? `YES (${payload.warmingProgress.toFixed(2)})` : 'NO'}`,
-            `Degraded: ${payload.degraded ? 'YES' : 'NO'}`,
-        ];
-        if (payload.degraded && payload.degradedReasons.length) {
-            line.push(`Reasons: ${payload.degradedReasons.join(',')}`);
-        }
-        if (payload.warnings && payload.warnings.length) {
-            line.push(`Warnings: ${payload.warnings.join(',')}`);
-        }
-        logger.info(line.join('\n'));
+    private buildLogSignature(payload: MarketDataStatusPayload): string {
+        const symbol = this.lastSymbol ?? '';
+        const marketType = this.lastMarketType;
+        const shouldShowMarketType = marketType !== undefined && marketType !== 'unknown';
+        const hasContext = symbol.length > 0 && shouldShowMarketType;
+        const symbolTag = hasContext ? symbol : '';
+        const marketTypeTag = hasContext ? marketType ?? '' : '';
+        const aggUsed = payload.aggSourcesUsed?.length ?? payload.activeSourcesAgg;
+        const aggSeen = payload.aggSourcesSeen?.length ?? payload.activeSourcesAgg;
+        const rawUsed = payload.rawSourcesUsed?.length ?? payload.activeSourcesRaw;
+        const rawSeen = payload.rawSourcesSeen?.length ?? payload.activeSourcesRaw;
+        const aggUnexpected = payload.aggSourcesUnexpected ?? [];
+        const rawUnexpected = payload.rawSourcesUnexpected ?? [];
+        return [
+            symbolTag,
+            marketTypeTag,
+            payload.warmingUp ? 'WARMING' : payload.degraded ? 'DEGRADED' : 'READY',
+            payload.overallConfidence.toFixed(2),
+            payload.blockConfidence.price.toFixed(2),
+            payload.blockConfidence.flow.toFixed(2),
+            payload.blockConfidence.liquidity.toFixed(2),
+            payload.blockConfidence.derivatives.toFixed(2),
+            `${aggUsed}/${payload.expectedSourcesAgg}`,
+            `${rawUsed}/${payload.expectedSourcesRaw}`,
+            `${rawSeen}`,
+            `${aggSeen}`,
+            payload.warmingUp ? payload.warmingProgress.toFixed(2) : 'NO',
+            payload.degraded ? 'YES' : 'NO',
+            payload.degradedReasons.join(','),
+            (payload.warnings ?? []).join(','),
+            aggUnexpected.join(','),
+            rawUnexpected.join(','),
+        ].join('|');
     }
 
     private logDegradedTransition(payload: MarketDataStatusPayload): void {
@@ -951,8 +1109,12 @@ export class MarketDataReadiness {
         const timeIssue = block ? this.lastTimeOutOfOrderByBlock.get(block) : undefined;
         const expectedAgg = block ? snapshot.expected[block] : undefined;
         const usedAgg = block ? snapshot.usedAgg[block] : undefined;
-        const lagNowTs = this.lastLagSampleTs ?? payload.lastBucketTs;
-        const lagStats = this.computeLagStats(lagNowTs);
+        const exchangeLagNowTs = this.lastExchangeLagSampleTs ?? payload.lastBucketTs;
+        const exchangeLagStats = this.computeExchangeLagStats(exchangeLagNowTs);
+        const lagStats =
+            reason === 'LAG_TOO_HIGH'
+                ? this.computeProcessingLagStats(this.lastProcessingLagSampleTs ?? this.now())
+                : exchangeLagStats;
         return {
             reason,
             block,
@@ -1028,16 +1190,19 @@ export class MarketDataReadiness {
                 blocks: payload.blockConfidence,
                 reasons: payload.degradedReasons,
                 warnings: payload.warnings,
+                aggSourcesUsed: payload.aggSourcesUsed,
+                aggSourcesSeen: payload.aggSourcesSeen,
+                aggSourcesUnexpected: payload.aggSourcesUnexpected,
+                rawSourcesUsed: payload.rawSourcesUsed,
+                rawSourcesSeen: payload.rawSourcesSeen,
+                rawSourcesUnexpected: payload.rawSourcesUnexpected,
             },
         };
     }
 
     private shouldLog(ts: number, last: MarketDataStatusPayload | undefined, next: MarketDataStatusPayload): boolean {
         if (!last) return true;
-        if (last.degraded !== next.degraded) return true;
-        if (last.warmingUp !== next.warmingUp) return true;
-        if (last.degradedReasons.join(',') !== next.degradedReasons.join(',')) return true;
-        if ((last.warnings ?? []).join(',') !== (next.warnings ?? []).join(',')) return true;
+        if (this.buildLogSignature(last) !== this.buildLogSignature(next)) return true;
         const lastLogTs = this.lastLogTs ?? 0;
         if (ts - lastLogTs >= this.logIntervalMs) return true;
         return false;
@@ -1048,34 +1213,68 @@ export class MarketDataReadiness {
         this.mismatchByBlock.clear();
     }
 
-    private recordLagSample(tsEvent: number, tsIngest?: number): void {
+    private recordExchangeLagSample(tsEvent: number, tsIngest?: number): void {
         if (!Number.isFinite(tsEvent)) return;
-        const ingest = tsIngest ?? tsEvent;
-        if (!Number.isFinite(ingest)) return;
-        const lagMs = Math.max(0, ingest - tsEvent);
-        this.lastLagSampleTs = ingest;
-        this.lagSamples.push({ ts: ingest, lagMs });
-        if (this.lagEwma === undefined) {
-            this.lagEwma = lagMs;
+        if (typeof tsIngest !== 'number' || !Number.isFinite(tsIngest)) return;
+        if (tsIngest < tsEvent) return;
+        const nowTs = this.now();
+        if (!Number.isFinite(nowTs)) return;
+        if (tsEvent < nowTs - EXCHANGE_LAG_MAX_EVENT_AGE_MS) return;
+        const lagMs = Math.max(0, tsIngest - tsEvent);
+        this.lastExchangeLagSampleTs = tsIngest;
+        this.exchangeLagSamples.push({ ts: tsIngest, lagMs });
+        if (this.exchangeLagEwma === undefined) {
+            this.exchangeLagEwma = lagMs;
         } else {
             const alpha = this.lagEwmaAlpha;
-            this.lagEwma = (1 - alpha) * this.lagEwma + alpha * lagMs;
+            this.exchangeLagEwma = (1 - alpha) * this.exchangeLagEwma + alpha * lagMs;
         }
-        this.pruneLagSamples(ingest);
+        this.pruneExchangeLagSamples(tsIngest);
     }
 
-    private pruneLagSamples(nowTs: number): void {
+    private recordProcessingLagSample(tsIngest?: number): void {
+        if (typeof tsIngest !== 'number' || !Number.isFinite(tsIngest)) return;
+        const nowTs = this.now();
+        if (!Number.isFinite(nowTs)) return;
+        const lagMs = Math.max(0, nowTs - tsIngest);
+        this.lastProcessingLagIngestTs = tsIngest;
+        this.lastProcessingLagSampleTs = nowTs;
+        this.processingLagSamples.push({ ts: nowTs, lagMs });
+        if (this.processingLagEwma === undefined) {
+            this.processingLagEwma = lagMs;
+        } else {
+            const alpha = this.lagEwmaAlpha;
+            this.processingLagEwma = (1 - alpha) * this.processingLagEwma + alpha * lagMs;
+        }
+        this.pruneProcessingLagSamples(nowTs);
+    }
+
+    private pruneExchangeLagSamples(nowTs: number): void {
         const cutoff = nowTs - this.lagWindowMs;
         let idx = 0;
-        while (idx < this.lagSamples.length && this.lagSamples[idx].ts < cutoff) idx += 1;
-        if (idx > 0) this.lagSamples.splice(0, idx);
+        while (idx < this.exchangeLagSamples.length && this.exchangeLagSamples[idx].ts < cutoff) idx += 1;
+        if (idx > 0) this.exchangeLagSamples.splice(0, idx);
     }
 
-    private computeLagStats(nowTs: number): { p95?: number; ewma?: number } {
-        this.pruneLagSamples(nowTs);
-        if (this.lagSamples.length === 0) return { p95: undefined, ewma: this.lagEwma };
-        const values = this.lagSamples.map((sample) => sample.lagMs).sort((a, b) => a - b);
-        return { p95: this.percentile(values, 0.95), ewma: this.lagEwma };
+    private pruneProcessingLagSamples(nowTs: number): void {
+        const cutoff = nowTs - this.lagWindowMs;
+        let idx = 0;
+        while (idx < this.processingLagSamples.length && this.processingLagSamples[idx].ts < cutoff) idx += 1;
+        if (idx > 0) this.processingLagSamples.splice(0, idx);
+    }
+
+    private computeExchangeLagStats(nowTs: number): { p95?: number; ewma?: number } {
+        this.pruneExchangeLagSamples(nowTs);
+        if (this.exchangeLagSamples.length === 0) return { p95: undefined, ewma: this.exchangeLagEwma };
+        const values = this.exchangeLagSamples.map((sample) => sample.lagMs).sort((a, b) => a - b);
+        return { p95: this.percentile(values, 0.95), ewma: this.exchangeLagEwma };
+    }
+
+    private computeProcessingLagStats(nowTs: number): { p95?: number; ewma?: number } {
+        this.pruneProcessingLagSamples(nowTs);
+        if (this.processingLagSamples.length === 0) return { p95: undefined, ewma: this.processingLagEwma };
+        const values = this.processingLagSamples.map((sample) => sample.lagMs).sort((a, b) => a - b);
+        return { p95: this.percentile(values, 0.95), ewma: this.processingLagEwma };
     }
 
     private percentile(sortedValues: number[], p: number): number {
@@ -1124,6 +1323,7 @@ export class MarketDataReadiness {
     }
 
     private toConfidence(evt: AggregatedWithMeta, topic: string): DataConfidence {
+        const tsIngest = typeof evt.meta.tsIngest === 'number' ? asTsMs(evt.meta.tsIngest) : undefined;
         return {
             sourceId: evt.symbol,
             topic,
@@ -1133,8 +1333,22 @@ export class MarketDataReadiness {
             freshSourcesCount: evt.sourcesUsed?.length ?? 0,
             staleSourcesDropped: evt.staleSourcesDropped,
             mismatchDetected: evt.mismatchDetected,
-            meta: createMeta('global_data', { tsEvent: asTsMs(evt.meta.tsEvent) }),
+            meta: createMeta('global_data', { tsEvent: asTsMs(evt.meta.tsEvent), tsIngest }),
         };
+    }
+
+    private resolveStatusIngestTs(bucketTs: number): number {
+        const candidates: number[] = [];
+        for (const evt of this.lastByBlock.values()) {
+            const ingest = evt.meta.tsIngest ?? evt.meta.tsEvent;
+            if (ingest !== undefined) candidates.push(ingest);
+        }
+        for (const evt of this.dataConfidenceByTopic.values()) {
+            const ingest = evt.meta.tsIngest ?? evt.meta.tsEvent;
+            if (ingest !== undefined) candidates.push(ingest);
+        }
+        if (!candidates.length) return bucketTs;
+        return Math.max(...candidates);
     }
 
     private lowestBlock(blockConfidence: Record<ReadinessBlock, number>): ReadinessBlock {

@@ -16,7 +16,7 @@ describe('CanonicalPriceAggregator', () => {
       symbol: 'BTCUSDT',
       streamId: 's1',
       marketType: 'futures',
-      meta: createMeta('market', { ts: 1000 }),
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId: 's1' }),
     };
     bus.publish('market:ticker', noPriceTicker);
 
@@ -27,7 +27,7 @@ describe('CanonicalPriceAggregator', () => {
       streamId: 's1',
       marketType: 'futures',
       indexPrice: '100',
-      meta: createMeta('market', { ts: 2000 }),
+      meta: createMeta('market', { tsEvent: 2000, tsIngest: 2000, streamId: 's1' }),
     };
     bus.publish('market:ticker', pricedTicker);
 

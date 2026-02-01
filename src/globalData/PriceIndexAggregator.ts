@@ -2,7 +2,7 @@ import { inheritMeta, type AggregatedQualityFlags, type EventBus, type MarketPri
 import { computeConfidenceScore } from '../core/confidence';
 import { stableRecordFromEntries, stableSortStrings } from '../core/determinism';
 import { sourceRegistry } from '../core/market/SourceRegistry';
-import { inferMarketTypeFromStreamId, normalizeMarketType, normalizeSymbol } from '../core/market/symbols';
+import { normalizeMarketType, normalizeSymbol } from '../core/market/symbols';
 import { detectMismatch } from './quality';
 
 export interface PriceIndexAggregatorOptions {
@@ -52,7 +52,7 @@ export class PriceIndexAggregator {
 
         const symbol = evt.symbol;
         const normalizedSymbol = normalizeSymbol(symbol);
-        const normalizedMarketType = normalizeMarketType(evt.marketType ?? inferMarketTypeFromStreamId(evt.streamId));
+        const normalizedMarketType = normalizeMarketType(evt.marketType);
         const ts = evt.meta.ts;
         const key = `${normalizedSymbol}:${normalizedMarketType}`;
         const byStream = this.sources.get(key) ?? new Map<string, SourceState>();

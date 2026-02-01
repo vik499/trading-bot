@@ -30,6 +30,8 @@ const makeKline = (symbol: string, tf: string, index: number, close: number, ran
   const endTs = startTs + step;
   return {
     symbol,
+    streamId: 'bybit.public.linear.v5',
+    marketType: 'futures',
     interval: TF_INTERVAL[tf] ?? '5',
     tf,
     startTs,
@@ -39,7 +41,12 @@ const makeKline = (symbol: string, tf: string, index: number, close: number, ran
     low: close - range,
     close,
     volume: 1,
-    meta: createMeta('market', { ts: endTs, correlationId }),
+    meta: createMeta('market', {
+      tsEvent: endTs,
+      tsIngest: endTs,
+      streamId: 'bybit.public.linear.v5',
+      correlationId,
+    }),
   };
 };
 

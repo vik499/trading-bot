@@ -1,5 +1,7 @@
 import {
-    inheritMeta,
+    asTsMs,
+    createMeta,
+    nowMs,
     type EventBus,
     type MarketOpenInterestAggEvent,
     type OpenInterestEvent,
@@ -16,6 +18,7 @@ export interface OpenInterestAggregatorOptions {
     canonicalMinConfidence?: number;
     providerId?: string;
     weights?: Record<string, number>;
+    now?: () => number;
 }
 
 interface SourceState {
@@ -32,6 +35,7 @@ export class OpenInterestAggregator {
     private readonly canonicalMinConfidence: number;
     private readonly providerId: string;
     private readonly weights: Record<string, number>;
+    private readonly now: () => number;
     private readonly sources = new Map<string, Map<string, SourceState>>();
     private readonly canonicalPrice = new Map<
         string,
@@ -47,6 +51,7 @@ export class OpenInterestAggregator {
         this.canonicalMinConfidence = Math.max(0, options.canonicalMinConfidence ?? 0.7);
         this.providerId = options.providerId ?? 'local_oi_agg';
         this.weights = options.weights ?? {};
+        this.now = options.now ?? nowMs;
     }
 
     start(): void {
@@ -70,7 +75,7 @@ export class OpenInterestAggregator {
     private onCanonical(evt: MarketPriceCanonicalEvent): void {
         const price = evt.indexPrice ?? evt.markPrice;
         if (!Number.isFinite(price)) return;
-        const normalizedMarketType = normalizeMarketType(evt.marketType ?? 'futures');
+        const normalizedMarketType = normalizeMarketType(evt.marketType);
         const key = this.canonicalKey(evt.symbol, normalizedMarketType);
         this.canonicalPrice.set(key, {
             price: price as number,
@@ -83,9 +88,9 @@ export class OpenInterestAggregator {
     private onOi(evt: OpenInterestEvent): void {
         const symbol = evt.symbol;
         const normalizedSymbol = normalizeSymbol(symbol);
-        const normalizedMarketType = normalizeMarketType(evt.marketType ?? 'futures');
+        const normalizedMarketType = normalizeMarketType(evt.marketType);
         const streamId = evt.streamId || 'unknown';
-        const ts = evt.meta.ts;
+        const ts = evt.meta.tsEvent;
         const { valueUsd: openInterestValueUsd, priceTypeUsed } = this.resolveUsdValue(evt, ts, normalizedMarketType);
         const sources = this.sources.get(symbol) ?? new Map<string, SourceState>();
         sources.set(streamId, {
@@ -126,7 +131,11 @@ export class OpenInterestAggregator {
                 staleSourcesDropped: breakdown.staleSourcesDropped.length ? breakdown.staleSourcesDropped : undefined,
             },
             provider: this.providerId,
-            meta: inheritMeta(evt.meta, 'global_data', { ts }),
+            meta: createMeta('global_data', {
+                tsEvent: asTsMs(ts),
+                tsIngest: asTsMs(evt.meta.tsIngest ?? this.now()),
+                correlationId: evt.meta.correlationId,
+            }),
         };
         this.bus.publish('market:oi_agg', payload);
         sourceRegistry.markAggEmitted(

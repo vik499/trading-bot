@@ -1,9 +1,18 @@
-import { asTsMs, inheritMeta, type EventBus, type MarketCvdEvent, type MarketType, type TradeEvent } from '../core/events/EventBus';
+import {
+    asTsMs,
+    createMeta,
+    nowMs,
+    type EventBus,
+    type KnownMarketType,
+    type MarketCvdEvent,
+    type TradeEvent,
+} from '../core/events/EventBus';
 import { bucketCloseTs, bucketStartTs as bucketStartTsFromTs } from '../core/buckets';
 
 export interface CvdCalculatorOptions {
     bucketMs?: number;
-    marketTypes?: MarketType[];
+    marketTypes?: KnownMarketType[];
+    now?: () => number;
 }
 
 interface CvdState {
@@ -17,7 +26,8 @@ interface CvdState {
 export class CvdCalculator {
     private readonly bus: EventBus;
     private readonly bucketMs: number;
-    private readonly marketTypes: Set<MarketType>;
+    private readonly marketTypes: Set<KnownMarketType>;
+    private readonly now: () => number;
     private readonly state = new Map<string, CvdState>();
     private unsubscribe?: () => void;
 
@@ -25,6 +35,7 @@ export class CvdCalculator {
         this.bus = bus;
         this.bucketMs = Math.max(100, options.bucketMs ?? 1_000);
         this.marketTypes = new Set(options.marketTypes ?? ['spot', 'futures']);
+        this.now = options.now ?? nowMs;
     }
 
     start(): void {
@@ -40,10 +51,10 @@ export class CvdCalculator {
     }
 
     private onTrade(evt: TradeEvent): void {
-        const marketType = evt.marketType ?? 'unknown';
+        const marketType = evt.marketType;
         if (!this.marketTypes.has(marketType)) return;
         if (!evt.streamId) return;
-        const ts = evt.meta.ts;
+        const ts = evt.meta.tsEvent;
         const bucketEndTs = bucketCloseTs(ts, this.bucketMs);
         const bucketStartTs = bucketStartTsFromTs(ts, this.bucketMs);
         const key = `${evt.symbol}:${marketType}:${evt.streamId}`;
@@ -74,7 +85,7 @@ export class CvdCalculator {
         this.state.set(key, state);
     }
 
-    private emitBucket(symbol: string, streamId: string, marketType: MarketType, state: CvdState): void {
+    private emitBucket(symbol: string, streamId: string, marketType: KnownMarketType, state: CvdState): void {
         const payload: MarketCvdEvent = {
             symbol,
             streamId,
@@ -86,7 +97,12 @@ export class CvdCalculator {
             cvdTotal: state.cvdTotal,
             unit: 'base',
             exchangeTs: state.bucketEndTs,
-            meta: inheritMeta(state.lastMeta, 'global_data', { tsEvent: asTsMs(state.bucketEndTs) }),
+            meta: createMeta('global_data', {
+                tsEvent: asTsMs(state.bucketEndTs),
+                tsIngest: asTsMs(state.lastMeta.tsIngest ?? this.now()),
+                correlationId: state.lastMeta.correlationId,
+                streamId,
+            }),
         };
 
         if (marketType === 'spot') {

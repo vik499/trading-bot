@@ -19,6 +19,7 @@ describe('LiquidityAggregator', () => {
       streamId: 's1',
       updateId: 1,
       exchangeTs: 1000,
+      marketType: 'futures',
       bids: [
         { price: 100, size: 1 },
         { price: 99, size: 2 },
@@ -27,7 +28,7 @@ describe('LiquidityAggregator', () => {
         { price: 101, size: 1 },
         { price: 102, size: 2 },
       ],
-      meta: createMeta('market', { ts: 1000 }),
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId: 's1' }),
     };
     bus.publish('market:orderbook_l2_snapshot', snapshot1);
 
@@ -36,6 +37,7 @@ describe('LiquidityAggregator', () => {
       streamId: 's2',
       updateId: 2,
       exchangeTs: 1500,
+      marketType: 'futures',
       bids: [
         { price: 200, size: 1 },
         { price: 199, size: 1 },
@@ -44,7 +46,7 @@ describe('LiquidityAggregator', () => {
         { price: 201, size: 1 },
         { price: 202, size: 1 },
       ],
-      meta: createMeta('market', { ts: 1500 }),
+      meta: createMeta('market', { tsEvent: 1500, tsIngest: 1500, streamId: 's2' }),
     };
     bus.publish('market:orderbook_l2_snapshot', snapshot2);
 
@@ -52,7 +54,7 @@ describe('LiquidityAggregator', () => {
       ...snapshot1,
       updateId: 3,
       exchangeTs: 2100,
-      meta: createMeta('market', { ts: 2100 }),
+      meta: createMeta('market', { tsEvent: 2100, tsIngest: 2100, streamId: 's1' }),
     });
 
     expect(outputs).toHaveLength(1);

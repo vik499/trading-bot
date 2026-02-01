@@ -17,6 +17,8 @@ const makeKline = (symbol: string, index: number, close: number, opts: { correla
   const range = opts.range ?? 0.02;
   return {
     symbol,
+    streamId: 'bybit.public.linear.v5',
+    marketType: 'futures',
     interval: '5',
     tf: '5m',
     startTs,
@@ -26,7 +28,12 @@ const makeKline = (symbol: string, index: number, close: number, opts: { correla
     low: close - range,
     close,
     volume: 1,
-    meta: createMeta('market', { ts: endTs, correlationId: opts.correlationId }),
+    meta: createMeta('market', {
+      tsEvent: endTs,
+      tsIngest: endTs,
+      streamId: 'bybit.public.linear.v5',
+      correlationId: opts.correlationId,
+    }),
   };
 };
 

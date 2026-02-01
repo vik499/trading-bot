@@ -7,7 +7,7 @@ import type {
     KlineEvent,
     KlineInterval,
     LiquidationEvent,
-    MarketType,
+    KnownMarketType,
     VenueId,
     OrderbookL2DeltaEvent,
     OrderbookL2SnapshotEvent,
@@ -38,7 +38,7 @@ const toErrorMessage = (err: unknown): string => {
 
 export interface BinanceWsClientOptions {
     streamId?: string;
-    marketType?: MarketType;
+    marketType?: KnownMarketType;
     depthLimit?: number;
     reconnectMaxMs?: number;
     pingIntervalMs?: number;
@@ -47,6 +47,8 @@ export interface BinanceWsClientOptions {
     supportsLiquidations?: boolean;
     supportsOrderbook?: boolean;
     eventBus?: EventBus;
+    instanceId?: string;
+    instanceIdFactory?: () => string;
 }
 
 type WsConnState = 'idle' | 'connecting' | 'open' | 'closing';
@@ -72,7 +74,105 @@ type DepthState = {
 const DEFAULT_STREAM_ID = 'binance.usdm.public';
 const DEFAULT_WS_URL = 'wss://fstream.binance.com/ws';
 
+let binanceClientInstanceSeq = 0;
+const nextBinanceClientInstanceId = (): string => {
+    binanceClientInstanceSeq += 1;
+    return binanceClientInstanceSeq.toString(36);
+};
+
+type BinanceClientRegistryKey = string;
+const binanceClientRegistry = new Map<BinanceClientRegistryKey, BinancePublicWsClient>();
+
+export const buildBinanceClientRegistryKey = (params: {
+    venue: VenueId;
+    streamId: string;
+    symbol?: string;
+    marketType?: KnownMarketType;
+}): string => `${params.venue}:${params.streamId}:${params.symbol ?? '*'}:${params.marketType ?? 'unknown'}`;
+
+export const resetBinancePublicWsClientRegistry = (): void => {
+    binanceClientRegistry.clear();
+};
+
+export const getBinancePublicWsClient = (opts: BinanceWsClientOptions & { url?: string; symbol?: string }): BinancePublicWsClient => {
+    const url = opts.url ?? DEFAULT_WS_URL;
+    const streamId = opts.streamId ?? DEFAULT_STREAM_ID;
+    const key = buildBinanceClientRegistryKey({ venue: 'binance', streamId, symbol: opts.symbol, marketType: opts.marketType });
+    const cached = binanceClientRegistry.get(key);
+    if (cached) return cached;
+    const client = new BinancePublicWsClient(url, opts);
+    logger.info(
+        m(
+            'connect',
+            `[BinanceWS#${client.clientInstanceId}] creating BinanceWS client id=${client.clientInstanceId} venue=binance streamId=${streamId} symbol=${opts.symbol ?? 'n/a'} marketType=${opts.marketType ?? 'unknown'}`
+        )
+    );
+    binanceClientRegistry.set(key, client);
+    return client;
+};
+
+class BinanceSubscriptionManager {
+    private readonly desired = new Map<string, string>();
+    private readonly active = new Set<string>();
+    private readonly pending = new Set<string>();
+
+    requestSubscribe(stream: string): boolean {
+        const key = buildBinanceSubKey(stream);
+        if (this.desired.has(key)) return false;
+        this.desired.set(key, stream);
+        return true;
+    }
+
+    buildDiff(): Array<{ key: string; stream: string }> {
+        const pendingKeys = new Set<string>([...this.active, ...this.pending]);
+        const diffKeys = Array.from(this.desired.keys()).filter((key) => !pendingKeys.has(key));
+        diffKeys.sort();
+        return diffKeys.map((key) => ({ key, stream: this.desired.get(key)! }));
+    }
+
+    markPending(keys: string[]): void {
+        keys.forEach((key) => this.pending.add(key));
+    }
+
+    markActive(key: string): void {
+        this.pending.delete(key);
+        this.active.add(key);
+    }
+
+    onOpen(): void {
+        this.pending.clear();
+        this.active.clear();
+    }
+
+    onClose(): void {
+        this.pending.clear();
+        this.active.clear();
+    }
+
+    desiredCount(): number {
+        return this.desired.size;
+    }
+
+    activeCount(): number {
+        return this.active.size;
+    }
+
+    pendingCount(): number {
+        return this.pending.size;
+    }
+
+    /** Snapshot of current subscription state (for tests and diagnostics) */
+    snapshot(): { desired: string[]; active: string[]; pending: string[] } {
+        return {
+            desired: Array.from(this.desired.values()),
+            active: Array.from(this.active.values()),
+            pending: Array.from(this.pending.values()),
+        };
+    }
+}
+
 export class BinancePublicWsClient {
+    public readonly clientInstanceId: string;
     private socket: WebSocket | null = null;
     private state: WsConnState = 'idle';
     private connectPromise: Promise<void> | null = null;
@@ -81,14 +181,15 @@ export class BinancePublicWsClient {
     private reconnectTimer: NodeJS.Timeout | null = null;
     private lastReconnectDelayMs?: number;
     private pingTimer: NodeJS.Timeout | null = null;
-    private readonly subscriptions = new Set<string>();
-    private readonly sentSubscriptions = new Set<string>();
+    private readonly subscriptions = new BinanceSubscriptionManager();
+    private reconcileInFlight = false;
+    private reconcileQueued = false;
     private readonly depthState = new Map<string, DepthState>();
     private readonly orderbookSymbols = new Set<string>();
 
     private readonly url: string;
-    private readonly streamId: string;
-    private readonly marketType?: MarketType;
+    public readonly streamId: string;
+    public readonly marketType?: KnownMarketType;
     private readonly depthLimit: number;
     private readonly reconnectMaxMs: number;
     private readonly pingIntervalMs: number;
@@ -111,6 +212,8 @@ export class BinancePublicWsClient {
         this.restClient = opts.restClient ?? new BinancePublicRestClient();
         this.now = opts.now ?? nowMs;
         this.bus = opts.eventBus ?? eventBus;
+        this.clientInstanceId = opts.instanceId ?? (opts.instanceIdFactory ? opts.instanceIdFactory() : nextBinanceClientInstanceId());
+        logger.info(m('connect', `[BinanceWS#${this.clientInstanceId}] created streamId=${this.streamId} marketType=${this.marketType ?? 'unknown'}`));
     }
 
     async connect(): Promise<void> {
@@ -119,6 +222,7 @@ export class BinancePublicWsClient {
 
         this.state = 'connecting';
         this.isDisconnecting = false;
+        logger.info(m('connect', `[BinanceWS#${this.clientInstanceId}] connect start`));
 
         this.connectPromise = new Promise((resolve, reject) => {
             const socket = new WebSocket(this.url);
@@ -132,7 +236,7 @@ export class BinancePublicWsClient {
                 this.state = 'idle';
                 this.connectPromise = null;
                 this.stopPing();
-                this.sentSubscriptions.clear();
+                this.subscriptions.onClose();
                 if (!this.isDisconnecting) {
                     this.scheduleReconnect(reason, closeCode);
                 }
@@ -141,11 +245,11 @@ export class BinancePublicWsClient {
             socket.on('open', () => {
                 this.state = 'open';
                 this.reconnectAttempts = 0;
-                this.sentSubscriptions.clear();
+                this.subscriptions.onOpen();
                 this.startPing();
                 this.flushSubscriptions();
                 this.refreshOrderbookSnapshots();
-                logger.info(m('ok', '[BinanceWS] connection open'));
+                logger.info(m('ok', `[BinanceWS#${this.clientInstanceId}] connection open`));
                 resolve();
             });
 
@@ -155,12 +259,12 @@ export class BinancePublicWsClient {
 
             socket.on('close', (code: number, reason: Buffer) => {
                 const reasonText = reason?.toString?.() ?? '';
-                logger.warn(m('warn', `[BinanceWS] close code=${code}${reasonText ? ` reason=${reasonText}` : ''}`));
+                logger.warn(m('warn', `[BinanceWS#${this.clientInstanceId}] close code=${code}${reasonText ? ` reason=${reasonText}` : ''}`));
                 cleanup('close', code);
             });
 
             socket.on('error', (err) => {
-                logger.warn(m('warn', `[BinanceWS] error: ${(err as Error).message}`));
+                logger.warn(m('warn', `[BinanceWS#${this.clientInstanceId}] error: ${(err as Error).message}`));
                 if (this.state === 'connecting') {
                     cleanup('connect-error');
                     reject(err);
@@ -234,22 +338,38 @@ export class BinancePublicWsClient {
     }
 
     private subscribeStream(stream: string): void {
-        if (this.subscriptions.has(stream)) return;
-        this.subscriptions.add(stream);
-        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-        if (this.sentSubscriptions.has(stream)) return;
-        this.sentSubscriptions.add(stream);
-        this.sendJson({ method: 'SUBSCRIBE', params: [stream], id: nextId() });
+        this.subscriptions.requestSubscribe(stream);
+        this.flushSubscriptions();
     }
 
     private flushSubscriptions(): void {
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-        if (this.subscriptions.size === 0) return;
-        const params = Array.from(this.subscriptions.values()).filter((stream) => !this.sentSubscriptions.has(stream));
-        if (params.length === 0) return;
-        params.forEach((stream) => this.sentSubscriptions.add(stream));
-        this.sendJson({ method: 'SUBSCRIBE', params, id: nextId() });
-        logger.info(m('connect', `[BinanceWS] subscribed ${params.length} streams`));
+        if (this.reconcileInFlight) {
+            this.reconcileQueued = true;
+            return;
+        }
+        this.reconcileInFlight = true;
+        try {
+            const diff = this.subscriptions.buildDiff();
+            if (diff.length === 0) return;
+            const params = diff.map((entry) => entry.stream);
+            const keys = diff.map((entry) => entry.key);
+            this.sendJson({ method: 'SUBSCRIBE', params, id: nextId() });
+            this.subscriptions.markPending(keys);
+            keys.forEach((key) => this.subscriptions.markActive(key));
+            logger.info(
+                m(
+                    'connect',
+                    `[BinanceWS#${this.clientInstanceId}] subscribe diff=${diff.length} totalDesired=${this.subscriptions.desiredCount()} active=${this.subscriptions.activeCount()} pending=${this.subscriptions.pendingCount()}`
+                )
+            );
+        } finally {
+            this.reconcileInFlight = false;
+            if (this.reconcileQueued) {
+                this.reconcileQueued = false;
+                this.flushSubscriptions();
+            }
+        }
     }
 
     private async ensureDepthSnapshot(symbol: string): Promise<void> {
@@ -506,6 +626,14 @@ export class BinancePublicWsClient {
             return;
         }
 
+        const marketType = this.marketType;
+        if (!isKnownMarketType(marketType)) {
+            logger.warn(
+                m('warn', `[BinanceWS#${this.clientInstanceId}] kline skipped for ${symbol}: marketType=${marketType ?? 'unknown'}`)
+            );
+            return;
+        }
+
         const event: KlineEvent = {
             symbol,
             interval,
@@ -518,14 +646,14 @@ export class BinancePublicWsClient {
             close,
             volume,
             streamId: this.streamId,
-            marketType: this.marketType,
+            marketType,
             meta: createMeta('market', {
                 tsEvent: asTsMs(endTs),
                 tsExchange: asTsMs(endTs),
                 tsIngest: asTsMs(this.now()),
                 streamId: this.streamId,
             }),
-        } as KlineEvent;
+        };
         this.bus.publish('market:kline', event);
 
         const rawEvt = mapCandleRaw(
@@ -542,7 +670,7 @@ export class BinancePublicWsClient {
             true,
             endTs,
             this.now(),
-            this.marketType
+            marketType
         );
         this.bus.publish('market:candle_raw', rawEvt);
     }
@@ -713,12 +841,12 @@ export class BinancePublicWsClient {
         const jitter = Math.floor(baseWithMin * 0.2 * stableJitterFactor(`binance:${reason}`, this.reconnectAttempts));
         const delay = baseWithMin + jitter;
         this.lastReconnectDelayMs = delay;
-        logger.warn(m('warn', `[BinanceWS] reconnect in ${delay}ms (reason=${reason})`));
+        logger.warn(m('warn', `[BinanceWS#${this.clientInstanceId}] reconnect in ${delay}ms (reason=${reason})`));
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null;
             this.connect().catch((err) => {
                 const msg = toErrorMessage(err);
-                logger.warn(m('warn', `[BinanceWS] reconnect failed: ${msg}`));
+                logger.warn(m('warn', `[BinanceWS#${this.clientInstanceId}] reconnect failed: ${msg}`));
             });
         }, delay);
     }
@@ -737,6 +865,10 @@ let idCounter = 1;
 function nextId(): number {
     idCounter += 1;
     return idCounter;
+}
+
+function buildBinanceSubKey(stream: string): string {
+    return stream.trim().toLowerCase();
 }
 
 function parseDepthLevels(raw: unknown): OrderbookLevel[] {
@@ -813,6 +945,10 @@ function intervalToTf(interval: KlineInterval): string {
     if (minutes % 1440 === 0) return `${minutes / 1440}d`;
     if (minutes % 60 === 0) return `${minutes / 60}h`;
     return `${minutes}m`;
+}
+
+function isKnownMarketType(value: unknown): value is KnownMarketType {
+    return value === 'spot' || value === 'futures';
 }
 
 function stableJitterFactor(seed: string, failures: number): number {

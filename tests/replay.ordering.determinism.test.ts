@@ -35,6 +35,7 @@ import { MarketDataReadiness } from '../src/observability/MarketDataReadiness';
 const SYMBOL = 'BTCUSDT';
 const STREAM_ID = 'stream-1';
 const RUN_ID = 'run-ordering';
+const READINESS_NOW_TS = 10_000;
 
 function startAggregators(bus: ReturnType<typeof createTestEventBus>) {
   const oiAgg: MarketOpenInterestAggEvent[] = [];
@@ -55,7 +56,13 @@ function startAggregators(bus: ReturnType<typeof createTestEventBus>) {
   const liquidationAggregator = new LiquidationAggregator(bus, { ttlMs: 5_000, bucketMs: 1_000 });
   const priceIndexAggregator = new PriceIndexAggregator(bus, { ttlMs: 5_000 });
   const canonicalPriceAggregator = new CanonicalPriceAggregator(bus, { ttlMs: 5_000 });
-  const readinessAgg = new MarketDataReadiness(bus, { bucketMs: 1_000, warmingWindowMs: 0, expectedSources: 1, logIntervalMs: 0 });
+  const readinessAgg = new MarketDataReadiness(bus, {
+    bucketMs: 1_000,
+    warmingWindowMs: 0,
+    expectedSources: 1,
+    logIntervalMs: 0,
+    now: () => READINESS_NOW_TS,
+  });
 
   bus.subscribe('market:oi_agg', (evt) => oiAgg.push(evt));
   bus.subscribe('market:funding_agg', (evt) => fundingAgg.push(evt));
@@ -123,7 +130,7 @@ const events: ReplayEventEntry[] = [
       tradeTs: 900,
       exchangeTs: 900,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 900 }),
+      meta: createMeta('market', { tsEvent: 900, tsIngest: 900, streamId: STREAM_ID }),
     },
   },
   {
@@ -137,7 +144,7 @@ const events: ReplayEventEntry[] = [
       tradeTs: 1_900,
       exchangeTs: 1_900,
       marketType: 'futures',
-      meta: createMeta('market', { ts: 1_900 }),
+      meta: createMeta('market', { tsEvent: 1_900, tsIngest: 1_900, streamId: STREAM_ID }),
     },
   },
   {
@@ -147,9 +154,10 @@ const events: ReplayEventEntry[] = [
       streamId: STREAM_ID,
       updateId: 1,
       exchangeTs: 1_100,
+      marketType: 'futures',
       bids: [{ price: 100, size: 1 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 1_100 }),
+      meta: createMeta('market', { tsEvent: 1_100, tsIngest: 1_100, streamId: STREAM_ID }),
     },
   },
   {
@@ -159,9 +167,10 @@ const events: ReplayEventEntry[] = [
       streamId: STREAM_ID,
       updateId: 2,
       exchangeTs: 2_100,
+      marketType: 'futures',
       bids: [{ price: 100, size: 1 }],
       asks: [{ price: 101, size: 1 }],
-      meta: createMeta('market', { ts: 2_100 }),
+      meta: createMeta('market', { tsEvent: 2_100, tsIngest: 2_100, streamId: STREAM_ID }),
     },
   },
   {
@@ -174,7 +183,8 @@ const events: ReplayEventEntry[] = [
       size: 1,
       notionalUsd: 100,
       exchangeTs: 1_200,
-      meta: createMeta('market', { ts: 1_200 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_200, tsIngest: 1_200, streamId: STREAM_ID }),
     },
   },
   {
@@ -187,7 +197,8 @@ const events: ReplayEventEntry[] = [
       size: 1,
       notionalUsd: 100,
       exchangeTs: 2_100,
-      meta: createMeta('market', { ts: 2_100 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 2_100, tsIngest: 2_100, streamId: STREAM_ID }),
     },
   },
   {
@@ -198,7 +209,8 @@ const events: ReplayEventEntry[] = [
       openInterest: 10,
       openInterestUnit: 'base',
       exchangeTs: 1_300,
-      meta: createMeta('market', { ts: 1_300 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_300, tsIngest: 1_300, streamId: STREAM_ID }),
     },
   },
   {
@@ -209,7 +221,8 @@ const events: ReplayEventEntry[] = [
       fundingRate: 0.0001,
       exchangeTs: 1_400,
       nextFundingTs: 2_400,
-      meta: createMeta('market', { ts: 1_400 }),
+      marketType: 'futures',
+      meta: createMeta('market', { tsEvent: 1_400, tsIngest: 1_400, streamId: STREAM_ID }),
     },
   },
   {
@@ -217,11 +230,12 @@ const events: ReplayEventEntry[] = [
     payload: {
       symbol: SYMBOL,
       streamId: STREAM_ID,
+      marketType: 'futures',
       indexPrice: '100',
       markPrice: '99.5',
       lastPrice: '100.2',
       exchangeTs: 1_500,
-      meta: createMeta('market', { ts: 1_500 }),
+      meta: createMeta('market', { tsEvent: 1_500, tsIngest: 1_500, streamId: STREAM_ID }),
     },
   },
 ];
