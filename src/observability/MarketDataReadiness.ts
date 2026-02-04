@@ -78,6 +78,19 @@ export interface MarketDataReadinessOptions {
     marketStatusJson?: boolean;
 }
 
+export interface MarketReadinessSnapshot {
+    symbol: string;
+    marketType: MarketType;
+    status: 'READY' | 'WARMING' | 'DEGRADED';
+    conf: number;
+    warnings: string[];
+    degradedReasons: string[];
+    lagExP95?: number;
+    lagExEwma?: number;
+    lagPrP95?: number;
+    lagPrEwma?: number;
+}
+
 type AggregatedWithMeta = {
     symbol: string;
     ts: number;
@@ -143,6 +156,11 @@ const REASON_ORDER: Reason[] = [
 ];
 
 const WARNING_ORDER: WarningReason[] = ['TIMEBASE_QUALITY_WARN', 'NON_MONOTONIC_TIMEBASE', 'EXCHANGE_LAG_TOO_HIGH'];
+
+function capArray<T>(items: T[], limit: number): T[] {
+    if (items.length <= limit) return items;
+    return items.slice(0, limit);
+}
 
 export class MarketDataReadiness {
     private readonly bus: EventBus;
@@ -342,6 +360,26 @@ export class MarketDataReadiness {
         this.unsubscribers.forEach((fn) => fn());
         this.unsubscribers.length = 0;
         this.started = false;
+    }
+
+    getHealthSnapshot(): MarketReadinessSnapshot | undefined {
+        const status = this.lastStatus;
+        if (!status) return undefined;
+        const symbol = this.lastSymbol ?? 'UNKNOWN';
+        const marketType = this.lastMarketType ?? 'unknown';
+        const readiness = status.warmingUp ? 'WARMING' : status.degraded ? 'DEGRADED' : 'READY';
+        return {
+            symbol,
+            marketType,
+            status: readiness,
+            conf: status.overallConfidence,
+            warnings: capArray(status.warnings ?? [], 20),
+            degradedReasons: capArray(status.degradedReasons ?? [], 20),
+            lagExP95: status.exchangeLagP95Ms,
+            lagExEwma: status.exchangeLagEwmaMs,
+            lagPrP95: status.processingLagP95Ms,
+            lagPrEwma: status.processingLagEwmaMs,
+        };
     }
 
     seedExpectedSources(input: { symbol: string; marketType: MarketType }): void {

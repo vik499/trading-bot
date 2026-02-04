@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import readline from 'node:readline';
 import { createMeta, eventBus, type RecoveryRequested, type SnapshotRequested } from '../core/events/EventBus';
 import { logger } from '../infra/logger';
@@ -39,7 +41,9 @@ function makeSink(rl: readline.Interface) {
   };
 }
 
-export function startCli() {
+export type CliStatusProvider = () => string[];
+
+export function startCli(options: { logDir?: string; getStatusLines?: CliStatusProvider } = {}) {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -75,7 +79,7 @@ export function startCli() {
 
   const stateHandler = (state: ControlState) => {
     // краткий вывод состояния
-    logger.info(
+    logger.ui(
       `[CLI] Status: mode=${state.mode} paused=${state.paused} lifecycle=${state.lifecycle} uptime=${Math.floor(
         (Date.now() - state.startedAt) / 1000,
       )}s`,
@@ -84,8 +88,10 @@ export function startCli() {
 
   eventBus.subscribe('control:state', stateHandler);
 
+  const logDir = options.logDir ?? process.env.LOG_DIR ?? 'logs';
+
   const printHelp = () => {
-    logger.info(
+    logger.ui(
       'Commands: help | status | pause | resume | snapshot [path] | recover [path] | mode live|paper|backtest | logs on|off | logs tail <N> | level <debug|info|warn|error> | exit',
     );
   };
@@ -110,6 +116,10 @@ export function startCli() {
     switch (cmd) {
       case 'status':
         publish({ type: 'status' });
+        if (options.getStatusLines) {
+          const lines = options.getStatusLines();
+          lines.forEach((line) => logger.ui(line));
+        }
         break;
       case 'help':
         printHelp();
@@ -148,7 +158,7 @@ export function startCli() {
         if (v === 'live') publish({ type: 'set_mode', mode: 'LIVE' });
         else if (v === 'paper') publish({ type: 'set_mode', mode: 'PAPER' });
         else if (v === 'backtest') publish({ type: 'set_mode', mode: 'BACKTEST' });
-        else logger.error('usage: mode live|paper|backtest');
+        else logger.ui('usage: mode live|paper|backtest');
         break;
       }
 
@@ -156,25 +166,40 @@ export function startCli() {
         const sub = (arg ?? '').toLowerCase();
         if (sub === 'on') {
           logger.setDisplay(true);
-          logger.info('logs: display enabled');
+          logger.setConsoleMode('verbose');
+          logger.ui('Консоль: расширенный режим включён');
         } else if (sub === 'off') {
-          logger.info('logs: display disabled (history still collected)');
-          logger.setDisplay(false);
+          logger.setDisplay(true);
+          logger.setConsoleMode('ui');
+          logger.ui('Консоль: UI-режим, подробные логи скрыты');
         } else if (sub === 'tail') {
           const lineBefore = rl.line;
           const cursorBefore = rl.cursor;
           const n = Number.parseInt(arg2 ?? '', 10);
-          const tail = logger.tail(Number.isFinite(n) ? n : 50);
-          tail.forEach((e) => {
+          const limit = Number.isFinite(n) ? n : 50;
+          const errorsPath = path.join(logDir, 'errors.log');
+          const warningsPath = path.join(logDir, 'warnings.log');
+          const lines: Array<{ label: string; line: string }> = [];
+          const tailFile = (filePath: string, label: string) => {
+            if (!fs.existsSync(filePath)) return;
+            const content = fs.readFileSync(filePath, 'utf8');
+            const rows = content.split(/\r?\n/).filter((line) => line.trim().length > 0);
+            const slice = rows.slice(-limit);
+            slice.forEach((line) => lines.push({ label, line }));
+          };
+          tailFile(errorsPath, 'errors.log');
+          tailFile(warningsPath, 'warnings.log');
+
+          lines.forEach((entry) => {
             readline.clearLine(process.stdout, 0);
             readline.cursorTo(process.stdout, 0);
-            process.stdout.write(`${e.iso} ${e.level.toUpperCase()}: ${e.message}\n`);
+            process.stdout.write(`[${entry.label}] ${entry.line}\n`);
           });
           rl.prompt(true);
           const moveLeft = lineBefore.length - cursorBefore;
           if (moveLeft > 0) readline.moveCursor(process.stdout, -moveLeft, 0);
         } else {
-          logger.error('usage: logs on|off|tail <N>');
+          logger.ui('usage: logs on|off|tail <N>');
         }
         break;
       }
@@ -183,9 +208,9 @@ export function startCli() {
         const lvl = (arg ?? '').toLowerCase();
         if (lvl === 'debug' || lvl === 'info' || lvl === 'warn' || lvl === 'error') {
           logger.setLevel(lvl as any);
-          logger.info(`log level set to ${lvl}`);
+          logger.ui(`log level set to ${lvl}`);
         } else {
-          logger.error('usage: level debug|info|warn|error');
+          logger.ui('usage: level debug|info|warn|error');
         }
         break;
       }
@@ -198,7 +223,7 @@ export function startCli() {
         break;
 
       default:
-        logger.error(m('error', 'Unknown command. Use: status | pause | resume | snapshot [path] | recover [path] | mode live|paper|backtest | exit'));
+        logger.ui(m('error', 'Unknown command. Use: status | pause | resume | snapshot [path] | recover [path] | mode live|paper|backtest | exit'));
     }
 
     rl.prompt();

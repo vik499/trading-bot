@@ -19,9 +19,17 @@ export interface LogEntry {
   iso: string;             // ISO time
   level: LogLevel;
   message: string;
+  channel?: 'ui' | 'log';
 }
 
-type LogSink = (entry: LogEntry, formatted: string) => void;
+export type LogSink = {
+  kind?: 'console' | 'file';
+  write: (entry: LogEntry, formatted: string) => void;
+  flush?: () => void | Promise<void>;
+  close?: () => void | Promise<void>;
+};
+
+type LogSinkFn = (entry: LogEntry, formatted: string) => void;
 
 const LEVEL_WEIGHT: Record<LogLevel, number> = {
   debug: 10,
@@ -54,6 +62,8 @@ function formatEntry(entry: LogEntry): string {
 class Logger {
   private minLevel: LogLevel = 'info';
   private displayEnabled = true;
+  private consoleMode: 'ui' | 'verbose' = 'verbose';
+  private runId?: string;
 
   // История логов (ring buffer)
   private readonly buffer: LogEntry[] = [];
@@ -63,10 +73,15 @@ class Logger {
   private readonly lastByKey = new Map<string, number>();
 
   // Sink по умолчанию пишет в stdout/stderr.
-  private sink: LogSink = (entry, formatted) => {
-    if (entry.level === 'error') console.error(formatted);
-    else console.log(formatted);
-  };
+  private sinks: LogSink[] = [
+    {
+      kind: 'console',
+      write: (entry, formatted) => {
+        if (entry.level === 'error') console.error(formatted);
+        else console.log(formatted);
+      },
+    },
+  ];
 
   // --------------- публичный API управления ---------------
 
@@ -87,6 +102,14 @@ class Logger {
 
   getLevel(): LogLevel {
     return this.minLevel;
+  }
+
+  setConsoleMode(mode: 'ui' | 'verbose'): void {
+    this.consoleMode = mode;
+  }
+
+  getConsoleMode(): 'ui' | 'verbose' {
+    return this.consoleMode;
   }
 
   /** Настроить лимит истории (кольцевого буфера). */
@@ -115,15 +138,53 @@ class Logger {
    * Заменить sink (куда реально выводить лог).
    * CLI позже сможет поставить sink, который не ломает prompt.
    */
-  setSink(sink: LogSink): void {
-    this.sink = sink;
+  setSink(sink: LogSink | LogSinkFn): void {
+    const consoleSink = this.normalizeSink(sink, 'console');
+    const fileSinks = this.sinks.filter((item) => item.kind === 'file');
+    this.sinks = [...fileSinks, consoleSink];
+  }
+
+  /** Добавить дополнительный sink (например, файловый). */
+  addSink(sink: LogSink | LogSinkFn): void {
+    this.sinks.push(this.normalizeSink(sink, 'file'));
+  }
+
+  /** Заменить все sinks. */
+  setSinks(sinks: Array<LogSink | LogSinkFn>): void {
+    this.sinks = sinks.map((sink) => this.normalizeSink(sink, 'file'));
   }
 
   resetSinkToConsole(): void {
-    this.sink = (entry, formatted) => {
-      if (entry.level === 'error') console.error(formatted);
-      else console.log(formatted);
-    };
+    const fileSinks = this.sinks.filter((item) => item.kind === 'file');
+    this.sinks = [
+      ...fileSinks,
+      {
+        kind: 'console',
+        write: (entry, formatted) => {
+          if (entry.level === 'error') console.error(formatted);
+          else console.log(formatted);
+        },
+      },
+    ];
+  }
+
+  /** Установить runId (для файловых логов/обсервабилити). */
+  setRunId(runId: string): void {
+    this.runId = runId;
+  }
+
+  getRunId(): string | undefined {
+    return this.runId;
+  }
+
+  /** Сбросить буферы sinks (если поддерживается). */
+  async flush(): Promise<void> {
+    await Promise.allSettled(this.sinks.map((sink) => (sink.flush ? sink.flush() : undefined)));
+  }
+
+  /** Закрыть sinks (если поддерживается). */
+  async close(): Promise<void> {
+    await Promise.allSettled(this.sinks.map((sink) => (sink.close ? sink.close() : undefined)));
   }
 
   // --------------- лог-методы ---------------
@@ -162,14 +223,48 @@ class Logger {
     if (this.shouldAllowByKey(key, intervalMs)) this.write('debug', msg);
   }
 
+  ui(msg: string): void {
+    this.write('info', msg, { channel: 'ui' });
+  }
+
+  /** UI в консоль, без записи в файловые sink'и (чтобы не дублировать сообщения). */
+  uiConsole(msg: string): void {
+    this.write('info', msg, { channel: 'ui', files: false });
+  }
+
+  uiThrottled(key: string, msg: string, intervalMs: number): void {
+    if (this.shouldAllowByKey(key, intervalMs)) this.write('info', msg, { channel: 'ui' });
+  }
+
+  uiConsoleThrottled(key: string, msg: string, intervalMs: number): void {
+    if (this.shouldAllowByKey(key, intervalMs)) this.write('info', msg, { channel: 'ui', files: false });
+  }
+
+  infoFile(msg: string): void {
+    this.write('info', msg, { console: false });
+  }
+
+  warnFile(msg: string): void {
+    this.write('warn', msg, { console: false });
+  }
+
+  infoFileThrottled(key: string, msg: string, intervalMs: number): void {
+    if (this.shouldAllowByKey(key, intervalMs)) this.write('info', msg, { console: false });
+  }
+
   // --------------- внутренности ---------------
 
-  private write(level: LogLevel, message: string): void {
+  private write(
+    level: LogLevel,
+    message: string,
+    options?: { channel?: 'ui' | 'log'; console?: boolean; files?: boolean }
+  ): void {
     const entry: LogEntry = {
       ts: now(),
       iso: iso(),
       level,
       message,
+      channel: options?.channel ?? 'log',
     };
 
     // 1) всегда сохраняем историю
@@ -177,12 +272,21 @@ class Logger {
     this.trimBuffer();
 
     // 2) решаем, показывать ли
-    if (!this.displayEnabled) return;
-    if (LEVEL_WEIGHT[level] < LEVEL_WEIGHT[this.minLevel]) return;
+    const isUi = entry.channel === 'ui';
+    if (!isUi && LEVEL_WEIGHT[level] < LEVEL_WEIGHT[this.minLevel]) return;
 
-    // 3) выводим через sink
+    // 3) выводим через sinks
     const formatted = formatEntry(entry);
-    this.sink(entry, formatted);
+    for (const sink of this.sinks) {
+      if (sink.kind === 'console') {
+        if (options?.console === false) continue;
+        if (!this.displayEnabled) continue;
+        if (this.consoleMode === 'ui' && entry.channel !== 'ui') continue;
+      } else if (sink.kind === 'file') {
+        if (options?.files === false) continue;
+      }
+      sink.write(entry, formatted);
+    }
   }
 
   private trimBuffer(): void {
@@ -197,6 +301,16 @@ class Logger {
     if (t - last < ms) return false;
     this.lastByKey.set(key, t);
     return true;
+  }
+
+  private normalizeSink(sink: LogSink | LogSinkFn, kind: 'console' | 'file'): LogSink {
+    if (typeof sink === 'function') {
+      return { kind, write: sink };
+    }
+    if (!sink.kind) {
+      return { ...sink, kind };
+    }
+    return sink;
   }
 }
 

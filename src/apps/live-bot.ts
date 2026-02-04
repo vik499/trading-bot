@@ -1,7 +1,8 @@
 import { execSync } from 'child_process';
+import { randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { logger } from '../infra/logger';
+import { logger, type LogLevel } from '../infra/logger';
 import { BybitPublicWsClient } from '../exchange/bybit/wsClient';
 import { getBinancePublicWsClient } from '../exchange/binance/wsClient';
 import { getOkxPublicWsClient } from '../exchange/okx/wsClient';
@@ -11,7 +12,13 @@ import {
     eventBus,
     type ControlCommand,
     type ControlState,
+    type DataSourceDegraded,
+    type DataSourceRecovered,
     type EventSource,
+    type MarketConnected,
+    type MarketDataStatusPayload,
+    type MarketDisconnected,
+    type RiskRejectedIntentEvent,
     type TickerEvent,
 } from '../core/events/EventBus';
 import { MarketGateway } from '../exchange/marketGateway';
@@ -34,7 +41,7 @@ import { RiskManager } from '../risk/RiskManager';
 import { PaperExecutionEngine } from '../execution/PaperExecutionEngine';
 import { PortfolioManager } from '../portfolio/PortfolioManager';
 import { SnapshotCoordinator } from '../state/SnapshotCoordinator';
-import { EventTap } from '../observability/EventTap';
+import { EventTap, type EventTapCounters } from '../observability/EventTap';
 import { GlobalDataGateway } from '../globalData/GlobalDataGateway';
 import { OpenInterestAggregator } from '../globalData/OpenInterestAggregator';
 import { FundingAggregator } from '../globalData/FundingAggregator';
@@ -48,6 +55,12 @@ import { GlobalDataQualityMonitor } from '../globalData/GlobalDataQualityMonitor
 import { PatternMiner } from '../research/PatternMiner';
 import { MarketDataReadiness } from '../observability/MarketDataReadiness';
 import { parseExpectedSourcesConfig, type ExpectedSourcesConfig } from '../core/market/expectedSources';
+import { FileSink } from '../observability/logger/FileSink';
+import { RotatingFileWriter } from '../observability/logger/RotatingFileWriter';
+import { HealthReporter } from '../observability/health/HealthReporter';
+import { DEFAULT_STALENESS_POLICY_RULES, type StalenessPolicyRule } from '../core/observability/stalenessPolicy';
+import { DebouncedConsoleTransitions } from '../observability/ui/DebouncedConsoleTransitions';
+import { formatDataSourceDegradedUiLine, formatDataSourceRecoveredUiLine } from '../observability/ui/dataQualityUi';
 
 const APP_NAME = 'vavanbot';
 const APP_TAG = `[${APP_NAME}]`;
@@ -115,6 +128,73 @@ function parseNumber(value: string | undefined, fallback: number): number {
     if (!value) return fallback;
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function getLogDir(): string {
+    const raw = process.env.LOG_DIR?.trim();
+    return raw && raw.length > 0 ? raw : 'logs';
+}
+
+function getLogLevel(): LogLevel {
+    const raw = process.env.LOG_LEVEL?.trim().toLowerCase();
+    if (raw === 'debug' || raw === 'info' || raw === 'warn' || raw === 'error') return raw;
+    return 'info';
+}
+
+function getLogRotateMaxBytes(): number {
+    return Math.max(0, Math.floor(parseNumber(process.env.LOG_ROTATE_MAX_BYTES, 10_485_760)));
+}
+
+function getLogRotateMaxFiles(): number {
+    return Math.max(0, Math.floor(parseNumber(process.env.LOG_ROTATE_MAX_FILES, 5)));
+}
+
+function getHealthSnapshotIntervalMs(): number {
+    return parseIntervalMs(process.env.HEALTH_SNAPSHOT_INTERVAL_MS, 5_000);
+}
+
+function buildDataQualityStalenessPolicy(): StalenessPolicyRule[] {
+    const rules = DEFAULT_STALENESS_POLICY_RULES.map((rule) => ({ ...rule }));
+
+    const oiRule = rules.find((rule) => rule.topic === 'market:oi_agg');
+    if (oiRule) {
+        oiRule.expectedIntervalMs = parseIntervalMs(process.env.BOT_DQ_OI_AGG_EXPECTED_INTERVAL_MS, oiRule.expectedIntervalMs);
+        oiRule.staleThresholdMs = parseIntervalMs(process.env.BOT_DQ_OI_AGG_STALE_THRESHOLD_MS, oiRule.staleThresholdMs);
+        oiRule.staleThresholdMs = Math.max(oiRule.expectedIntervalMs, oiRule.staleThresholdMs);
+    }
+
+    const fundingRule = rules.find((rule) => rule.topic === 'market:funding_agg');
+    if (fundingRule) {
+        fundingRule.expectedIntervalMs = parseIntervalMs(
+            process.env.BOT_DQ_FUNDING_AGG_EXPECTED_INTERVAL_MS,
+            fundingRule.expectedIntervalMs
+        );
+        fundingRule.staleThresholdMs = parseIntervalMs(
+            process.env.BOT_DQ_FUNDING_AGG_STALE_THRESHOLD_MS,
+            fundingRule.staleThresholdMs
+        );
+        fundingRule.staleThresholdMs = Math.max(fundingRule.expectedIntervalMs, fundingRule.staleThresholdMs);
+    }
+
+    return rules;
+}
+
+function getConsoleMode(): 'ui' | 'verbose' {
+    const raw = process.env.CONSOLE_MODE?.trim().toLowerCase();
+    if (raw === 'verbose') return 'verbose';
+    return 'ui';
+}
+
+function getConsoleHeartbeatMs(): number {
+    return parseIntervalMs(process.env.CONSOLE_HEARTBEAT_MS, 30_000);
+}
+
+function getConsoleTransitionCooldownMs(): number {
+    return parseIntervalMs(process.env.CONSOLE_TRANSITION_COOLDOWN_MS, 10_000);
+}
+
+function getConsoleShowTicker(): boolean {
+    return readFlagFromEnv('CONSOLE_SHOW_TICKER', false);
 }
 
 function readFlagFromEnv(name: string, fallback = true): boolean {
@@ -278,6 +358,23 @@ function getLiquidityDepthLevels(): number {
     return Math.max(1, Math.floor(parseNumber(process.env.BOT_LIQUIDITY_DEPTH_LEVELS, 10)));
 }
 
+function createRunId(): string {
+    const d = new Date();
+    const pad = (v: number) => String(v).padStart(2, '0');
+    const ts = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(
+        d.getUTCHours()
+    )}-${pad(d.getUTCMinutes())}-${pad(d.getUTCSeconds())}Z`;
+    let suffix = '000000';
+    try {
+        suffix = randomBytes(3).toString('hex');
+    } catch {
+        suffix = Math.floor(Math.random() * 0xffffff)
+            .toString(16)
+            .padStart(6, '0');
+    }
+    return `${ts}_${suffix}`;
+}
+
 function getBuildInfo(): BuildInfo {
     return {
         appVersion: getAppVersion(),
@@ -287,12 +384,43 @@ function getBuildInfo(): BuildInfo {
     };
 }
 
+function setupFileLogging(runId: string): void {
+    const logDir = getLogDir();
+    const maxBytes = getLogRotateMaxBytes();
+    const maxFiles = getLogRotateMaxFiles();
+
+    const touch = (filePath: string) => {
+        try {
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            const fd = fs.openSync(filePath, 'a');
+            fs.closeSync(fd);
+        } catch {
+            // ignore
+        }
+    };
+
+    touch(path.join(logDir, 'app.log'));
+    touch(path.join(logDir, 'warnings.log'));
+    touch(path.join(logDir, 'errors.log'));
+    touch(path.join(logDir, 'health.jsonl'));
+
+    const appWriter = new RotatingFileWriter(path.join(logDir, 'app.log'), { maxBytes, maxFiles });
+    const warningsWriter = new RotatingFileWriter(path.join(logDir, 'warnings.log'), { maxBytes, maxFiles });
+    const errorsWriter = new RotatingFileWriter(path.join(logDir, 'errors.log'), { maxBytes, maxFiles });
+
+    logger.addSink(new FileSink(appWriter, { runId }));
+    // warnings.log: WARN + ERROR (documented choice)
+    logger.addSink(new FileSink(warningsWriter, { runId, levels: ['warn', 'error'] }));
+    logger.addSink(new FileSink(errorsWriter, { runId, levels: ['error'] }));
+}
+
 async function flushLogger(): Promise<void> {
     try {
         const anyLogger = logger as any;
         if (typeof anyLogger.flush === 'function') {
             await Promise.resolve(anyLogger.flush());
-        } else if (typeof anyLogger.close === 'function') {
+        }
+        if (typeof anyLogger.close === 'function') {
             await Promise.resolve(anyLogger.close());
         } else if (typeof anyLogger.end === 'function') {
             await Promise.resolve(anyLogger.end());
@@ -318,7 +446,7 @@ class LiveBotApp {
     private paused = false;
 
     private marketGateways: MarketGateway[] = [];
-    private healthInterval?: NodeJS.Timeout;
+    private uiHeartbeatInterval?: NodeJS.Timeout;
     private orchestrator?: Orchestrator;
     private journal?: EventJournal;
     private aggregatedJournal?: AggregatedEventJournal;
@@ -347,12 +475,37 @@ class LiveBotApp {
     private priceIndexAggregator?: PriceIndexAggregator;
     private canonicalPriceAggregator?: CanonicalPriceAggregator;
     private marketDataReadiness?: MarketDataReadiness;
+    private healthReporter?: HealthReporter;
+
+    private readonly consoleHeartbeatMs = getConsoleHeartbeatMs();
+    private readonly consoleTransitionCooldownMs = getConsoleTransitionCooldownMs();
+    private readonly consoleShowTicker = getConsoleShowTicker();
+    private readonly dataQualityConsoleGate = new DebouncedConsoleTransitions({
+        debounceMs: this.consoleTransitionCooldownMs,
+        holdDownMs: this.consoleTransitionCooldownMs,
+    });
+    private readonly dataQualityKeysBySourceId = new Map<string, string[]>();
+
+    private lastMarketUiSignature?: string;
+    private lastMarketUiTs?: number;
+    private riskRejectCounts: Record<string, number> = {};
+    private riskRejectTimer?: NodeJS.Timeout;
+    private lastTapCounters?: EventTapCounters;
+
+    private connectedCount = 0;
+    private totalConnections = 0;
 
     private readonly enableCli = process.env.BOT_CLI !== '0';
 
     // handlers, чтобы на shutdown корректно отписаться
     private onTickerHandler?: (t: TickerEvent) => void;
     private onControlStateHandler?: (state: ControlState) => void;
+    private onMarketStatusHandler?: (payload: MarketDataStatusPayload) => void;
+    private onMarketConnectedHandler?: (evt: MarketConnected) => void;
+    private onMarketDisconnectedHandler?: (evt: MarketDisconnected) => void;
+    private onRiskRejectedHandler?: (evt: RiskRejectedIntentEvent) => void;
+    private onDataSourceDegradedHandler?: (evt: DataSourceDegraded) => void;
+    private onDataSourceRecoveredHandler?: (evt: DataSourceRecovered) => void;
 
     private controlState?: ControlState;
     private stopRequested = false;
@@ -361,12 +514,18 @@ class LiveBotApp {
     private stopTimeout?: NodeJS.Timeout;
 
     public async start(): Promise<void> {
-        logger.info(m('lifecycle', `${APP_TAG} Запущен торговый бот (live mode)...`));
+        logger.infoFile(m('lifecycle', `${APP_TAG} Запущен торговый бот (live mode)...`));
 
         const build = getBuildInfo();
-        logger.info(
+        logger.infoFile(
             m('ok', `${APP_TAG} Build info: appVersion=${build.appVersion} git=${build.gitVersion} node=${build.nodeVersion} pid=${build.pid}`)
         );
+
+        const runId = logger.getRunId() ?? 'unknown';
+        const logDir = getLogDir();
+        logger.ui(`${APP_TAG} Старт: режим=${this.mode} runId=${runId}`);
+        logger.ui(`${APP_TAG} Версия: app=${build.appVersion} git=${build.gitVersion} node=${build.nodeVersion}`);
+        logger.ui(`${APP_TAG} Логи: ${logDir}/app.log, ${logDir}/warnings.log, ${logDir}/errors.log, ${logDir}/health.jsonl`);
 
         // 1) Поднимаем Market Data Plane (multi-exchange WS + REST)
         const globalWeights = parseWeights(process.env.BOT_GLOBAL_WEIGHTS);
@@ -558,6 +717,9 @@ class LiveBotApp {
             }
         }
 
+        this.totalConnections = this.marketGateways.length;
+        logger.ui(`${APP_TAG} Подключения WS: ${this.connectedCount}/${this.totalConnections}`);
+
         // 1.5) Поднимаем Control Plane (Orchestrator), регистрируем cleanup
         this.orchestrator = new Orchestrator();
         this.orchestrator.registerCleanup(async () => {
@@ -622,8 +784,6 @@ class LiveBotApp {
         this.canonicalPriceAggregator.start();
         this.globalDataQuality = new GlobalDataQualityMonitor(eventBus, {
             expectedIntervalMs: {
-                'market:oi_agg': 60_000,
-                'market:funding_agg': 60_000,
                 'market:cvd_spot_agg': getCvdBucketMs(),
                 'market:cvd_futures_agg': getCvdBucketMs(),
                 'market:liquidations_agg': getLiqBucketMs(),
@@ -631,6 +791,7 @@ class LiveBotApp {
                 'market:price_index': 60_000,
                 'market:price_canonical': 60_000,
             },
+            stalenessPolicy: buildDataQualityStalenessPolicy(),
             mismatchWindowMs: 120_000,
         });
         this.globalDataQuality.start();
@@ -720,6 +881,23 @@ class LiveBotApp {
         this.eventTap.start();
         this.orchestrator.registerCleanup(() => this.eventTap?.stop());
 
+        this.healthReporter = new HealthReporter({
+            runId: logger.getRunId() ?? 'unknown',
+            logDir: getLogDir(),
+            intervalMs: getHealthSnapshotIntervalMs(),
+            maxBytes: getLogRotateMaxBytes(),
+            maxFiles: getLogRotateMaxFiles(),
+            buildInfo: { appVersion: build.appVersion, gitVersion: build.gitVersion },
+            eventTap: this.eventTap,
+            marketDataReadiness: this.marketDataReadiness,
+            globalDataQuality: this.globalDataQuality,
+            getLifecycle: () => this.controlState?.lifecycle ?? 'STARTING',
+            getMode: () => this.mode,
+            getPaused: () => this.paused,
+        });
+        this.healthReporter.start();
+        this.orchestrator.registerCleanup(() => this.healthReporter?.stop({ finalSnapshot: true }));
+
         this.orchestrator.start();
 
         // 2) Подписки на EventBus (пока временно: логирование и управление режимом)
@@ -730,16 +908,21 @@ class LiveBotApp {
 
         // 3) Подключение и подписка теперь делаются через orchestrator->market events (см. orchestrator.start())
 
-        // 5) Health-пульс. Позже это станет частью Control Plane: health/status.
-        this.healthInterval = setInterval(() => {
-            if (this.stopRequested) return;
-            logger.info(m('lifecycle', `${APP_TAG} Status: mode=${this.mode} paused=${this.paused} lifecycle=${this.controlState?.lifecycle ?? 'n/a'} (bot alive)`));
-            // TODO(ControlPlane): publish control:state from Orchestrator
-        }, 30_000);
+        // 5) Console heartbeat (UI mode).
+        if (this.consoleHeartbeatMs > 0) {
+            this.uiHeartbeatInterval = setInterval(() => {
+                if (this.stopRequested) return;
+                const lifecycle = this.controlState?.lifecycle ?? 'n/a';
+                const market = this.formatMarketUi();
+                const flow = this.formatFlowUi();
+                logger.ui(`${APP_TAG} Пульс: режим=${this.mode} пауза=${this.paused ? 'ДА' : 'НЕТ'} состояние=${lifecycle} ${market} ${flow}`);
+            }, this.consoleHeartbeatMs);
+            this.uiHeartbeatInterval.unref?.();
+        }
 
         // 6) Консольное управление (CLI): команды идут в EventBus как control:command
         if (this.enableCli) {
-            startCli();
+            startCli({ logDir: getLogDir(), getStatusLines: () => this.buildStatusLines() });
         } else {
             logger.info(`${APP_TAG} CLI disabled (BOT_CLI=0)`);
         }
@@ -751,8 +934,12 @@ class LiveBotApp {
             const symbol = t?.symbol ?? 'n/a';
             const lastPrice = t?.lastPrice ?? 'n/a';
             const p24h = t?.price24hPcnt ?? 'n/a';
-
-            logger.infoThrottled(`ticker:${symbol}`, `${APP_TAG} Ticker: ${symbol} last=${lastPrice} 24h=${p24h}`, 3000);
+            const line = `${APP_TAG} Ticker: ${symbol} last=${lastPrice} 24h=${p24h}`;
+            if (this.consoleShowTicker && logger.getConsoleMode() === 'verbose') {
+                logger.infoThrottled(`ticker:${symbol}`, line, 3000);
+            } else {
+                logger.infoFile(line);
+            }
         };
         eventBus.subscribe('market:ticker', this.onTickerHandler);
 
@@ -770,12 +957,197 @@ class LiveBotApp {
             this.mode = state.mode;
             this.paused = state.paused;
 
+            if (state.lifecycle === 'STOPPING') {
+                this.healthReporter?.snapshot();
+            }
+
             if (state.lifecycle === 'STOPPED') {
                 logger.info(m('shutdown', `${APP_TAG} STOPPED получено от Orchestrator — завершаем процесс`));
                 void this.completeStop();
             }
         };
         eventBus.subscribe('control:state', this.onControlStateHandler);
+
+        this.onMarketStatusHandler = (payload: MarketDataStatusPayload) => {
+            this.handleMarketStatus(payload);
+        };
+        eventBus.subscribe('system:market_data_status', this.onMarketStatusHandler);
+
+        this.onMarketConnectedHandler = (evt: MarketConnected) => {
+            this.connectedCount = Math.min(this.totalConnections, this.connectedCount + 1);
+            const url = evt.url ? ` url=${evt.url}` : '';
+            logger.ui(`${APP_TAG} Подключение: +1 (${this.connectedCount}/${this.totalConnections})${url}`);
+        };
+        eventBus.subscribe('market:connected', this.onMarketConnectedHandler);
+
+        this.onMarketDisconnectedHandler = (evt: MarketDisconnected) => {
+            this.connectedCount = Math.max(0, this.connectedCount - 1);
+            const reason = evt.reason ? ` причина=${evt.reason}` : '';
+            logger.ui(`${APP_TAG} Подключение: -1 (${this.connectedCount}/${this.totalConnections})${reason}`);
+        };
+        eventBus.subscribe('market:disconnected', this.onMarketDisconnectedHandler);
+
+        this.onRiskRejectedHandler = (evt: RiskRejectedIntentEvent) => {
+            this.recordRiskReject(evt);
+        };
+        eventBus.subscribe('risk:rejected_intent', this.onRiskRejectedHandler);
+
+        this.onDataSourceDegradedHandler = (evt: DataSourceDegraded) => {
+            this.handleDataSourceDegraded(evt);
+        };
+        eventBus.subscribe('data:sourceDegraded', this.onDataSourceDegradedHandler);
+
+        this.onDataSourceRecoveredHandler = (evt: DataSourceRecovered) => {
+            this.handleDataSourceRecovered(evt);
+        };
+        eventBus.subscribe('data:sourceRecovered', this.onDataSourceRecoveredHandler);
+    }
+
+    private handleMarketStatus(payload: MarketDataStatusPayload): void {
+        const status = payload.warmingUp ? 'WARMING' : payload.degraded ? 'DEGRADED' : 'READY';
+        const reasons = payload.degradedReasons?.join('|') ?? '';
+        const warnings = payload.warnings?.join('|') ?? '';
+        const signature = `${status}|${reasons}|${warnings}`;
+        const nowTs = Date.now();
+        if (this.lastMarketUiSignature === signature) return;
+        const lastTs = this.lastMarketUiTs ?? 0;
+        if (nowTs - lastTs < this.consoleTransitionCooldownMs) return;
+        this.lastMarketUiSignature = signature;
+        this.lastMarketUiTs = nowTs;
+
+        const statusRu = status === 'READY' ? 'ГОТОВ' : status === 'WARMING' ? 'ПРОГРЕВ' : 'ДЕГРАД';
+        const conf = payload.overallConfidence.toFixed(2);
+        const reasonPart = reasons ? ` причины=${reasons}` : '';
+        const warnPart = warnings ? ` предупреждения=${warnings}` : '';
+        logger.ui(`${APP_TAG} MarketData: ${statusRu} conf=${conf}${reasonPart}${warnPart}`);
+    }
+
+    private handleDataSourceDegraded(evt: DataSourceDegraded): void {
+        const keys = this.resolveDataQualityKeys(evt.sourceId);
+        const keysPart = keys.length ? ` keys=${keys.join(',')}` : '';
+        logger.infoFile(
+            m(
+                'warn',
+                `${APP_TAG} DataQuality: деградация sourceId=${evt.sourceId} reason=${evt.reason}${keysPart} lastSuccessTs=${evt.lastSuccessTs ?? 'n/a'}`
+            )
+        );
+
+        if (!this.dataQualityConsoleGate.shouldEmitDegraded(evt.sourceId)) return;
+        logger.uiConsole(
+            formatDataSourceDegradedUiLine({
+                appTag: APP_TAG,
+                keys,
+                sourceId: evt.sourceId,
+                reason: evt.reason,
+            })
+        );
+    }
+
+    private handleDataSourceRecovered(evt: DataSourceRecovered): void {
+        const keys = this.resolveDataQualityKeys(evt.sourceId);
+        const keysPart = keys.length ? ` keys=${keys.join(',')}` : '';
+        logger.infoFile(
+            m(
+                'ok',
+                `${APP_TAG} DataQuality: восстановление sourceId=${evt.sourceId}${keysPart} recoveredTs=${evt.recoveredTs} lastErrorTs=${evt.lastErrorTs ?? 'n/a'}`
+            )
+        );
+
+        if (!this.dataQualityConsoleGate.shouldEmitRecovered(evt.sourceId)) return;
+        logger.uiConsole(
+            formatDataSourceRecoveredUiLine({
+                appTag: APP_TAG,
+                keys,
+                sourceId: evt.sourceId,
+            })
+        );
+    }
+
+    private resolveDataQualityKeys(sourceId: string, maxKeys = 3): string[] {
+        const snapshot = this.globalDataQuality?.snapshot(50);
+        const keys =
+            snapshot?.degraded
+                ?.filter((entry) => entry.sourceId === sourceId)
+                .map((entry) => entry.key)
+                .filter(Boolean) ?? [];
+
+        if (keys.length) {
+            this.dataQualityKeysBySourceId.set(sourceId, keys);
+            return keys.slice(0, maxKeys);
+        }
+
+        const cached = this.dataQualityKeysBySourceId.get(sourceId);
+        return cached ? cached.slice(0, maxKeys) : [];
+    }
+
+    private recordRiskReject(evt: RiskRejectedIntentEvent): void {
+        const code = evt.reasonCode ?? 'UNKNOWN';
+        this.riskRejectCounts[code] = (this.riskRejectCounts[code] ?? 0) + 1;
+        if (!this.riskRejectTimer) {
+            this.riskRejectTimer = setInterval(() => {
+                this.flushRiskRejectSummary();
+            }, 60_000);
+            this.riskRejectTimer.unref?.();
+        }
+    }
+
+    private flushRiskRejectSummary(force = false): void {
+        const entries = Object.entries(this.riskRejectCounts).filter(([, count]) => count > 0);
+        if (!entries.length && !force) return;
+        if (entries.length) {
+            const parts = entries.map(([code, count]) => `${code}=${count}`);
+            logger.ui(`${APP_TAG} Отклонено сигналов: ${parts.join(', ')}`);
+        }
+        this.riskRejectCounts = {};
+    }
+
+    private formatMarketUi(): string {
+        const snapshot = this.marketDataReadiness?.getHealthSnapshot();
+        if (!snapshot) return 'рынок=н/д';
+        const status = snapshot.status === 'READY' ? 'ГОТОВ' : snapshot.status === 'WARMING' ? 'ПРОГРЕВ' : 'ДЕГРАД';
+        return `рынок=${status}`;
+    }
+
+    private formatFlowUi(): string {
+        const counters = this.eventTap?.getCounters();
+        if (!counters) return 'поток=н/д';
+        const sum =
+            counters.ticksSeen +
+            counters.klinesSeen +
+            counters.tradesSeen +
+            counters.orderbookSnapshotsSeen +
+            counters.orderbookDeltasSeen;
+        const last = this.lastTapCounters;
+        const lastSum = last
+            ? last.ticksSeen +
+              last.klinesSeen +
+              last.tradesSeen +
+              last.orderbookSnapshotsSeen +
+              last.orderbookDeltasSeen
+            : 0;
+        this.lastTapCounters = counters;
+        const status = sum > lastSum ? 'OK' : 'ПАУЗА';
+        return `поток=${status}`;
+    }
+
+    private buildStatusLines(): string[] {
+        const lines: string[] = [];
+        const lifecycle = this.controlState?.lifecycle ?? 'n/a';
+        const startedAt = this.controlState?.startedAt;
+        const uptimeSec = startedAt ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000)) : 0;
+        lines.push(`${APP_TAG} Статус: режим=${this.mode} пауза=${this.paused ? 'ДА' : 'НЕТ'} состояние=${lifecycle} аптайм=${uptimeSec}s`);
+
+        const market = this.marketDataReadiness?.getHealthSnapshot();
+        if (market) {
+            const status = market.status === 'READY' ? 'ГОТОВ' : market.status === 'WARMING' ? 'ПРОГРЕВ' : 'ДЕГРАД';
+            lines.push(`${APP_TAG} MarketData: ${market.marketType} ${status} conf=${market.conf.toFixed(2)}`);
+        } else {
+            lines.push(`${APP_TAG} MarketData: н/д`);
+        }
+
+        lines.push(`${APP_TAG} Подключения: ${this.connectedCount}/${this.totalConnections}`);
+        lines.push(`${APP_TAG} Логи: ${getLogDir()}`);
+        return lines;
     }
 
     public requestShutdown(reason: string, exitCode = 0): void {
@@ -799,10 +1171,17 @@ class LiveBotApp {
         this.stopped = true;
 
         try {
-            if (this.healthInterval) {
-                clearInterval(this.healthInterval);
-                this.healthInterval = undefined;
+            if (this.uiHeartbeatInterval) {
+                clearInterval(this.uiHeartbeatInterval);
+                this.uiHeartbeatInterval = undefined;
             }
+        } catch {
+            // ignore
+        }
+
+        try {
+            this.healthReporter?.stop({ finalSnapshot: true });
+            this.healthReporter = undefined;
         } catch {
             // ignore
         }
@@ -815,6 +1194,30 @@ class LiveBotApp {
             if (this.onControlStateHandler) {
                 eventBus.unsubscribe('control:state', this.onControlStateHandler);
                 this.onControlStateHandler = undefined;
+            }
+            if (this.onMarketStatusHandler) {
+                eventBus.unsubscribe('system:market_data_status', this.onMarketStatusHandler);
+                this.onMarketStatusHandler = undefined;
+            }
+            if (this.onMarketConnectedHandler) {
+                eventBus.unsubscribe('market:connected', this.onMarketConnectedHandler);
+                this.onMarketConnectedHandler = undefined;
+            }
+            if (this.onMarketDisconnectedHandler) {
+                eventBus.unsubscribe('market:disconnected', this.onMarketDisconnectedHandler);
+                this.onMarketDisconnectedHandler = undefined;
+            }
+            if (this.onRiskRejectedHandler) {
+                eventBus.unsubscribe('risk:rejected_intent', this.onRiskRejectedHandler);
+                this.onRiskRejectedHandler = undefined;
+            }
+            if (this.onDataSourceDegradedHandler) {
+                eventBus.unsubscribe('data:sourceDegraded', this.onDataSourceDegradedHandler);
+                this.onDataSourceDegradedHandler = undefined;
+            }
+            if (this.onDataSourceRecoveredHandler) {
+                eventBus.unsubscribe('data:sourceRecovered', this.onDataSourceRecoveredHandler);
+                this.onDataSourceRecoveredHandler = undefined;
             }
         } catch {
             // ignore
@@ -847,6 +1250,16 @@ class LiveBotApp {
             // ignore
         }
 
+        try {
+            this.flushRiskRejectSummary(true);
+            if (this.riskRejectTimer) {
+                clearInterval(this.riskRejectTimer);
+                this.riskRejectTimer = undefined;
+            }
+        } catch {
+            // ignore
+        }
+
         if (force && this.marketGateways.length) {
             await Promise.all(
                 this.marketGateways.map(async (gateway) => {
@@ -873,9 +1286,16 @@ class LiveBotApp {
 }
 
 async function main(): Promise<void> {
+    const runId = createRunId();
+    logger.setRunId(runId);
+    logger.setLevel(getLogLevel());
+    logger.setConsoleMode(getConsoleMode());
+    setupFileLogging(runId);
+
     const app = new LiveBotApp();
 
     const onFatal = async (label: string, err: unknown) => {
+        logger.ui(`${APP_TAG} Ошибка: ${label}. Подробности в logs/errors.log`);
         logger.error(`${APP_TAG} ${label}:`, err);
         app.requestShutdown(label, 1);
     };
@@ -902,6 +1322,7 @@ main().catch(async (error) => {
     } catch {
         // ignore
     }
+    logger.ui(`${APP_TAG} Ошибка: fatal. Подробности в logs/errors.log`);
     logger.error(`${APP_TAG} Fatal error in trading bot:`, error);
 
     await flushLogger();
