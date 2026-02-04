@@ -11,6 +11,7 @@ import { MarketDataReadiness } from '../../src/observability/MarketDataReadiness
 const makePrice = (ts: number): MarketPriceCanonicalEvent => ({
   symbol: 'BTCUSDT',
   ts,
+  marketType: 'futures',
   indexPrice: 100,
   sourcesUsed: ['s1'],
   freshSourcesCount: 1,
@@ -22,6 +23,7 @@ const makeFunding = (ts: number): MarketFundingAggEvent => ({
   symbol: 'BTCUSDT',
   ts,
   fundingRate: 0.0001,
+  marketType: 'futures',
   sourcesUsed: ['s1'],
   confidenceScore: 0.9,
   meta: createMeta('global_data', { ts }),

@@ -11,6 +11,7 @@ import { MarketDataReadiness } from '../../src/observability/MarketDataReadiness
 const makePrice = (ts: number): MarketPriceCanonicalEvent => ({
   symbol: 'BTCUSDT',
   ts,
+  marketType: 'spot',
   indexPrice: 100,
   sourcesUsed: ['s1'],
   freshSourcesCount: 1,

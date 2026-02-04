@@ -90,6 +90,8 @@ describe('MarketGateway kline bootstrap', () => {
     const klines: Kline[] = [
       {
         symbol: 'BTCUSDT',
+        streamId: 'test.stream',
+        marketType: 'futures',
         interval: '5',
         tf: '5m',
         startTs: 1_700_000_300_000,
@@ -102,6 +104,8 @@ describe('MarketGateway kline bootstrap', () => {
       },
       {
         symbol: 'BTCUSDT',
+        streamId: 'test.stream',
+        marketType: 'futures',
         interval: '5',
         tf: '5m',
         startTs: 1_700_000_000_000,
@@ -186,6 +190,8 @@ describe('MarketGateway kline bootstrap', () => {
       '60': [
         {
           symbol: 'BTCUSDT',
+          streamId: 'test.stream',
+          marketType: 'futures',
           interval: '60',
           tf: '1h',
           startTs: 0,
@@ -200,6 +206,8 @@ describe('MarketGateway kline bootstrap', () => {
       '240': [
         {
           symbol: 'BTCUSDT',
+          streamId: 'test.stream',
+          marketType: 'futures',
           interval: '240',
           tf: '4h',
           startTs: 0,
@@ -256,6 +264,8 @@ describe('MarketGateway kline bootstrap', () => {
       const startTs = idx * dayMs;
       return {
         symbol: 'BTCUSDT',
+        streamId: 'test.stream',
+        marketType: 'futures',
         interval: '1440',
         tf: '1d',
         startTs,

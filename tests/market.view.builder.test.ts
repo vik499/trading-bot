@@ -17,6 +17,7 @@ describe('MarketViewBuilder', () => {
       ts: 1000,
       openInterest: 1200,
       openInterestUnit: 'base',
+      marketType: 'futures',
       meta: createMeta('global_data', { ts: 1000 }),
     };
     bus.publish('market:oi_agg', oiAgg);

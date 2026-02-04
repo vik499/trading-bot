@@ -79,6 +79,7 @@ describe('AggregatedEventJournal', () => {
       ts: meta.ts,
       openInterest: 100,
       openInterestUnit: 'base',
+      marketType: 'futures',
       sourcesUsed: ['s1'],
       freshSourcesCount: 1,
       confidenceScore: 0.9,
