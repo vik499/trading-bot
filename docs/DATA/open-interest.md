@@ -5,6 +5,43 @@
 - OI is ingested as `market:oi` and aggregated to `market:oi_agg`.
 - Aggregation is multi-source (Bybit + Binance + OKX) with per-source weights and TTL filtering.
 
+## OI comparability audit (units + instrument identity)
+
+Open interest is venue-specific, and API payloads use different units. To keep comparisons correct and explainable, the system records the following (per venue / marketType):
+
+### MarketType = futures
+
+| Venue | Instrument identity | Unit (raw) | Notes |
+|---|---|---|---|
+| Bybit | `BTCUSDT` (linear derivatives symbol) | `contracts` | No USD notional conversion without explicit contract size |
+| Binance | `BTCUSDT` (USDT‑M futures symbol) | `contracts` | No USD notional conversion without explicit contract size |
+| OKX | `BTC-USDT-SWAP` (instId) | `base` (from `oiCcy`) + optional USD notional (from `oiUsd`) | `openInterestValueUsd` is populated from `oiUsd` when present |
+
+### MarketType = spot
+
+Spot has no open interest concept. There is no `market:oi` spot ingestion at this phase.
+
+### Comparability rules (data quality)
+
+Data-quality mismatch comparison for `market:oi_agg` only compares values when they are explicitly comparable:
+
+- **Comparable (preferred)**: `usd` (USD notional) when at least 2 venues have a USD value:
+  - from `openInterestUnit=usd`, or
+  - from `openInterestValueUsd`, or
+  - derived via **canonical price**: `base → usd` using `market:price_canonical` (must be fresh).
+- **Non-comparable**: `contracts` (contract counts) cannot be converted without contract-size metadata.
+  - Such sources are excluded from the baseline comparison and surfaced as non-comparable in `health.jsonl` / warnings.
+
+## OI baseline strategy (deterministic)
+
+`GlobalDataQualityMonitor` uses a deterministic baseline strategy for OI mismatch checks:
+
+- **Env**: `BOT_DQ_OI_BASELINE_STRATEGY=bybit|median`
+- **Default**: `bybit`
+
+`bybit`: baseline is the Bybit stream when comparable; otherwise the comparison is suppressed with context.  
+`median`: baseline is the median across comparable venues (deterministic tie-breaking).
+
 ## Binance USDT-M source notes
 - Open interest endpoint: `GET /fapi/v1/openInterest` (request weight 1). Response fields include `openInterest`, `symbol`, and `time`. Source: https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Open-Interest
 - Funding/mark price endpoint: `GET /fapi/v1/premiumIndex` (request weight 1 with `symbol`). Response fields include `lastFundingRate`, `nextFundingTime`, `time`, and `markPrice`. Source: https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Mark-Price
@@ -61,4 +98,5 @@ This table is intentionally conservative and must be verified with official docu
 ## Limitations
 - `market:oi_agg` does not blend incompatible units; a single unit is chosen based on available sources.
 - `openInterestValueUsd` is only populated when all contributing sources supply notional values.
+- OI mismatch comparisons are suppressed when no comparable unit set exists (to avoid false `diffPct` from mixing units or unknown contract sizes).
 - The decision matrix above is a placeholder and must be validated against official documentation.

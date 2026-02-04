@@ -179,6 +179,12 @@ function buildDataQualityStalenessPolicy(): StalenessPolicyRule[] {
     return rules;
 }
 
+function getOiBaselineStrategy(): 'bybit' | 'median' {
+    const raw = process.env.BOT_DQ_OI_BASELINE_STRATEGY?.trim().toLowerCase();
+    if (raw === 'median') return 'median';
+    return 'bybit';
+}
+
 function getConsoleMode(): 'ui' | 'verbose' {
     const raw = process.env.CONSOLE_MODE?.trim().toLowerCase();
     if (raw === 'verbose') return 'verbose';
@@ -793,6 +799,7 @@ class LiveBotApp {
             },
             stalenessPolicy: buildDataQualityStalenessPolicy(),
             mismatchWindowMs: 120_000,
+            oiBaselineStrategy: getOiBaselineStrategy(),
         });
         this.globalDataQuality.start();
         this.marketDataReadiness = new MarketDataReadiness(eventBus, {

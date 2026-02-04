@@ -16,11 +16,14 @@ import {
     type MarketPriceCanonicalEvent,
     type MarketPriceIndexEvent,
     type MarketVolumeAggEvent,
+    type OpenInterestEvent,
+    type OpenInterestUnit,
 } from '../core/events/EventBus';
 import { computeConfidenceScore } from '../core/confidence';
 import { stableRecordFromEntries, stableSortStrings } from '../core/determinism';
 import { makeDataQualityKey, makeDataQualitySourceId } from '../core/observability/dataQualityKeys';
 import { resolveStalenessPolicy, type StalenessPolicyRule } from '../core/observability/stalenessPolicy';
+import { normalizeMarketType, normalizeSymbol } from '../core/market/symbols';
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
 
@@ -46,6 +49,7 @@ export interface GlobalDataQualityConfig {
     mismatchWindowMs?: number;
     logThrottleMs?: number;
     mismatchBaselineEpsilon?: number;
+    oiBaselineStrategy?: 'bybit' | 'median';
 }
 
 export interface GlobalDataQualitySnapshot {
@@ -64,6 +68,14 @@ export interface GlobalDataQualitySnapshot {
     mismatch?: Array<{
         key: string;
         active: boolean;
+        suppressed?: boolean;
+        suppressionReason?: string;
+        baselineStrategy?: string;
+        comparableVenues?: string[];
+        excludedVenues?: string[];
+        excludedReasons?: Record<string, string>;
+        unitByVenue?: Record<string, string>;
+        instrumentByVenue?: Record<string, string>;
         diffPct?: number;
         diffAbs?: number;
         baseline?: number;
@@ -97,6 +109,14 @@ interface MismatchInfo {
     observed: number;
     baselineEpsilon: number;
     insufficientBaseline: boolean;
+    suppressed?: boolean;
+    suppressionReason?: string;
+    baselineStrategy?: string;
+    comparableVenues?: string[];
+    excludedVenues?: string[];
+    excludedReasons?: Record<string, string>;
+    unitByVenue?: Record<string, string>;
+    instrumentByVenue?: Record<string, string>;
     venueBreakdown?: Record<string, number>;
     baselineVenue?: string;
     observedVenue?: string;
@@ -135,6 +155,10 @@ export class GlobalDataQualityMonitor {
             lastInfo?: MismatchInfo;
         }
     >();
+    private readonly oiRawByKey = new Map<
+        string,
+        Map<string, { ts: number; unit: OpenInterestUnit; value: number; valueUsd?: number }>
+    >();
     private readonly referencePriceBySymbol = new Map<string, { price: number; ts: number }>();
     private lastMetaTs?: number;
 
@@ -148,6 +172,7 @@ export class GlobalDataQualityMonitor {
             mismatchWindowMs: Math.max(0, config.mismatchWindowMs ?? 60_000),
             logThrottleMs: Math.max(0, config.logThrottleMs ?? 30_000),
             mismatchBaselineEpsilon: Math.max(0, config.mismatchBaselineEpsilon ?? 1e-6),
+            oiBaselineStrategy: config.oiBaselineStrategy === 'median' ? 'median' : 'bybit',
         };
     }
 
@@ -162,6 +187,7 @@ export class GlobalDataQualityMonitor {
         const onCvdFutures = (evt: MarketCvdAggEvent) => this.onAggEvent('market:cvd_futures_agg', evt);
         const onIndex = (evt: MarketPriceIndexEvent) => this.onAggEvent('market:price_index', evt);
         const onCanonical = (evt: MarketPriceCanonicalEvent) => this.onPriceCanonical(evt);
+        const onOiRaw = (evt: OpenInterestEvent) => this.onOiRaw(evt);
 
         this.bus.subscribe('market:oi_agg', onOi);
         this.bus.subscribe('market:funding_agg', onFunding);
@@ -172,6 +198,7 @@ export class GlobalDataQualityMonitor {
         this.bus.subscribe('market:cvd_futures_agg', onCvdFutures);
         this.bus.subscribe('market:price_index', onIndex);
         this.bus.subscribe('market:price_canonical', onCanonical);
+        this.bus.subscribe('market:oi', onOiRaw);
 
         this.unsubscribers.push(
             () => this.bus.unsubscribe('market:oi_agg', onOi),
@@ -182,7 +209,8 @@ export class GlobalDataQualityMonitor {
             () => this.bus.unsubscribe('market:cvd_spot_agg', onCvdSpot),
             () => this.bus.unsubscribe('market:cvd_futures_agg', onCvdFutures),
             () => this.bus.unsubscribe('market:price_index', onIndex),
-            () => this.bus.unsubscribe('market:price_canonical', onCanonical)
+            () => this.bus.unsubscribe('market:price_canonical', onCanonical),
+            () => this.bus.unsubscribe('market:oi', onOiRaw)
         );
 
         this.started = true;
@@ -208,10 +236,20 @@ export class GlobalDataQualityMonitor {
             lastSuccessTs: value.lastSuccessTs,
         }));
         const mismatchEntries = Array.from(this.mismatchByKey.entries())
-            .filter(([, value]) => value.active)
+            .filter(([, value]) => value.active || Boolean(value.lastInfo?.suppressed))
             .map(([key, value]) => ({
                 key,
                 active: value.active,
+                suppressed: value.lastInfo?.suppressed,
+                suppressionReason: value.lastInfo?.suppressionReason,
+                baselineStrategy: value.lastInfo?.baselineStrategy,
+                comparableVenues: value.lastInfo?.comparableVenues?.slice(0, 10),
+                excludedVenues: value.lastInfo?.excludedVenues?.slice(0, 10),
+                excludedReasons: value.lastInfo?.excludedReasons ? this.capRecord(value.lastInfo.excludedReasons, 10) : undefined,
+                unitByVenue: value.lastInfo?.unitByVenue ? this.capRecord(value.lastInfo.unitByVenue, 10) : undefined,
+                instrumentByVenue: value.lastInfo?.instrumentByVenue
+                    ? this.capRecord(value.lastInfo.instrumentByVenue, 10)
+                    : undefined,
                 diffPct: value.lastInfo?.diffPct,
                 diffAbs: value.lastInfo?.diffAbs,
                 baseline: value.lastInfo?.baseline,
@@ -230,7 +268,7 @@ export class GlobalDataQualityMonitor {
         return {
             ts,
             degradedCount: degradedEntries.length,
-            mismatchCount: mismatchEntries.length,
+            mismatchCount: mismatchEntries.filter((entry) => entry.active).length,
             degraded: degradedEntries.slice(0, maxItems),
             mismatch: mismatchEntries.slice(0, maxItems),
         };
@@ -250,6 +288,35 @@ export class GlobalDataQualityMonitor {
             this.referencePriceBySymbol.set(evt.symbol, { price: price as number, ts: evt.meta.ts });
         }
         this.onAggEvent('market:price_canonical', evt);
+    }
+
+    private onOiRaw(evt: OpenInterestEvent): void {
+        const symbol = normalizeSymbol(evt.symbol);
+        const marketType = normalizeMarketType(evt.marketType);
+        const key = `${symbol}:${marketType}`;
+        const streamId = evt.streamId;
+        const ts = evt.meta.tsEvent;
+
+        const byStream = this.oiRawByKey.get(key) ?? new Map<string, { ts: number; unit: OpenInterestUnit; value: number; valueUsd?: number }>();
+        const existing = byStream.get(streamId);
+        if (existing && ts < existing.ts) return;
+
+        const unit = evt.openInterestUnit ?? 'unknown';
+        let valueUsd: number | undefined;
+
+        if (typeof evt.openInterestValueUsd === 'number' && Number.isFinite(evt.openInterestValueUsd)) {
+            valueUsd = evt.openInterestValueUsd;
+        } else if (unit === 'usd') {
+            valueUsd = evt.openInterest;
+        } else if (unit === 'base' && this.hasReferencePrice(symbol, ts)) {
+            const ref = this.referencePriceBySymbol.get(symbol);
+            if (ref && Number.isFinite(ref.price)) {
+                valueUsd = evt.openInterest * ref.price;
+            }
+        }
+
+        byStream.set(streamId, { ts, unit, value: evt.openInterest, valueUsd });
+        this.oiRawByKey.set(key, byStream);
     }
 
     private detectStale(topic: string, evt: AggregatedEvent): void {
@@ -314,6 +381,10 @@ export class GlobalDataQualityMonitor {
     }
 
     private detectMismatch(topic: string, evt: AggregatedEvent): void {
+        if (topic === 'market:oi_agg') {
+            this.detectOiMismatch(evt as MarketOpenInterestAggEvent);
+            return;
+        }
         const breakdown = hasVenueBreakdown(evt) ? evt.venueBreakdown : undefined;
         if (!breakdown) return;
         const values = Object.entries(breakdown).filter(
@@ -402,6 +473,345 @@ export class GlobalDataQualityMonitor {
             this.mismatchByKey.set(key, next);
             this.markDegraded(key, sourceId, evt.ts, evt.meta.ts, 'mismatch');
         }
+    }
+
+    private detectOiMismatch(evt: MarketOpenInterestAggEvent): void {
+        const topic = 'market:oi_agg';
+        const key = makeDataQualityKey(topic, evt.symbol, evt.provider);
+
+        const symbol = normalizeSymbol(evt.symbol);
+        const marketType = normalizeMarketType(evt.marketType);
+        const rawKey = `${symbol}:${marketType}`;
+        const rawByStream = this.oiRawByKey.get(rawKey);
+        const breakdown = hasVenueBreakdown(evt) ? evt.venueBreakdown : undefined;
+
+        const candidateIds = new Set<string>();
+        if (breakdown) {
+            for (const streamId of Object.keys(breakdown)) candidateIds.add(streamId);
+        }
+        if (rawByStream) {
+            for (const streamId of rawByStream.keys()) candidateIds.add(streamId);
+        }
+        const orderedCandidates = stableSortStrings(Array.from(candidateIds));
+        if (orderedCandidates.length < 2) return;
+
+        const freshnessWindowMs = this.resolveFreshnessWindowMs(topic, evt);
+        const nowTs = evt.ts;
+        const baselineStrategy = this.config.oiBaselineStrategy;
+        const baselineEpsilon = this.config.mismatchBaselineEpsilon;
+
+        const unitByVenue: Record<string, string> = {};
+        const instrumentByVenue: Record<string, string> = {};
+        const excludedReasons: Record<string, string> = {};
+
+        const groupedByUnit = new Map<OpenInterestUnit, Array<[string, number]>>();
+        const usdCandidates: Array<[string, number]> = [];
+        const baseCandidates: Array<[string, number]> = [];
+
+        for (const streamId of orderedCandidates) {
+            const state = rawByStream?.get(streamId);
+            let unit: OpenInterestUnit = state?.unit ?? 'unknown';
+            // If we have no raw audit info for this stream, fall back to the aggregate unit.
+            // OpenInterestAggregator emits venueBreakdown only for the dominant unit group, so this is safe for breakdown-only ids.
+            if (unit === 'unknown' && evt.openInterestUnit) unit = evt.openInterestUnit;
+            unitByVenue[streamId] = unit;
+            instrumentByVenue[streamId] = this.describeOiInstrumentId(streamId, symbol);
+
+            if (state && freshnessWindowMs !== undefined && nowTs - state.ts > freshnessWindowMs) {
+                excludedReasons[streamId] = `STALE(>${freshnessWindowMs}ms)`;
+                continue;
+            }
+
+            const value = state?.value ?? (breakdown ? breakdown[streamId] : undefined);
+            if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+            const list = groupedByUnit.get(unit) ?? [];
+            list.push([streamId, value]);
+            groupedByUnit.set(unit, list);
+
+            if (unit === 'base') {
+                baseCandidates.push([streamId, value]);
+            }
+
+            let valueUsd = state?.valueUsd;
+            if (valueUsd === undefined) {
+                if (unit === 'usd') {
+                    valueUsd = value;
+                } else if (unit === 'base' && this.hasReferencePrice(symbol, evt.meta.tsEvent)) {
+                    const ref = this.referencePriceBySymbol.get(symbol);
+                    if (ref && Number.isFinite(ref.price)) {
+                        valueUsd = value * ref.price;
+                    }
+                }
+            }
+            if (typeof valueUsd === 'number' && Number.isFinite(valueUsd)) {
+                usdCandidates.push([streamId, valueUsd]);
+            }
+        }
+
+        const compareUnit = usdCandidates.length >= 2 ? 'usd' : baseCandidates.length >= 2 ? 'base' : undefined;
+        const comparable = compareUnit === 'usd' ? usdCandidates : compareUnit === 'base' ? baseCandidates : [];
+        const comparableIds = stableSortStrings(comparable.map(([id]) => id));
+        const excludedIds = stableSortStrings(orderedCandidates.filter((id) => !comparableIds.includes(id)));
+
+        for (const id of excludedIds) {
+            if (excludedReasons[id]) continue;
+            const unit = unitByVenue[id] ?? 'unknown';
+            if (unit === 'contracts') {
+                excludedReasons[id] = 'NON_COMPARABLE(contracts:no_contract_size)';
+                continue;
+            }
+            excludedReasons[id] = `NON_COMPARABLE(unit=${unit})`;
+        }
+
+        const suppressionReasons: string[] = [];
+        if (!compareUnit) suppressionReasons.push('NO_COMPARABLE_UNIT');
+        if (compareUnit && comparable.length < 2) suppressionReasons.push('INSUFFICIENT_COMPARABLE_SOURCES');
+
+        const baseline = compareUnit ? this.computeBaseline(comparable, baselineStrategy) : undefined;
+        if (baselineStrategy === 'bybit' && compareUnit && (!baseline || !this.isBybitStreamId(baseline.venue))) {
+            suppressionReasons.push('BASELINE_BYBIT_MISSING');
+        }
+
+        const mismatchKey = key;
+        const existing = this.mismatchByKey.get(mismatchKey);
+        if (existing?.active && suppressionReasons.length) {
+            this.clearDegradedFlag(mismatchKey, 'mismatch', evt.meta.ts);
+        }
+
+        if (suppressionReasons.length) {
+            const dominant = this.selectDominantUnitGroup(groupedByUnit);
+            const diagnosticValues = dominant?.values ?? [];
+            const diagnosticUnit = dominant?.unit;
+            const diagnosticBaseline = diagnosticValues.length ? this.computeBaseline(diagnosticValues, baselineStrategy) : undefined;
+            const diagnosticObserved =
+                diagnosticBaseline && diagnosticValues.length >= 2
+                    ? this.computeObserved(diagnosticValues, diagnosticBaseline.value, diagnosticBaseline.venue)
+                    : undefined;
+
+            const diffAbs =
+                diagnosticBaseline && diagnosticObserved
+                    ? Math.abs(diagnosticObserved.value - diagnosticBaseline.value)
+                    : 0;
+            const insufficientBaseline =
+                !diagnosticBaseline || Math.abs(diagnosticBaseline.value) < baselineEpsilon;
+            const diffPct = diagnosticBaseline
+                ? insufficientBaseline
+                    ? diffAbs / baselineEpsilon
+                    : diffAbs / Math.abs(diagnosticBaseline.value)
+                : 0;
+
+            const state = existing ?? { firstTs: evt.ts, lastTs: evt.ts, active: false };
+            state.lastTs = evt.ts;
+            state.active = false;
+            state.lastInfo = {
+                diffPct,
+                diffAbs,
+                baseline: diagnosticBaseline?.value ?? 0,
+                observed: diagnosticObserved?.value ?? 0,
+                baselineEpsilon,
+                insufficientBaseline,
+                suppressed: true,
+                suppressionReason: suppressionReasons.join(','),
+                baselineStrategy,
+                comparableVenues: comparableIds,
+                excludedVenues: excludedIds,
+                excludedReasons,
+                unitByVenue,
+                instrumentByVenue,
+                venueBreakdown: diagnosticValues.length ? stableRecordFromEntries(diagnosticValues) : undefined,
+                baselineVenue: diagnosticBaseline?.venue,
+                observedVenue: diagnosticObserved?.venue,
+                venues: orderedCandidates,
+                unit: diagnosticUnit ?? compareUnit ?? evt.openInterestUnit,
+            };
+            this.mismatchByKey.set(mismatchKey, state);
+            this.logThrottled(
+                `${mismatchKey}:mismatch:suppressed`,
+                evt.meta.ts,
+                `[GlobalData] oi comparability suppressed key=${mismatchKey} topic=${topic} symbol=${evt.symbol} ` +
+                    `unit=${state.lastInfo.unit ?? 'n/a'} baseline=${state.lastInfo.baseline.toFixed(8)} ` +
+                    `observed=${state.lastInfo.observed.toFixed(8)} diffPct=${state.lastInfo.diffPct.toFixed(4)} ` +
+                    `baselineStrategy=${baselineStrategy} reason=${suppressionReasons.join(',')} ` +
+                    `comparable=${comparableIds.join(',') || 'n/a'} excluded=${excludedIds.join(',') || 'n/a'}`
+            );
+            return;
+        }
+
+        if (!baseline) {
+            this.mismatchByKey.delete(mismatchKey);
+            return;
+        }
+
+        const observed = this.computeObserved(comparable, baseline.value, baseline.venue);
+        if (!observed) {
+            this.mismatchByKey.delete(mismatchKey);
+            return;
+        }
+
+        const diffAbs = Math.abs(observed.value - baseline.value);
+        const insufficientBaseline = Math.abs(baseline.value) < baselineEpsilon;
+        const diffPct = insufficientBaseline ? diffAbs / baselineEpsilon : diffAbs / Math.abs(baseline.value);
+        const mismatchDetected = insufficientBaseline
+            ? diffAbs >= baselineEpsilon
+            : diffPct >= this.config.mismatchThresholdPct;
+
+        if (!mismatchDetected) {
+            const state = this.mismatchByKey.get(mismatchKey);
+            if (state?.active) {
+                this.clearDegradedFlag(mismatchKey, 'mismatch', evt.meta.ts);
+            }
+            this.mismatchByKey.delete(mismatchKey);
+            return;
+        }
+
+        const next =
+            existing && !existing.lastInfo?.suppressed ? existing : { firstTs: evt.ts, lastTs: evt.ts, active: false };
+        next.lastTs = evt.ts;
+        next.lastInfo = {
+            diffPct,
+            diffAbs,
+            baseline: baseline.value,
+            observed: observed.value,
+            baselineEpsilon,
+            insufficientBaseline,
+            baselineStrategy,
+            comparableVenues: comparableIds,
+            excludedVenues: excludedIds,
+            excludedReasons,
+            unitByVenue,
+            instrumentByVenue,
+            venueBreakdown: stableRecordFromEntries(comparable),
+            baselineVenue: baseline.venue,
+            observedVenue: observed.venue,
+            venues: orderedCandidates,
+            unit: compareUnit,
+        };
+        this.mismatchByKey.set(mismatchKey, next);
+
+        if (!next.active && evt.ts - next.firstTs >= this.config.mismatchWindowMs) {
+            const payload: DataMismatch = {
+                symbol: evt.symbol,
+                topic,
+                ts: evt.ts,
+                values: stableRecordFromEntries(comparable),
+                thresholdPct: this.config.mismatchThresholdPct,
+                meta: createMeta('global_data', { tsEvent: asTsMs(evt.meta.tsEvent) }),
+            };
+            this.bus.publish('data:mismatch', payload);
+            const sourceId = makeDataQualitySourceId(topic, evt.provider);
+            const venuesLabel = comparableIds.length
+                ? comparableIds.slice(0, 8).join(',') + (comparableIds.length > 8 ? ',…' : '')
+                : 'n/a';
+            this.logThrottled(
+                `${mismatchKey}:mismatch`,
+                evt.meta.ts,
+                `[GlobalData] mismatch key=${mismatchKey} sourceId=${sourceId} topic=${topic} symbol=${evt.symbol} ` +
+                    `unit=${compareUnit} diffAbs=${diffAbs.toFixed(8)} diffPct=${diffPct.toFixed(4)} ` +
+                    `baseline=${baseline.value.toFixed(8)} observed=${observed.value.toFixed(8)} ` +
+                    `baselineVenue=${baseline.venue} observedVenue=${observed.venue} venues=${venuesLabel}`
+            );
+            next.active = true;
+            this.mismatchByKey.set(mismatchKey, next);
+            this.markDegraded(mismatchKey, sourceId, evt.ts, evt.meta.ts, 'mismatch');
+        }
+    }
+
+    private resolveFreshnessWindowMs(topic: string, evt: AggregatedEvent): number | undefined {
+        const policy = resolveStalenessPolicy(this.config.stalenessPolicy, {
+            topic,
+            symbol: evt.symbol,
+            marketType: 'marketType' in evt ? evt.marketType : undefined,
+        });
+        const expected = policy?.expectedIntervalMs ?? this.config.expectedIntervalMs[topic];
+        if (!expected) return undefined;
+        const staleThresholdMs = policy?.staleThresholdMs ?? expected * this.config.staleMultiplier;
+        return Math.max(expected, staleThresholdMs);
+    }
+
+    private computeBaseline(values: Array<[string, number]>, strategy: 'bybit' | 'median'): { venue: string; value: number } | undefined {
+        const filtered = values.filter(([, value]) => Number.isFinite(value));
+        if (filtered.length === 0) return undefined;
+
+        if (strategy === 'bybit') {
+            const bybit = filtered.filter(([venue]) => this.isBybitStreamId(venue)).sort(([a], [b]) => a.localeCompare(b));
+            if (bybit.length === 0) return undefined;
+            return { venue: bybit[0][0], value: bybit[0][1] };
+        }
+
+        const ordered = filtered
+            .slice()
+            .sort(([venueA, valueA], [venueB, valueB]) => (valueA !== valueB ? valueA - valueB : venueA.localeCompare(venueB)));
+        const mid = Math.floor(ordered.length / 2);
+        if (ordered.length % 2 === 1) {
+            return { venue: ordered[mid][0], value: ordered[mid][1] };
+        }
+        const lo = ordered[mid - 1];
+        const hi = ordered[mid];
+        return { venue: 'median', value: (lo[1] + hi[1]) / 2 };
+    }
+
+    private computeObserved(
+        values: Array<[string, number]>,
+        baseline: number,
+        baselineVenue?: string
+    ): { venue: string; value: number } | undefined {
+        let best: { venue: string; value: number; diff: number } | undefined;
+        for (const [venue, value] of values) {
+            if (!Number.isFinite(value)) continue;
+            if (baselineVenue && baselineVenue !== 'median' && venue === baselineVenue) continue;
+            const diff = Math.abs(value - baseline);
+            if (!best || diff > best.diff || (diff === best.diff && venue.localeCompare(best.venue) < 0)) {
+                best = { venue, value, diff };
+            }
+        }
+        if (!best) return undefined;
+        return { venue: best.venue, value: best.value };
+    }
+
+    private selectDominantUnitGroup(
+        grouped: Map<OpenInterestUnit, Array<[string, number]>>
+    ): { unit: OpenInterestUnit; values: Array<[string, number]> } | undefined {
+        const entries = Array.from(grouped.entries()).filter(([, values]) => values.length > 0);
+        if (entries.length === 0) return undefined;
+        entries.sort(([unitA, valuesA], [unitB, valuesB]) => {
+            if (valuesB.length !== valuesA.length) return valuesB.length - valuesA.length;
+            return unitA.localeCompare(unitB);
+        });
+        const [unit, values] = entries[0];
+        if (values.length < 2) return undefined;
+        return { unit, values };
+    }
+
+    private isBybitStreamId(streamId: string): boolean {
+        return this.resolveStreamVenue(streamId) === 'bybit';
+    }
+
+    private resolveStreamVenue(streamId: string): string {
+        const prefix = streamId.split('.')[0]?.trim().toLowerCase();
+        if (!prefix) return 'unknown';
+        if (prefix === 'bybit' || prefix === 'binance' || prefix === 'okx') return prefix;
+        return prefix;
+    }
+
+    private describeOiInstrumentId(streamId: string, symbol: string): string {
+        const venue = this.resolveStreamVenue(streamId);
+        if (venue === 'okx') {
+            const split = this.splitSymbol(symbol);
+            if (split) return `${split.base}-${split.quote}-SWAP`;
+            return `${symbol}-SWAP`;
+        }
+        return symbol;
+    }
+
+    private splitSymbol(symbol: string): { base: string; quote: string } | undefined {
+        const upper = normalizeSymbol(symbol);
+        const quotes = ['USDT', 'USDC', 'USD'];
+        for (const quote of quotes) {
+            if (upper.endsWith(quote) && upper.length > quote.length) {
+                return { base: upper.slice(0, -quote.length), quote };
+            }
+        }
+        return undefined;
     }
 
     private logMismatchDiagnostics(
