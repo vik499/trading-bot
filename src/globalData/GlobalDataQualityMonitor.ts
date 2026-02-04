@@ -18,6 +18,9 @@ import {
     type MarketVolumeAggEvent,
 } from '../core/events/EventBus';
 import { computeConfidenceScore } from '../core/confidence';
+import { stableRecordFromEntries, stableSortStrings } from '../core/determinism';
+import { makeDataQualityKey, makeDataQualitySourceId } from '../core/observability/dataQualityKeys';
+import { resolveStalenessPolicy, type StalenessPolicyRule } from '../core/observability/stalenessPolicy';
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
 
@@ -38,10 +41,43 @@ function hasQualityFlags(evt: unknown): evt is {
 export interface GlobalDataQualityConfig {
     expectedIntervalMs?: Partial<Record<string, number>>;
     staleMultiplier?: number;
+    stalenessPolicy?: StalenessPolicyRule[];
     mismatchThresholdPct?: number;
     mismatchWindowMs?: number;
     logThrottleMs?: number;
     mismatchBaselineEpsilon?: number;
+}
+
+export interface GlobalDataQualitySnapshot {
+    ts: number;
+    degradedCount: number;
+    mismatchCount: number;
+    degraded?: Array<{
+        key: string;
+        sourceId: string;
+        stale: boolean;
+        mismatch: boolean;
+        degraded: boolean;
+        lastErrorTs?: number;
+        lastSuccessTs?: number;
+    }>;
+    mismatch?: Array<{
+        key: string;
+        active: boolean;
+        diffPct?: number;
+        diffAbs?: number;
+        baseline?: number;
+        observed?: number;
+        baselineEpsilon?: number;
+        insufficientBaseline?: boolean;
+        baselineVenue?: string;
+        observedVenue?: string;
+        venues?: string[];
+        venueBreakdown?: Record<string, number>;
+        bucket?: string;
+        unit?: string;
+        resetHint?: string;
+    }>;
 }
 
 type AggregatedEvent =
@@ -58,9 +94,13 @@ interface MismatchInfo {
     diffPct: number;
     diffAbs: number;
     baseline: number;
+    observed: number;
     baselineEpsilon: number;
     insufficientBaseline: boolean;
     venueBreakdown?: Record<string, number>;
+    baselineVenue?: string;
+    observedVenue?: string;
+    venues?: string[];
     bucket?: string;
     unit?: string;
     resetHint?: string;
@@ -72,6 +112,8 @@ export class GlobalDataQualityMonitor {
     private started = false;
     private readonly unsubscribers: Array<() => void> = [];
     private readonly lastTsByKey = new Map<string, number>();
+    private readonly firstIngestTsByKey = new Map<string, number>();
+    private readonly staleSamplesByKey = new Map<string, number>();
     private readonly lastLogByKey = new Map<string, number>();
     private readonly degradedByKey = new Map<
         string,
@@ -94,12 +136,14 @@ export class GlobalDataQualityMonitor {
         }
     >();
     private readonly referencePriceBySymbol = new Map<string, { price: number; ts: number }>();
+    private lastMetaTs?: number;
 
     constructor(bus: EventBus = defaultEventBus, config: GlobalDataQualityConfig = {}) {
         this.bus = bus;
         this.config = {
             expectedIntervalMs: config.expectedIntervalMs ?? {},
             staleMultiplier: Math.max(1, config.staleMultiplier ?? 2),
+            stalenessPolicy: config.stalenessPolicy ?? [],
             mismatchThresholdPct: Math.max(0, config.mismatchThresholdPct ?? 0.1),
             mismatchWindowMs: Math.max(0, config.mismatchWindowMs ?? 60_000),
             logThrottleMs: Math.max(0, config.logThrottleMs ?? 30_000),
@@ -152,13 +196,55 @@ export class GlobalDataQualityMonitor {
         this.started = false;
     }
 
+    snapshot(maxItems = 25): GlobalDataQualitySnapshot {
+        const ts = this.lastMetaTs ?? 0;
+        const degradedEntries = Array.from(this.degradedByKey.entries()).map(([key, value]) => ({
+            key,
+            sourceId: value.sourceId,
+            stale: value.stale,
+            mismatch: value.mismatch,
+            degraded: value.degraded,
+            lastErrorTs: value.lastErrorTs,
+            lastSuccessTs: value.lastSuccessTs,
+        }));
+        const mismatchEntries = Array.from(this.mismatchByKey.entries())
+            .filter(([, value]) => value.active)
+            .map(([key, value]) => ({
+                key,
+                active: value.active,
+                diffPct: value.lastInfo?.diffPct,
+                diffAbs: value.lastInfo?.diffAbs,
+                baseline: value.lastInfo?.baseline,
+                observed: value.lastInfo?.observed,
+                baselineEpsilon: value.lastInfo?.baselineEpsilon,
+                insufficientBaseline: value.lastInfo?.insufficientBaseline,
+                baselineVenue: value.lastInfo?.baselineVenue,
+                observedVenue: value.lastInfo?.observedVenue,
+                venues: value.lastInfo?.venues?.slice(0, 10),
+                venueBreakdown: value.lastInfo?.venueBreakdown ? this.capRecord(value.lastInfo.venueBreakdown, 10) : undefined,
+                bucket: value.lastInfo?.bucket,
+                unit: value.lastInfo?.unit,
+                resetHint: value.lastInfo?.resetHint,
+            }));
+
+        return {
+            ts,
+            degradedCount: degradedEntries.length,
+            mismatchCount: mismatchEntries.length,
+            degraded: degradedEntries.slice(0, maxItems),
+            mismatch: mismatchEntries.slice(0, maxItems),
+        };
+    }
+
     private onAggEvent(topic: string, evt: AggregatedEvent): void {
+        this.lastMetaTs = evt.meta.tsEvent;
         this.detectStale(topic, evt);
         this.detectMismatch(topic, evt);
         this.emitConfidence(topic, evt);
     }
 
     private onPriceCanonical(evt: MarketPriceCanonicalEvent): void {
+        this.lastMetaTs = evt.meta.tsEvent;
         const price = evt.indexPrice ?? evt.markPrice ?? evt.lastPrice;
         if (Number.isFinite(price)) {
             this.referencePriceBySymbol.set(evt.symbol, { price: price as number, ts: evt.meta.ts });
@@ -167,23 +253,48 @@ export class GlobalDataQualityMonitor {
     }
 
     private detectStale(topic: string, evt: AggregatedEvent): void {
-        const expected = this.config.expectedIntervalMs[topic];
-        const key = this.makeKey(topic, evt.symbol, evt.provider);
+        const key = makeDataQualityKey(topic, evt.symbol, evt.provider);
+        const sourceId = makeDataQualitySourceId(topic, evt.provider);
+        const policy = resolveStalenessPolicy(this.config.stalenessPolicy, {
+            topic,
+            symbol: evt.symbol,
+            marketType: 'marketType' in evt ? evt.marketType : undefined,
+        });
+
+        const expected = policy?.expectedIntervalMs ?? this.config.expectedIntervalMs[topic];
         if (!expected) {
             this.lastTsByKey.set(key, evt.ts);
             return;
         }
+
+        const staleThresholdMs = policy?.staleThresholdMs ?? expected * this.config.staleMultiplier;
+        const ingestNow = evt.meta.tsIngest ?? evt.meta.tsEvent;
+        if (!this.firstIngestTsByKey.has(key)) {
+            this.firstIngestTsByKey.set(key, ingestNow);
+        }
+
         const last = this.lastTsByKey.get(key);
         this.lastTsByKey.set(key, evt.ts);
         if (last === undefined) return;
+
+        const sampleCount = (this.staleSamplesByKey.get(key) ?? 0) + 1;
+        this.staleSamplesByKey.set(key, sampleCount);
+
         const delta = evt.ts - last;
-        if (delta <= expected * this.config.staleMultiplier) {
+        if (delta <= staleThresholdMs) {
             this.clearDegradedFlag(key, 'stale', evt.meta.ts);
             return;
         }
 
+        // Startup/backfill protection: only for topics with explicit policy rules.
+        if (policy) {
+            const firstIngestTs = this.firstIngestTsByKey.get(key) ?? ingestNow;
+            if (policy.startupGraceMs > 0 && ingestNow - firstIngestTs < policy.startupGraceMs) return;
+            if (sampleCount < policy.minSamples) return;
+        }
+
         const payload: DataStale = {
-            sourceId: this.resolveSourceId(topic, evt),
+            sourceId,
             topic,
             symbol: evt.symbol,
             lastTs: last,
@@ -192,8 +303,14 @@ export class GlobalDataQualityMonitor {
             meta: createMeta('global_data', { tsEvent: asTsMs(evt.meta.tsEvent) }),
         };
         this.bus.publish('data:stale', payload);
-        this.logThrottled(`${key}:stale`, evt.meta.ts, `[GlobalData] stale topic=${topic} symbol=${evt.symbol} deltaMs=${delta}`);
-        this.markDegraded(key, this.resolveSourceId(topic, evt), last, evt.meta.ts, 'stale');
+        this.logThrottled(
+            `${key}:stale`,
+            evt.meta.ts,
+            `[GlobalData] stale key=${key} sourceId=${sourceId} topic=${topic} symbol=${evt.symbol} ` +
+                `deltaMs=${delta} expectedIntervalMs=${expected} staleThresholdMs=${staleThresholdMs} ` +
+                `lastSuccessTs=${last} lastSeenTs=${evt.ts}`
+        );
+        this.markDegraded(key, sourceId, last, evt.meta.ts, 'stale');
     }
 
     private detectMismatch(topic: string, evt: AggregatedEvent): void {
@@ -203,19 +320,31 @@ export class GlobalDataQualityMonitor {
             (entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isFinite(entry[1])
         );
         if (values.length < 2) return;
-        const nums = Object.values(breakdown).filter((value): value is number => typeof value === 'number');
-        const min = Math.min(...nums);
-        const max = Math.max(...nums);
+        let minVenue: string | undefined;
+        let maxVenue: string | undefined;
+        let min = Infinity;
+        let max = -Infinity;
+        for (const [venue, value] of values) {
+            if (value < min) {
+                min = value;
+                minVenue = venue;
+            }
+            if (value > max) {
+                max = value;
+                maxVenue = venue;
+            }
+        }
         if (min <= 0) return;
         const diff = max - min;
         const baseline = min;
+        const observed = max;
         const baselineEpsilon = this.config.mismatchBaselineEpsilon;
         const insufficientBaseline = Math.abs(baseline) < baselineEpsilon;
         const diffPct = insufficientBaseline ? diff / baselineEpsilon : diff / baseline;
         const mismatchDetected = insufficientBaseline
             ? diff >= baselineEpsilon
             : diffPct >= this.config.mismatchThresholdPct;
-        const key = this.makeKey(topic, evt.symbol, evt.provider);
+        const key = makeDataQualityKey(topic, evt.symbol, evt.provider);
 
         if (!mismatchDetected) {
             const state = this.mismatchByKey.get(key);
@@ -232,9 +361,13 @@ export class GlobalDataQualityMonitor {
             diffPct,
             diffAbs: diff,
             baseline,
+            observed,
             baselineEpsilon,
             insufficientBaseline,
-            venueBreakdown: Object.fromEntries(values),
+            venueBreakdown: stableRecordFromEntries(values),
+            baselineVenue: minVenue,
+            observedVenue: maxVenue,
+            venues: stableSortStrings(values.map(([venue]) => venue)),
             bucket: this.describeBucket(evt),
             unit: this.describeUnit(evt),
             resetHint: this.describeResetHint(evt),
@@ -246,23 +379,28 @@ export class GlobalDataQualityMonitor {
                 symbol: evt.symbol,
                 topic,
                 ts: evt.ts,
-                values: Object.fromEntries(values),
+                values: stableRecordFromEntries(values),
                 thresholdPct: this.config.mismatchThresholdPct,
                 meta: createMeta('global_data', { tsEvent: asTsMs(evt.meta.tsEvent) }),
             };
             this.bus.publish('data:mismatch', payload);
-            const diffLabel = insufficientBaseline ? 'insufficient_baseline' : diffPct.toFixed(4);
+            const sourceId = makeDataQualitySourceId(topic, evt.provider);
+            const venues = next.lastInfo?.venues ?? [];
+            const venuesLabel = venues.length ? venues.slice(0, 8).join(',') + (venues.length > 8 ? ',…' : '') : 'n/a';
+            const unitLabel = next.lastInfo?.unit ?? 'n/a';
             this.logThrottled(
                 `${key}:mismatch`,
                 evt.meta.ts,
-                `[GlobalData] mismatch topic=${topic} symbol=${evt.symbol} diffPct=${diffLabel}`
+                `[GlobalData] mismatch key=${key} sourceId=${sourceId} topic=${topic} symbol=${evt.symbol} ` +
+                    `unit=${unitLabel} diffAbs=${diff.toFixed(8)} diffPct=${diffPct.toFixed(4)} ` +
+                    `baseline=${baseline.toFixed(8)} observed=${observed.toFixed(8)} ` +
+                    `baselineVenue=${minVenue ?? 'n/a'} observedVenue=${maxVenue ?? 'n/a'} venues=${venuesLabel}` +
+                    (insufficientBaseline ? ` insufficientBaseline=true baselineEpsilon=${baselineEpsilon.toExponential(2)}` : '')
             );
-            if (topic === 'market:cvd_futures_agg') {
-                this.logMismatchDiagnostics(key, evt.meta.ts, evt.symbol, topic, next.lastInfo);
-            }
+            this.logMismatchDiagnostics(key, evt.meta.ts, evt.symbol, topic, next.lastInfo);
             next.active = true;
             this.mismatchByKey.set(key, next);
-            this.markDegraded(key, this.resolveSourceId(topic, evt), evt.ts, evt.meta.ts, 'mismatch');
+            this.markDegraded(key, sourceId, evt.ts, evt.meta.ts, 'mismatch');
         }
     }
 
@@ -274,7 +412,7 @@ export class GlobalDataQualityMonitor {
         info?: MismatchInfo
     ): void {
         if (!info) return;
-        const breakdown = info.venueBreakdown ? JSON.stringify(info.venueBreakdown) : 'n/a';
+        const breakdown = info.venueBreakdown ? JSON.stringify(this.capRecord(info.venueBreakdown, 10)) : 'n/a';
         const bucket = info.bucket ?? 'n/a';
         const unit = info.unit ?? 'n/a';
         const resetHint = info.resetHint ?? 'n/a';
@@ -360,11 +498,11 @@ export class GlobalDataQualityMonitor {
     }
 
     private makeKey(topic: string, symbol: string, provider?: string): string {
-        return `${topic}:${symbol}:${provider ?? 'global'}`;
+        return makeDataQualityKey(topic, symbol, provider);
     }
 
     private resolveSourceId(topic: string, evt: AggregatedEvent): string {
-        return evt.provider ? `${evt.provider}:${topic}` : `global:${topic}`;
+        return makeDataQualitySourceId(topic, evt.provider);
     }
 
     private markDegraded(key: string, sourceId: string, lastSuccessTs: number, ts: number, reason: 'stale' | 'mismatch'): void {
@@ -378,6 +516,8 @@ export class GlobalDataQualityMonitor {
         state[reason] = true;
         state.lastErrorTs = ts;
         state.lastSuccessTs = lastSuccessTs;
+        // Make the key visible to observers before emitting the transition event.
+        this.degradedByKey.set(key, state);
         if (!state.degraded) {
             state.degraded = true;
             this.bus.publish('data:sourceDegraded', {
@@ -386,8 +526,18 @@ export class GlobalDataQualityMonitor {
                 lastSuccessTs: state.lastSuccessTs,
                 meta: createMeta('global_data', { tsEvent: asTsMs(ts) }),
             });
+            this.degradedByKey.set(key, state);
         }
-        this.degradedByKey.set(key, state);
+    }
+
+    private capRecord<T>(record: Record<string, T>, maxKeys: number): Record<string, T> {
+        const keys = stableSortStrings(Object.keys(record));
+        const limited = keys.slice(0, Math.max(0, Math.floor(maxKeys)));
+        const next: Record<string, T> = {};
+        for (const key of limited) {
+            next[key] = record[key] as T;
+        }
+        return next;
     }
 
     private clearDegradedFlag(key: string, reason: 'stale' | 'mismatch', ts: number): void {
