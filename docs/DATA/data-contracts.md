@@ -150,6 +150,7 @@ Rules:
 - Missing inputs in a bucket lower confidence deterministically.
 - Readiness degradation uses critical blocks (default: price, flow, liquidity). Derivatives can be non-critical.
 - Critical blocks are configurable; derivatives can be treated as non-blocking when desired.
+- Flow confidence is evaluated for the reported `marketType` when available (spot uses `flow_spot`, futures uses `flow_futures`); unknown marketType may consider both.
 - `LAG_TOO_HIGH` refers to processing lag only (system falling behind).
 - Exchange/transport lag (tsIngest - tsEvent) must never degrade readiness; it is surfaced as warning `EXCHANGE_LAG_TOO_HIGH` only.
 - Exchange lag stats ignore events older than 10 minutes to avoid backfill contaminating lag warnings.

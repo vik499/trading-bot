@@ -55,4 +55,38 @@ describe('CvdAggregator', () => {
 
     agg.stop();
   });
+
+  it('computes confidence 0.475 with mismatch + binance penalty', () => {
+    const bus = createTestEventBus();
+    const agg = new CvdAggregator(bus, { ttlMs: 10_000 });
+    const spotAgg: MarketCvdAggEvent[] = [];
+
+    bus.subscribe('market:cvd_spot_agg', (evt) => spotAgg.push(evt));
+    agg.start();
+
+    const make = (streamId: string, total: number): MarketCvdEvent => ({
+      symbol: 'BTCUSDT',
+      streamId,
+      marketType: 'spot',
+      bucketStartTs: 0,
+      bucketEndTs: 1000,
+      bucketSizeMs: 1000,
+      cvdTotal: total,
+      cvdDelta: total,
+      unit: 'base',
+      exchangeTs: 1000,
+      meta: createMeta('market', { tsEvent: 1000, tsIngest: 1000, streamId }),
+    });
+
+    bus.publish('market:cvd_spot', make('binance.usdm.public', 100));
+    bus.publish('market:cvd_spot', make('bybit.public.linear.v5', 120));
+
+    const last = spotAgg[spotAgg.length - 1];
+    expect(last.mismatchDetected).toBe(true);
+    expect(last.confidenceScore).toBeDefined();
+    expect(last.confidenceScore!).toBeCloseTo(0.475, 6);
+    expect(last.confidenceScore!.toFixed(2)).toBe('0.47');
+
+    agg.stop();
+  });
 });
