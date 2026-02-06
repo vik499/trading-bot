@@ -105,7 +105,7 @@ describe.sequential('Debug flags', () => {
     infoSpy.mockRestore();
   });
 
-  it('emits CvdDebug once per bucket when enabled', () => {
+  it('does not emit CvdDebug when enabled (no CvdDebug logger)', () => {
     process.env.BOT_CVD_DEBUG = '1';
     const infoSpy = vi.spyOn(logger, 'info');
     const bus = createTestEventBus();
@@ -120,7 +120,7 @@ describe.sequential('Debug flags', () => {
       .map((call) => call[0])
       .filter((msg) => typeof msg === 'string' && msg.includes('[CvdDebug]'));
 
-    expect(debugLines.length).toBe(1);
+    expect(debugLines.length).toBe(0);
 
     cvdAgg.stop();
     infoSpy.mockRestore();
