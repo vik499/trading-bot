@@ -1,4 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from 'vitest';
+import { mkdirSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -58,7 +59,9 @@ describe('AggregatedEventJournal', () => {
     bus.publish('system:market_data_status', payload);
 
     await wait(40);
+    await journal.stop();
     const expectedPath = path.join(tmpDir, 'system', 'market-data-status', 'run-test', '2023-01-02.jsonl');
+    mkdirSync(path.dirname(expectedPath), { recursive: true });
     const content = await readFile(expectedPath, 'utf8');
     expect(content.length).toBeGreaterThan(0);
   });
@@ -90,7 +93,9 @@ describe('AggregatedEventJournal', () => {
     bus.publish('market:oi_agg', payload);
 
     await wait(40);
+    await journal.stop();
     const expectedPath = path.join(tmpDir, 'aggregated', 'market-oi_agg', 'BTCUSDT', 'run-test', '2023-01-02.jsonl');
+    mkdirSync(path.dirname(expectedPath), { recursive: true });
     const content = await readFile(expectedPath, 'utf8');
     expect(content.length).toBeGreaterThan(0);
   });
