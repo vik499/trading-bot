@@ -268,9 +268,9 @@ export class EventTap {
     const msg = this.formatSummary();
     const throttleMs = Math.max(0, this.opts.summaryThrottleMs);
     if (throttleMs > 0) {
-      logger.infoThrottled('eventtap:summary', msg, throttleMs);
+      logger.infoFileThrottled('eventtap:summary', msg, throttleMs);
     } else {
-      logger.info(msg);
+      logger.infoFile(msg);
     }
   }
 

@@ -46,3 +46,7 @@ The following files are **not** part of this repository and must not be referenc
 ## Location reminder
 
 `AGENTS.md` is in the repository root (./AGENTS.md).
+
+## Supplemental references (non-authoritative)
+
+- `docs/AI_COMMON_ERRORS.md` — quick “do not do” checklist; does not override CANON/DOCS_INDEX.

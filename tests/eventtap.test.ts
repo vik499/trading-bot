@@ -19,21 +19,35 @@ import { logger, type LogLevel } from '../src/infra/logger';
 
 describe('EventTap', () => {
   let logs: string[];
+  let fileLogs: string[];
   let prevLevel: LogLevel;
   let prevDisplay: boolean;
 
   beforeEach(() => {
     logs = [];
+    fileLogs = [];
     prevLevel = logger.getLevel();
     prevDisplay = logger.isDisplayEnabled();
     logger.setLevel('info');
     logger.setDisplay(true);
-    logger.setSink((_entry, formatted) => {
-      logs.push(formatted);
-    });
+    logger.setSinks([
+      {
+        kind: 'file',
+        write: (_entry, formatted) => {
+          fileLogs.push(formatted);
+        },
+      },
+      {
+        kind: 'console',
+        write: (_entry, formatted) => {
+          logs.push(formatted);
+        },
+      },
+    ]);
   });
 
   afterEach(() => {
+    logger.setSinks([]);
     logger.resetSinkToConsole();
     logger.setLevel(prevLevel);
     logger.setDisplay(prevDisplay);
@@ -166,7 +180,7 @@ describe('EventTap', () => {
     tap.emitSummary();
     tap.emitSummary();
 
-    const summaryLogs = logs.filter((line) => line.includes('[EventTap] counters'));
+    const summaryLogs = fileLogs.filter((line) => line.includes('[EventTap] counters'));
     expect(summaryLogs).toHaveLength(1);
     expect(summaryLogs[0]).toContain('ticks=1');
     expect(summaryLogs[0]).toContain('intents=1');

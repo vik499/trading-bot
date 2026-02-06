@@ -28,6 +28,7 @@ describe('GlobalDataQualityMonitor', () => {
       openInterestUnit: 'base',
       venueBreakdown: { bybit: 100, binance: 101, okx: 99 },
       provider: 'local_oi_agg',
+      marketType: 'futures',
       meta: createMeta('global_data', { ts: 1_000 }),
     });
 
@@ -38,6 +39,7 @@ describe('GlobalDataQualityMonitor', () => {
       openInterestUnit: 'base',
       venueBreakdown: { bybit: 102, binance: 103, okx: 101 },
       provider: 'local_oi_agg',
+      marketType: 'futures',
       meta: createMeta('global_data', { ts: 4_000 }),
     });
 
@@ -51,6 +53,7 @@ describe('GlobalDataQualityMonitor', () => {
       openInterestUnit: 'base',
       venueBreakdown: { bybit: 103, binance: 104, okx: 102 },
       provider: 'local_oi_agg',
+      marketType: 'futures',
       meta: createMeta('global_data', { ts: 4_500 }),
     });
 
@@ -82,6 +85,7 @@ describe('GlobalDataQualityMonitor', () => {
       openInterestUnit: 'base',
       venueBreakdown: { bybit: 100, binance: 200, okx: 150 },
       provider: 'local_oi_agg',
+      marketType: 'futures',
       meta: createMeta('global_data', { ts: 1_000 }),
     });
 
@@ -92,6 +96,7 @@ describe('GlobalDataQualityMonitor', () => {
       openInterestUnit: 'base',
       venueBreakdown: { bybit: 110, binance: 220, okx: 180 },
       provider: 'local_oi_agg',
+      marketType: 'futures',
       meta: createMeta('global_data', { ts: 2_500 }),
     });
 
@@ -105,6 +110,7 @@ describe('GlobalDataQualityMonitor', () => {
       openInterestUnit: 'base',
       venueBreakdown: { bybit: 105, binance: 108, okx: 106 },
       provider: 'local_oi_agg',
+      marketType: 'futures',
       meta: createMeta('global_data', { ts: 2_600 }),
     });
 

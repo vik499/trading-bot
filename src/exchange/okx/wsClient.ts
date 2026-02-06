@@ -24,6 +24,7 @@ import {
     mapOrderbookSnapshotRaw,
     mapTradeRaw,
 } from '../normalizers/rawAdapters';
+import { getOkxSwapCtVal } from './instrumentMeta';
 
 export interface OkxWsClientOptions {
     streamId?: string;
@@ -474,9 +475,11 @@ export class OkxPublicWsClient {
             const sideRaw = obj.side ? String(obj.side).toLowerCase() : undefined;
             const side = sideRaw === 'buy' ? 'Buy' : sideRaw === 'sell' ? 'Sell' : undefined;
             const price = toOptionalNumber(obj.px ?? obj.price);
-            const size = toOptionalNumber(obj.sz ?? obj.size);
+            const rawSize = toOptionalNumber(obj.sz ?? obj.size);
             const tradeTs = toOptionalNumber(obj.ts);
-            if (!side || price === undefined || size === undefined || tradeTs === undefined) continue;
+            if (!side || price === undefined || rawSize === undefined || tradeTs === undefined) continue;
+            const marketType = this.marketType ?? detectMarketType(instId);
+            const size = normalizeOkxTradeSize(instId, rawSize, marketType);
 
             const evt: TradeEvent = {
                 symbol,
@@ -487,7 +490,7 @@ export class OkxPublicWsClient {
                 size,
                 tradeTs,
                 exchangeTs: tradeTs,
-                marketType: this.marketType ?? detectMarketType(instId),
+                marketType,
                 meta: createMeta('market', {
                     tsEvent: asTsMs(tradeTs),
                     tsExchange: asTsMs(tradeTs),
@@ -899,6 +902,14 @@ const toErrorMessage = (err: unknown): string => {
 function normalizeOkxSymbol(instId: string): string {
     const trimmed = instId.trim().toUpperCase();
     return trimmed.replace(/-/g, '').replace('SWAP', '');
+}
+
+function normalizeOkxTradeSize(instId: string, size: number, marketType: KnownMarketType): number {
+    if (marketType !== 'futures') return size;
+    const ctVal = getOkxSwapCtVal(instId);
+    // If ctVal is unknown, keep raw size to avoid silent assumptions.
+    if (ctVal === undefined) return size;
+    return size * ctVal;
 }
 
 function buildSubKey(arg: OkxArg): string {

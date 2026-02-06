@@ -1,5 +1,6 @@
 import { logger } from '../infra/logger';
 import { m } from '../core/logMarkers';
+import { bucketCloseTs } from '../core/buckets';
 import {
     asTsMs,
     createMeta,
@@ -78,6 +79,19 @@ export interface MarketDataReadinessOptions {
     marketStatusJson?: boolean;
 }
 
+export interface MarketReadinessSnapshot {
+    symbol: string;
+    marketType: MarketType;
+    status: 'READY' | 'WARMING' | 'DEGRADED';
+    conf: number;
+    warnings: string[];
+    degradedReasons: string[];
+    lagExP95?: number;
+    lagExEwma?: number;
+    lagPrP95?: number;
+    lagPrEwma?: number;
+}
+
 type AggregatedWithMeta = {
     symbol: string;
     ts: number;
@@ -144,6 +158,11 @@ const REASON_ORDER: Reason[] = [
 
 const WARNING_ORDER: WarningReason[] = ['TIMEBASE_QUALITY_WARN', 'NON_MONOTONIC_TIMEBASE', 'EXCHANGE_LAG_TOO_HIGH'];
 
+function capArray<T>(items: T[], limit: number): T[] {
+    if (items.length <= limit) return items;
+    return items.slice(0, limit);
+}
+
 export class MarketDataReadiness {
     private readonly bus: EventBus;
     private readonly bucketMs: number;
@@ -171,6 +190,9 @@ export class MarketDataReadiness {
     private readonly criticalBlocks: Set<ReadinessBlock>;
     private readonly startupGraceWindowMs: number;
     private readonly marketStatusJson: boolean;
+    private readonly flowDebug: boolean;
+    private readonly readinessDebug: boolean;
+    private readonly gapDebug: boolean;
     private readonly now: () => number;
 
     private started = false;
@@ -207,6 +229,8 @@ export class MarketDataReadiness {
     private lastSnapshot?: SourceRegistrySnapshot;
     private lastLogTs?: number;
     private lastLogSignature?: string;
+    private readonly lastFlowDebugByKey = new Map<string, number>();
+    private readonly lastNoRefPriceDebugByKey = new Map<string, number>();
     private readonly missingExpectedLogged = new Set<string>();
 
     private wsDegraded = false;
@@ -256,6 +280,9 @@ export class MarketDataReadiness {
         this.weights = this.normalizeWeights(rawWeights, this.criticalBlocks);
         this.startupGraceWindowMs = Math.max(0, options.startupGraceWindowMs ?? 0);
         this.marketStatusJson = options.marketStatusJson ?? readFlag('MARKET_STATUS_JSON', false);
+        this.flowDebug = readFlag('BOT_FLOW_DEBUG', false);
+        this.readinessDebug = readFlag('BOT_READINESS_DEBUG', false);
+        this.gapDebug = readFlag('BOT_GAP_DEBUG', false);
         this.now = options.now ?? nowMs;
     }
 
@@ -344,6 +371,26 @@ export class MarketDataReadiness {
         this.started = false;
     }
 
+    getHealthSnapshot(): MarketReadinessSnapshot | undefined {
+        const status = this.lastStatus;
+        if (!status) return undefined;
+        const symbol = this.lastSymbol ?? 'UNKNOWN';
+        const marketType = this.lastMarketType ?? 'unknown';
+        const readiness = status.warmingUp ? 'WARMING' : status.degraded ? 'DEGRADED' : 'READY';
+        return {
+            symbol,
+            marketType,
+            status: readiness,
+            conf: status.overallConfidence,
+            warnings: capArray(status.warnings ?? [], 20),
+            degradedReasons: capArray(status.degradedReasons ?? [], 20),
+            lagExP95: status.exchangeLagP95Ms,
+            lagExEwma: status.exchangeLagEwmaMs,
+            lagPrP95: status.processingLagP95Ms,
+            lagPrEwma: status.processingLagEwmaMs,
+        };
+    }
+
     seedExpectedSources(input: { symbol: string; marketType: MarketType }): void {
         const normalizedSymbol = normalizeSymbol(input.symbol);
         const normalizedMarketType = normalizeMarketType(input.marketType);
@@ -391,6 +438,9 @@ export class MarketDataReadiness {
         const block = this.mapTopicToBlock(evt.topic);
         if (!block) return;
         this.gapByBlock.set(block, true);
+        if (this.gapDebug) {
+            this.logGapDebug('data:gapDetected', evt, block);
+        }
     }
 
     private onSequenceGap(evt: DataSequenceGapOrOutOfOrder): void {
@@ -398,6 +448,9 @@ export class MarketDataReadiness {
         if (!block) return;
         this.gapByBlock.set(block, true);
         this.lastSequenceIssueByBlock.set(block, evt);
+        if (this.gapDebug) {
+            this.logGapDebug('data:sequence_gap_or_out_of_order', evt, block);
+        }
     }
 
     private onTimeOutOfOrder(evt: DataTimeOutOfOrder): void {
@@ -612,12 +665,16 @@ export class MarketDataReadiness {
         const price = this.applyTimebasePenalty('price', priceRaw, bucketTs);
         const flowSpot = this.confidenceForTopic('flow_spot', bucketTs);
         const flowFutures = this.confidenceForTopic('flow_futures', bucketTs);
+        const flowTypesUsed = this.resolveFlowTypesForMarketType(snapshot.marketType);
         const flowCandidates: number[] = [];
-        if (this.expectedFlowTypes.has('spot')) flowCandidates.push(flowSpot);
-        if (this.expectedFlowTypes.has('futures')) flowCandidates.push(flowFutures);
+        if (flowTypesUsed.includes('spot')) flowCandidates.push(flowSpot);
+        if (flowTypesUsed.includes('futures')) flowCandidates.push(flowFutures);
         const flowRaw = flowCandidates.length ? Math.min(...flowCandidates) : Math.min(flowSpot, flowFutures);
         const flowValue = this.expectedBlockEmpty(snapshot, 'flow') ? 1 : flowRaw;
         const flow = this.applyTimebasePenalty('flow', flowValue, bucketTs);
+        if (this.flowDebug) {
+            this.logFlowDebug(snapshot.symbol, snapshot.marketType, bucketTs, flowSpot, flowFutures, flowRaw, flow, flowTypesUsed);
+        }
         const liquidityRaw = this.expectedBlockEmpty(snapshot, 'liquidity') ? 1 : this.confidenceForBlock('liquidity', bucketTs);
         const liquidity = this.applyTimebasePenalty('liquidity', liquidityRaw, bucketTs);
         const derivOi = this.confidenceForTopic('derivatives_oi', bucketTs);
@@ -685,7 +742,7 @@ export class MarketDataReadiness {
         const expectedDerivatives = !this.expectedBlockEmpty(snapshot, 'derivatives');
 
         const priceEvt = this.lastByBlock.get('price');
-        const priceBucketMatch = priceEvt && this.bucketEndTs(priceEvt.meta.tsEvent) === bucketTs;
+        const priceBucketMatch = priceEvt ? this.bucketEndTs(priceEvt.meta.tsEvent) === bucketTs : false;
         if (!priceEvt || !priceBucketMatch) {
             if (!withinStartupGrace && this.isCriticalBlock('price')) {
                 reasons.add('PRICE_STALE');
@@ -773,7 +830,12 @@ export class MarketDataReadiness {
         const priceValid = priceBucketMatch && this.confidenceValue(priceEvt?.confidenceScore) >= this.thresholds.criticalBlock;
         if (hasMismatch) {
             if (priceValid) reasons.add('MISMATCH_DETECTED');
-            else reasons.add('NO_REF_PRICE');
+            else {
+                reasons.add('NO_REF_PRICE');
+                if (this.readinessDebug) {
+                    this.logNoRefPriceDebug(bucketTs, snapshot, priceEvt, priceBucketMatch);
+                }
+            }
         }
 
         if (snapshot.nonMonotonicSources.length > 0) {
@@ -1286,9 +1348,7 @@ export class MarketDataReadiness {
     }
 
     private bucketEndTs(ts: number): number {
-        const adjusted = Math.max(0, ts - 1);
-        const start = Math.floor(adjusted / this.bucketMs) * this.bucketMs;
-        return start + this.bucketMs;
+        return bucketCloseTs(ts, this.bucketMs);
     }
 
     private confidenceValue(value?: number): number {
@@ -1308,6 +1368,131 @@ export class MarketDataReadiness {
             return value;
         }
         return this.clamp(value * TIMEBASE_CONFIDENCE_PENALTY, 0, 1);
+    }
+
+    private logFlowDebug(
+        symbol: string,
+        marketType: MarketType,
+        bucketTs: number,
+        flowSpot: number,
+        flowFutures: number,
+        flowRaw: number,
+        flowAfterPenalty: number,
+        flowTypesUsed: MarketType[]
+    ): void {
+        const key = `${symbol}:${marketType}`;
+        const lastBucket = this.lastFlowDebugByKey.get(key);
+        if (lastBucket === bucketTs) return;
+        this.lastFlowDebugByKey.set(key, bucketTs);
+
+        const expectedFlowTypes = flowTypesUsed.length ? flowTypesUsed : (['spot', 'futures'] as const);
+        let minSource = 'n/a';
+        if (expectedFlowTypes.length === 1) {
+            minSource = expectedFlowTypes[0];
+        } else if (flowSpot < flowFutures) {
+            minSource = 'spot';
+        } else if (flowFutures < flowSpot) {
+            minSource = 'futures';
+        } else {
+            minSource = 'tie';
+        }
+
+        logger.info(
+            `[FlowDebug] ${JSON.stringify({
+                symbol,
+                marketType,
+                bucketTs,
+                flowSpot,
+                flowFutures,
+                flowRaw,
+                flowAfterPenalty,
+                expectedFlowTypes,
+                minSource,
+            })}`
+        );
+    }
+
+    private resolveFlowTypesForMarketType(marketType: MarketType): MarketType[] {
+        const hasSpot = this.expectedFlowTypes.has('spot');
+        const hasFutures = this.expectedFlowTypes.has('futures');
+        if (marketType === 'spot' && hasSpot) return ['spot'];
+        if (marketType === 'futures' && hasFutures) return ['futures'];
+        const fallback: MarketType[] = [];
+        if (hasSpot) fallback.push('spot');
+        if (hasFutures) fallback.push('futures');
+        return fallback.length ? fallback : ['spot', 'futures'];
+    }
+
+    private logNoRefPriceDebug(
+        bucketTs: number,
+        snapshot: SourceRegistrySnapshot,
+        priceEvt: AggregatedWithMeta | undefined,
+        priceBucketMatch: boolean
+    ): void {
+        const key = `${snapshot.symbol}:${snapshot.marketType}`;
+        const lastBucket = this.lastNoRefPriceDebugByKey.get(key);
+        if (lastBucket === bucketTs) return;
+        this.lastNoRefPriceDebugByKey.set(key, bucketTs);
+
+        const priceTsEvent = priceEvt?.meta.tsEvent;
+        const priceBucketTs = priceTsEvent !== undefined ? this.bucketEndTs(priceTsEvent) : undefined;
+        const priceConfidence = this.confidenceValue(priceEvt?.confidenceScore);
+        const mismatchBlocks = Array.from(this.mismatchByBlock.entries())
+            .filter(([, value]) => value)
+            .map(([block]) => block)
+            .sort();
+
+        logger.info(
+            `[ReadinessDebug] ${JSON.stringify({
+                bucketTs,
+                symbol: snapshot.symbol,
+                marketType: snapshot.marketType,
+                priceTsEvent,
+                priceBucketTs,
+                priceBucketMatch,
+                priceConfidence,
+                mismatchBlocks,
+            })}`
+        );
+    }
+
+    private logGapDebug(
+        type: 'data:gapDetected' | 'data:sequence_gap_or_out_of_order',
+        evt: DataGapDetected | DataSequenceGapOrOutOfOrder,
+        block: ReadinessBlock
+    ): void {
+        const marketType = inferMarketTypeFromStreamId(evt.streamId);
+        if (type === 'data:gapDetected') {
+            const gap = evt as DataGapDetected;
+            logger.info(
+                `[GapDebug] ${JSON.stringify({
+                    type,
+                    block,
+                    topic: gap.topic,
+                    symbol: gap.symbol,
+                    marketType,
+                    streamId: gap.streamId,
+                    prevTsExchange: gap.prevTsExchange,
+                    currTsExchange: gap.currTsExchange,
+                    deltaMs: gap.deltaMs,
+                })}`
+            );
+            return;
+        }
+        const seq = evt as DataSequenceGapOrOutOfOrder;
+        logger.info(
+            `[GapDebug] ${JSON.stringify({
+                type,
+                block,
+                topic: seq.topic,
+                symbol: seq.symbol,
+                marketType,
+                streamId: seq.streamId,
+                prevSeq: seq.prevSeq,
+                currSeq: seq.currSeq,
+                kind: seq.kind,
+            })}`
+        );
     }
 
     private mapTopicToBlock(topic: string): ReadinessBlock | undefined {

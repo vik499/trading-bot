@@ -79,6 +79,9 @@ LEVEL 5:
 
 No code edits before completing this reading.
 
+### Supplemental (non-authoritative)
+- `docs/AI_COMMON_ERRORS.md` — quick “do not do” checklist; does not override CANON/DOCS_INDEX.
+
 ### Nonexistent docs (не существуют в этом репо)
 - `00-overview.md`, `01-setup.md`, `02-architecture.md`, `03-data.md`, `04-system.md`, `05-testing.md` do **NOT** exist here.
 - Do not reference them; if you see them mentioned elsewhere, ignore and follow `docs/DOCS_INDEX.md`.

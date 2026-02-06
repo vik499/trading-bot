@@ -19,6 +19,7 @@ describe('LiquidationAggregator', () => {
       size,
       notionalUsd: price * size,
       exchangeTs: ts,
+      marketType: 'futures',
       meta: createMeta('market', { ts }),
     });
 

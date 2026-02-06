@@ -326,7 +326,7 @@ describe('EventJournal', () => {
     appendMock.mockRejectedValueOnce(new Error('disk full'));
 
     const meta = createMeta('market', { tsEvent: 100, tsIngest: 100, streamId: 's1' });
-    bus.publish('market:ticker', { meta, symbol, exchangeTs: 50 });
+    bus.publish('market:ticker', { meta, symbol, streamId: 's1', marketType: 'futures', exchangeTs: 50 });
 
     await wait(30);
 

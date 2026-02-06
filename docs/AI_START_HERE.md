@@ -15,3 +15,6 @@ This project prioritizes:
 - Multi-exchange correctness
 - Reproducible research
 - Strict architectural boundaries
+
+Quick safety checklist (non-authoritative):
+- `docs/AI_COMMON_ERRORS.md`

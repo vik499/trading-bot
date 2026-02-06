@@ -6,8 +6,10 @@ import { createTestEventBus } from '../src/core/events/testing';
 
 const makeTicker = (symbol: string, ts: number, price: number): TickerEvent => ({
   symbol,
+  streamId: 'test.stream',
+  marketType: 'futures',
   lastPrice: String(price),
-  meta: createMeta('market', { ts }),
+  meta: createMeta('market', { tsEvent: ts, tsIngest: ts }),
 });
 
 describe('FeatureEngine analytics:features', () => {

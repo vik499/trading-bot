@@ -8,10 +8,11 @@ import {
     type MarketCvdAggEvent,
     type MarketCvdEvent,
 } from '../core/events/EventBus';
-import { computeConfidenceScore, getSourceTrustAdjustments } from '../core/confidence';
+import { computeConfidenceExplain, computeConfidenceScore, getSourceTrustAdjustments } from '../core/confidence';
 import { stableRecordFromEntries, stableSortStrings } from '../core/determinism';
 import { sourceRegistry } from '../core/market/SourceRegistry';
 import { normalizeMarketType, normalizeSymbol } from '../core/market/symbols';
+import { logger } from '../infra/logger';
 import { detectMismatch } from './quality';
 
 export interface CvdAggregatorOptions {
@@ -40,6 +41,8 @@ export class CvdAggregator {
     private readonly signOverrides: Record<string, number>;
     private readonly now: () => number;
     private readonly sources = new Map<string, Map<KnownMarketType, Map<string, SourceState>>>();
+    private readonly debug: boolean;
+    private readonly lastDebugBucketByKey = new Map<string, number>();
     private unsubscribe?: () => void;
 
     constructor(bus: EventBus, options: CvdAggregatorOptions = {}) {
@@ -50,6 +53,7 @@ export class CvdAggregator {
         this.unitMultipliers = options.unitMultipliers ?? {};
         this.signOverrides = options.signOverrides ?? {};
         this.now = options.now ?? nowMs;
+        this.debug = readFlag('BOT_CVD_DEBUG', false);
     }
 
     start(): void {
@@ -93,6 +97,10 @@ export class CvdAggregator {
                 'STALE_INPUT'
             );
             return;
+        }
+
+        if (this.debug) {
+            this.logDebug(symbol, marketType, evt.bucketStartTs, evt.bucketEndTs, aggregate);
         }
 
         const payload: MarketCvdAggEvent = {
@@ -211,4 +219,63 @@ export class CvdAggregator {
         const normalizedSign = sign >= 0 ? 1 : -1;
         return value * multiplier * normalizedSign;
     }
+
+    private logDebug(
+        symbol: string,
+        marketType: KnownMarketType,
+        bucketStartTs: number,
+        bucketEndTs: number,
+        aggregate: {
+            sourcesUsed: string[];
+            staleSourcesDropped: string[];
+            venueBreakdown: Record<string, number>;
+            mismatchDetected: boolean;
+            confidenceScore: number;
+        }
+    ): void {
+        const key = `${symbol}:${marketType}`;
+        const lastBucket = this.lastDebugBucketByKey.get(key);
+        if (lastBucket === bucketEndTs) return;
+        this.lastDebugBucketByKey.set(key, bucketEndTs);
+
+        const freshSourcesCount = aggregate.sourcesUsed.length;
+        const staleSourcesDroppedCount = aggregate.staleSourcesDropped.length;
+        const total = freshSourcesCount + staleSourcesDroppedCount;
+        const base = total > 0 ? freshSourcesCount / total : 0;
+        const trust = getSourceTrustAdjustments(aggregate.sourcesUsed, 'trade');
+        const explain = computeConfidenceExplain({
+            freshSourcesCount,
+            staleSourcesDroppedCount,
+            mismatchDetected: aggregate.mismatchDetected,
+            sourcePenalty: trust.sourcePenalty,
+            sourceCap: trust.sourceCap,
+        });
+
+        logger.info(
+            `[CvdDebug] ${JSON.stringify({
+                symbol,
+                marketType,
+                bucketStartTs,
+                bucketEndTs,
+                sourcesUsed: aggregate.sourcesUsed,
+                staleSourcesDropped: aggregate.staleSourcesDropped,
+                venueBreakdown: aggregate.venueBreakdown,
+                mismatchDetected: aggregate.mismatchDetected,
+                confidence: {
+                    base,
+                    penalties: explain.penalties,
+                    score: aggregate.confidenceScore,
+                },
+            })}`
+        );
+    }
+}
+
+function readFlag(name: string, fallback: boolean): boolean {
+    const raw = process.env[name];
+    if (raw === undefined) return fallback;
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === '0' || normalized === 'false' || normalized === 'off') return false;
+    if (normalized === '1' || normalized === 'true' || normalized === 'on') return true;
+    return fallback;
 }

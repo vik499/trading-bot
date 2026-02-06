@@ -112,6 +112,12 @@ function parseWeights(raw: string | undefined): Record<string, number> {
   return weights;
 }
 
+function getOiBaselineStrategy(): 'bybit' | 'median' {
+  const raw = process.env.BOT_DQ_OI_BASELINE_STRATEGY?.trim().toLowerCase();
+  if (raw === 'median') return 'median';
+  return 'bybit';
+}
+
 function getGlobalTtlMs(): number {
   return parseIntervalMs(process.env.BOT_GLOBAL_TTL_MS, 120_000);
 }
@@ -243,6 +249,7 @@ async function main(): Promise<void> {
       'market:price_canonical': 60_000,
     },
     mismatchWindowMs: 120_000,
+    oiBaselineStrategy: getOiBaselineStrategy(),
   });
   const marketDataReadiness = new MarketDataReadiness(eventBus, {
     bucketMs: getReadinessBucketMs(),
