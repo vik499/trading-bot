@@ -66,6 +66,11 @@ Rules:
 - Spot and futures are emitted separately.
 - USD normalization must be explicit via `unit`.
 - For aggregated CVD, `venueBreakdown` reflects normalized totals (after per-source unit/sign normalization when configured).
+ - Aggregated CVD may include mismatch diagnostics:
+   - `mismatchType`: `NONE` | `SIGN` | `DISPERSION`
+   - `mismatchReason`: `SIGN` | `DISPERSION`
+   - `signAgreementRatio` (number | null)
+   - `scaleFactors` / `scaledVenueBreakdown` (per-venue scaling diagnostics)
 
 ## Liquidations
 

@@ -573,6 +573,11 @@ export interface MarketCvdAggEvent extends BaseEvent, MarketAggBase {
     confidenceScore?: number;
     provider?: string;
     weightsUsed?: AggregatedVenueBreakdown;
+    mismatchType?: 'NONE' | 'SIGN' | 'DISPERSION';
+    mismatchReason?: 'SIGN' | 'DISPERSION';
+    signAgreementRatio?: number | null;
+    scaleFactors?: AggregatedVenueBreakdown;
+    scaledVenueBreakdown?: AggregatedVenueBreakdown;
     cvdDelta?: number;
     bucketStartTs?: number;
     bucketEndTs?: number;
