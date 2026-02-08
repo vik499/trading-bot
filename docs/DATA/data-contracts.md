@@ -166,3 +166,6 @@ Health snapshots (`logs/health.jsonl`) may include optional telemetry when reaso
 - `gapTelemetry` (GAPS_DETECTED attribution: markers + input gap stats)
 - `priceStaleTelemetry` (PRICE_STALE attribution: age/bucket + sources)
 - `refPriceTelemetry` (NO_REF_PRICE attribution: price validity + source/suppression summary)
+- `worstStatusInMinute` (`READY | WARMING | DEGRADED | NO_DATA`) keeps minute worst-case severity.
+- `reasonsUnionInMinute` is the deterministic union of minute reasons (fixed reason order, deduplicated).
+- `warningsUnionInMinute` (optional) is the deterministic union of minute warnings (fixed warning order, deduplicated).

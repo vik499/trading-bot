@@ -1,13 +1,25 @@
-import type { GapTelemetry, PriceStaleTelemetry, RefPriceTelemetry } from '../MarketDataReadiness';
+import {
+  MARKET_DATA_DEGRADED_REASON_ORDER,
+  MARKET_DATA_WARNING_REASON_ORDER,
+  type GapTelemetry,
+  type MarketDataDegradedReason,
+  type MarketDataWarningReason,
+  type MarketReadinessStatus,
+  type PriceStaleTelemetry,
+  type RefPriceTelemetry,
+} from '../MarketDataReadiness';
 
 export type HealthMarketSnapshot = {
   symbol?: string;
   marketType?: string;
   status?: string;
+  worstStatusInMinute?: MarketReadinessStatus;
   conf?: number;
-  degradedReasons?: string[];
-  reasons?: string[];
-  warnings?: string[];
+  degradedReasons?: MarketDataDegradedReason[];
+  reasons?: MarketDataDegradedReason[];
+  reasonsUnionInMinute?: MarketDataDegradedReason[];
+  warnings?: MarketDataWarningReason[];
+  warningsUnionInMinute?: MarketDataWarningReason[];
   gapTelemetry?: GapTelemetry;
   priceStaleTelemetry?: PriceStaleTelemetry;
   refPriceTelemetry?: RefPriceTelemetry;
@@ -25,9 +37,10 @@ export type HealthMarketEntry = {
   minuteTs: number;
   symbol: string;
   marketType: string;
-  status?: string;
-  reasons: string[];
-  warnings: string[];
+  status?: MarketReadinessStatus;
+  worstStatusInMinute?: MarketReadinessStatus;
+  reasons: MarketDataDegradedReason[];
+  warnings: MarketDataWarningReason[];
   conf?: number;
   gapTelemetry?: GapTelemetry;
   priceStaleTelemetry?: PriceStaleTelemetry;
@@ -47,8 +60,8 @@ export function extractHealthMarketEntries(
       const marketType = m.marketType;
       if (!symbol || !marketType) continue;
       if (symbol !== filter.symbol || marketType !== filter.marketType) continue;
-      const reasons = normalizeStringArray(m.degradedReasons ?? m.reasons);
-      const warnings = normalizeStringArray(m.warnings);
+      const reasons = normalizeReasonArray(m.reasonsUnionInMinute ?? m.degradedReasons ?? m.reasons);
+      const warnings = normalizeWarningArray(m.warningsUnionInMinute ?? m.warnings);
       const conf = typeof m.conf === 'number' ? m.conf : undefined;
       const gapTelemetry = m.gapTelemetry;
       const priceStaleTelemetry = m.priceStaleTelemetry;
@@ -58,7 +71,8 @@ export function extractHealthMarketEntries(
         minuteTs: Math.floor(entry.ts / 60000) * 60000,
         symbol,
         marketType,
-        status: m.status,
+        status: normalizeStatus(m.status),
+        worstStatusInMinute: normalizeStatus(m.worstStatusInMinute),
         reasons,
         warnings,
         conf,
@@ -92,9 +106,9 @@ export type DegradedMinuteRow = {
   minuteTs: number;
   symbol: string;
   marketType: string;
-  status?: string;
-  reasons: string[];
-  warnings: string[];
+  status?: MarketReadinessStatus;
+  reasons: MarketDataDegradedReason[];
+  warnings: MarketDataWarningReason[];
   conf?: number;
   gapTelemetry?: GapTelemetry;
   priceStaleTelemetry?: PriceStaleTelemetry;
@@ -111,12 +125,13 @@ export function summarizeDegradedMinutes(entries: HealthMarketEntry[]): Degraded
   }
   const rows: DegradedMinuteRow[] = [];
   for (const entry of byMinute.values()) {
-    if (entry.status !== 'DEGRADED') continue;
+    const minuteStatus = entry.worstStatusInMinute ?? entry.status;
+    if (minuteStatus !== 'DEGRADED' && minuteStatus !== 'NO_DATA') continue;
     rows.push({
       minuteTs: entry.minuteTs,
       symbol: entry.symbol,
       marketType: entry.marketType,
-      status: entry.status,
+      status: minuteStatus,
       reasons: entry.reasons,
       warnings: entry.warnings,
       conf: entry.conf,
@@ -197,11 +212,34 @@ function pickMismatchTimestamp(entry: MismatchLogEntry): number | null {
   return null;
 }
 
-function normalizeStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  const out: string[] = [];
-  for (const item of value) {
-    if (typeof item === 'string') out.push(item);
+function normalizeStatus(value: unknown): MarketReadinessStatus | undefined {
+  if (value !== 'READY' && value !== 'WARMING' && value !== 'DEGRADED' && value !== 'NO_DATA') {
+    return undefined;
   }
-  return out;
+  return value;
 }
+
+function normalizeReasonArray(value: unknown): MarketDataDegradedReason[] {
+  if (!Array.isArray(value)) return [];
+  const reasonSet = new Set<MarketDataDegradedReason>();
+  for (const item of value) {
+    if (typeof item === 'string' && DEGRADED_REASON_SET.has(item as MarketDataDegradedReason)) {
+      reasonSet.add(item as MarketDataDegradedReason);
+    }
+  }
+  return MARKET_DATA_DEGRADED_REASON_ORDER.filter((reason) => reasonSet.has(reason));
+}
+
+function normalizeWarningArray(value: unknown): MarketDataWarningReason[] {
+  if (!Array.isArray(value)) return [];
+  const warningSet = new Set<MarketDataWarningReason>();
+  for (const item of value) {
+    if (typeof item === 'string' && WARNING_REASON_SET.has(item as MarketDataWarningReason)) {
+      warningSet.add(item as MarketDataWarningReason);
+    }
+  }
+  return MARKET_DATA_WARNING_REASON_ORDER.filter((warning) => warningSet.has(warning));
+}
+
+const DEGRADED_REASON_SET = new Set<MarketDataDegradedReason>(MARKET_DATA_DEGRADED_REASON_ORDER);
+const WARNING_REASON_SET = new Set<MarketDataWarningReason>(MARKET_DATA_WARNING_REASON_ORDER);

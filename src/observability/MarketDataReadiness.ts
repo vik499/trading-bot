@@ -149,13 +149,18 @@ export interface RefPriceTelemetry {
     mismatchBlocks?: ReadinessBlock[];
 }
 
+export type MarketReadinessStatus = 'READY' | 'WARMING' | 'DEGRADED' | 'NO_DATA';
+
 export interface MarketReadinessSnapshot {
     symbol: string;
     marketType: MarketType;
     status: 'READY' | 'WARMING' | 'DEGRADED';
     conf: number;
-    warnings: string[];
-    degradedReasons: string[];
+    warnings: MarketDataWarningReason[];
+    degradedReasons: MarketDataDegradedReason[];
+    worstStatusInMinute: MarketReadinessStatus;
+    reasonsUnionInMinute: MarketDataDegradedReason[];
+    warningsUnionInMinute?: MarketDataWarningReason[];
     gapTelemetry?: GapTelemetry;
     priceStaleTelemetry?: PriceStaleTelemetry;
     refPriceTelemetry?: RefPriceTelemetry;
@@ -165,22 +170,44 @@ export interface MarketReadinessSnapshot {
     lagPrEwma?: number;
 }
 
+interface MinuteRollupSnapshot {
+    worstStatusInMinute: MarketReadinessStatus;
+    reasonsUnionInMinute: MarketDataDegradedReason[];
+    warningsUnionInMinute?: MarketDataWarningReason[];
+}
+
+type MinuteRollupState = {
+    minuteTs: number;
+    worstStatusInMinute: MarketReadinessStatus;
+    reasons: Set<MarketDataDegradedReason>;
+    warnings: Set<MarketDataWarningReason>;
+};
+
 export function buildMarketReadinessSnapshot(
     payload: MarketDataStatusPayload,
     symbol: string,
     marketType: MarketType,
     gapTelemetry?: GapTelemetry,
     priceStaleTelemetry?: PriceStaleTelemetry,
-    refPriceTelemetry?: RefPriceTelemetry
+    refPriceTelemetry?: RefPriceTelemetry,
+    minuteRollup?: MinuteRollupSnapshot
 ): MarketReadinessSnapshot {
-    const readiness = payload.warmingUp ? 'WARMING' : payload.degraded ? 'DEGRADED' : 'READY';
+    const status = payload.warmingUp ? 'WARMING' : payload.degraded ? 'DEGRADED' : 'READY';
+    const degradedReasons = normalizeDegradedReasons(payload.degradedReasons);
+    const warnings = normalizeWarningReasons(payload.warnings ?? []);
+    const defaultWorstStatus: MarketReadinessStatus = degradedReasons.includes('NO_DATA') ? 'NO_DATA' : status;
+    const reasonsUnionInMinute = minuteRollup?.reasonsUnionInMinute ?? degradedReasons;
+    const warningsUnionInMinute = minuteRollup?.warningsUnionInMinute ?? warnings;
     return {
         symbol,
         marketType,
-        status: readiness,
+        status,
         conf: payload.overallConfidence,
-        warnings: capArray(payload.warnings ?? [], 20),
-        degradedReasons: capArray(payload.degradedReasons ?? [], 20),
+        warnings: capArray(warnings, 20),
+        degradedReasons: capArray(degradedReasons, 20),
+        worstStatusInMinute: minuteRollup?.worstStatusInMinute ?? defaultWorstStatus,
+        reasonsUnionInMinute: capArray(reasonsUnionInMinute, 20),
+        warningsUnionInMinute: warningsUnionInMinute.length ? capArray(warningsUnionInMinute, 20) : undefined,
         gapTelemetry,
         priceStaleTelemetry,
         refPriceTelemetry,
@@ -218,7 +245,7 @@ type GapEvidenceSample = {
     markers: GapTelemetryMarker[];
 };
 
-type Reason =
+export type MarketDataDegradedReason =
     | 'PRICE_STALE'
     | 'PRICE_LOW_CONF'
     | 'FLOW_LOW_CONF'
@@ -233,11 +260,14 @@ type Reason =
     | 'NO_REF_PRICE'
     | 'WS_DISCONNECTED';
 
-type WarningReason =
+export type MarketDataWarningReason =
     | 'TIMEBASE_QUALITY_WARN'
     | 'NON_MONOTONIC_TIMEBASE'
     | 'EXCHANGE_LAG_TOO_HIGH'
     | 'GAP_ATTRIBUTION_MISSING';
+
+type Reason = MarketDataDegradedReason;
+type WarningReason = MarketDataWarningReason;
 
 const DEFAULT_BUCKET_MS = 1_000;
 const DEFAULT_WARMUP_MS = 30 * 60_000;
@@ -288,6 +318,12 @@ const WARNING_ORDER: WarningReason[] = [
     'EXCHANGE_LAG_TOO_HIGH',
     'GAP_ATTRIBUTION_MISSING',
 ];
+
+export const MARKET_DATA_DEGRADED_REASON_ORDER: readonly MarketDataDegradedReason[] = REASON_ORDER;
+export const MARKET_DATA_WARNING_REASON_ORDER: readonly MarketDataWarningReason[] = WARNING_ORDER;
+
+const DEGRADED_REASON_SET = new Set<MarketDataDegradedReason>(MARKET_DATA_DEGRADED_REASON_ORDER);
+const WARNING_REASON_SET = new Set<MarketDataWarningReason>(MARKET_DATA_WARNING_REASON_ORDER);
 
 function capArray<T>(items: T[], limit: number): T[] {
     if (items.length <= limit) return items;
@@ -364,6 +400,7 @@ export class MarketDataReadiness {
 
     private readonly reasonSince = new Map<Reason, number>();
     private readonly warningSince = new Map<WarningReason, number>();
+    private readonly minuteRollupByKey = new Map<string, MinuteRollupState>();
 
     private lastSymbol?: string;
     private lastMarketType?: MarketType;
@@ -768,13 +805,15 @@ export class MarketDataReadiness {
         this.lastStatus = payload;
         const symbol = this.lastSymbol ?? 'UNKNOWN';
         const marketType = this.lastMarketType ?? 'unknown';
+        const minuteRollup = this.updateMinuteRollup(symbol, marketType, payload);
         this.lastHealthSnapshot = buildMarketReadinessSnapshot(
             payload,
             symbol,
             marketType,
             this.lastGapTelemetry,
             this.lastPriceStaleTelemetry,
-            this.lastRefPriceTelemetry
+            this.lastRefPriceTelemetry,
+            minuteRollup
         );
         this.bus.publish('system:market_data_status', payload);
         this.maybeLog(payload);
@@ -1187,11 +1226,11 @@ export class MarketDataReadiness {
     }
 
     private orderReasons(reasons: Set<Reason>): Reason[] {
-        return REASON_ORDER.filter((r) => reasons.has(r));
+        return orderDegradedReasons(reasons);
     }
 
     private orderWarnings(warnings: Set<WarningReason>): WarningReason[] {
-        return WARNING_ORDER.filter((w) => warnings.has(w));
+        return orderWarningReasons(warnings);
     }
 
     private stabilizeReasons(reasons: Set<Reason>, ts: number): Set<Reason> {
@@ -2029,6 +2068,52 @@ export class MarketDataReadiness {
             derivatives: normalized.derivatives / sum,
         };
     }
+
+    private updateMinuteRollup(
+        symbol: string,
+        marketType: MarketType,
+        payload: MarketDataStatusPayload
+    ): MinuteRollupSnapshot {
+        const minuteTs = Math.floor(payload.lastBucketTs / 60_000) * 60_000;
+        const key = `${symbol}:${marketType}`;
+        const reasons = normalizeDegradedReasons(payload.degradedReasons);
+        const warnings = normalizeWarningReasons(payload.warnings ?? []);
+        const instantStatus: MarketReadinessStatus = reasons.includes('NO_DATA')
+            ? 'NO_DATA'
+            : payload.warmingUp
+              ? 'WARMING'
+              : payload.degraded
+                ? 'DEGRADED'
+                : 'READY';
+
+        const current = this.minuteRollupByKey.get(key);
+        if (!current || current.minuteTs !== minuteTs) {
+            const next: MinuteRollupState = {
+                minuteTs,
+                worstStatusInMinute: instantStatus,
+                reasons: new Set(reasons),
+                warnings: new Set(warnings),
+            };
+            this.minuteRollupByKey.set(key, next);
+            return {
+                worstStatusInMinute: next.worstStatusInMinute,
+                reasonsUnionInMinute: orderDegradedReasons(next.reasons),
+                warningsUnionInMinute: orderWarningReasons(next.warnings),
+            };
+        }
+
+        if (readinessStatusPriority(instantStatus) > readinessStatusPriority(current.worstStatusInMinute)) {
+            current.worstStatusInMinute = instantStatus;
+        }
+        for (const reason of reasons) current.reasons.add(reason);
+        for (const warning of warnings) current.warnings.add(warning);
+
+        return {
+            worstStatusInMinute: current.worstStatusInMinute,
+            reasonsUnionInMinute: orderDegradedReasons(current.reasons),
+            warningsUnionInMinute: orderWarningReasons(current.warnings),
+        };
+    }
 }
 
 function isTargetMarketType(value: MarketType | undefined): value is 'spot' | 'futures' {
@@ -2042,4 +2127,49 @@ function readFlag(name: string, fallback: boolean): boolean {
     if (normalized === '0' || normalized === 'false' || normalized === 'off') return false;
     if (normalized === '1' || normalized === 'true' || normalized === 'on') return true;
     return fallback;
+}
+
+function isDegradedReason(value: string): value is MarketDataDegradedReason {
+    return DEGRADED_REASON_SET.has(value as MarketDataDegradedReason);
+}
+
+function isWarningReason(value: string): value is MarketDataWarningReason {
+    return WARNING_REASON_SET.has(value as MarketDataWarningReason);
+}
+
+function orderDegradedReasons(reasons: Iterable<MarketDataDegradedReason>): MarketDataDegradedReason[] {
+    const reasonSet = new Set(reasons);
+    return MARKET_DATA_DEGRADED_REASON_ORDER.filter((reason) => reasonSet.has(reason));
+}
+
+function orderWarningReasons(warnings: Iterable<MarketDataWarningReason>): MarketDataWarningReason[] {
+    const warningSet = new Set(warnings);
+    return MARKET_DATA_WARNING_REASON_ORDER.filter((warning) => warningSet.has(warning));
+}
+
+function normalizeDegradedReasons(reasons: readonly string[]): MarketDataDegradedReason[] {
+    const known = new Set<MarketDataDegradedReason>();
+    for (const reason of reasons) {
+        if (isDegradedReason(reason)) {
+            known.add(reason);
+        }
+    }
+    return orderDegradedReasons(known);
+}
+
+function normalizeWarningReasons(warnings: readonly string[]): MarketDataWarningReason[] {
+    const known = new Set<MarketDataWarningReason>();
+    for (const warning of warnings) {
+        if (isWarningReason(warning)) {
+            known.add(warning);
+        }
+    }
+    return orderWarningReasons(known);
+}
+
+function readinessStatusPriority(status: MarketReadinessStatus): number {
+    if (status === 'NO_DATA') return 4;
+    if (status === 'DEGRADED') return 3;
+    if (status === 'WARMING') return 2;
+    return 1;
 }
