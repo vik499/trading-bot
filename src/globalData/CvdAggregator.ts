@@ -24,13 +24,19 @@ export interface CvdMismatchPolicy {
     minScale: number;
     maxScale: number;
     signAgreementThreshold: number;
+    signHardThreshold: number;
     zThresh: number;
     zMax: number;
     ratioThresh: number;
     ratioMax: number;
+    dispersionHardZ: number;
+    dispersionHardRatio: number;
+    hardBuckets: number;
     penaltySign: number;
     penaltyDispersion: number;
 }
+
+const NONE_LOG_INTERVAL_MS = 10_000;
 
 export const DEFAULT_CVD_MISMATCH_POLICY: CvdMismatchPolicy = {
     ewmaAlpha: 0.2,
@@ -39,10 +45,14 @@ export const DEFAULT_CVD_MISMATCH_POLICY: CvdMismatchPolicy = {
     minScale: 0.25,
     maxScale: 4,
     signAgreementThreshold: 2 / 3,
+    signHardThreshold: 0.5,
     zThresh: 3,
     zMax: 6,
     ratioThresh: 4,
     ratioMax: 6,
+    dispersionHardZ: 4,
+    dispersionHardRatio: 6,
+    hardBuckets: 2,
     penaltySign: 0.5,
     penaltyDispersion: 0.85,
 };
@@ -78,7 +88,9 @@ export class CvdAggregator {
     private readonly debug: boolean;
     private readonly lastDebugBucketByKey = new Map<string, number>();
     private readonly lastMismatchBucketByKey = new Map<string, number>();
+    private readonly lastNoneLogTsByKey = new Map<string, number>();
     private readonly ewmaAbsByKey = new Map<string, Map<string, number>>();
+    private readonly hardMismatchStateByKey = new Map<string, HardMismatchState>();
     private unsubscribe?: () => void;
 
     constructor(bus: EventBus, options: CvdAggregatorOptions = {}) {
@@ -136,7 +148,7 @@ export class CvdAggregator {
             return;
         }
 
-        if (marketType === 'futures' && this.providerId === 'local_cvd_agg' && aggregate.mismatchDetected) {
+        if (marketType === 'futures' && this.providerId === 'local_cvd_agg') {
             this.logMismatchContext(symbol, marketType, evt.bucketStartTs, evt.bucketEndTs, aggregate);
         }
 
@@ -247,9 +259,11 @@ export class CvdAggregator {
             `${symbol}:${marketType}`,
             venueDeltaEntries,
             this.ewmaAbsByKey,
-            this.mismatchPolicy
+            this.mismatchPolicy,
+            this.hardMismatchStateByKey,
+            bucketStartTs
         );
-        const mismatchDetected = mismatchDetails.mismatchType !== 'NONE';
+        const mismatchDetected = mismatchDetails.mismatchDetected;
         const trust = getSourceTrustAdjustments(orderedSources, 'trade');
         const baseConfidence = computeConfidenceScore({
             freshSourcesCount: orderedSources.length,
@@ -360,6 +374,15 @@ export class CvdAggregator {
         if (lastBucket === bucketEndTs) return;
         this.lastMismatchBucketByKey.set(key, bucketEndTs);
 
+        if (aggregate.mismatchType === 'NONE') {
+            const noneKey = `${symbol}:${marketType}`;
+            const lastNoneTs = this.lastNoneLogTsByKey.get(noneKey);
+            if (lastNoneTs !== undefined && bucketEndTs - lastNoneTs < NONE_LOG_INTERVAL_MS) {
+                return;
+            }
+            this.lastNoneLogTsByKey.set(noneKey, bucketEndTs);
+        }
+
         const unitMultipliers = this.buildOverrideMap(this.unitMultipliers, aggregate.sourcesUsed);
         const signOverrides = this.buildOverrideMap(this.signOverrides, aggregate.sourcesUsed);
 
@@ -369,6 +392,8 @@ export class CvdAggregator {
                 marketType,
                 bucketStartTs,
                 bucketEndTs,
+                tsEvent: bucketEndTs,
+                runId: logger.getRunId(),
                 provider: this.providerId,
                 sourcesUsed: aggregate.sourcesUsed,
                 staleSourcesDropped: aggregate.staleSourcesDropped,
@@ -411,13 +436,37 @@ export interface CvdMismatchDetails {
     signAgreementRatio?: number | null;
 }
 
+interface HardMismatchState {
+    lastBucketTs?: number;
+    signStreak: number;
+    dispersionStreak: number;
+    lastDetected: boolean;
+}
+
 export function evaluateCvdMismatchV1(
     key: string,
     venueDeltas: Array<[string, number]>,
     ewmaAbsByKey: Map<string, Map<string, number>>,
-    policy: CvdMismatchPolicy
+    policy: CvdMismatchPolicy,
+    hardStateByKey: Map<string, HardMismatchState>,
+    bucketTs: number
 ): CvdMismatchDetails {
+    const hardState = hardStateByKey.get(key) ?? {
+        lastBucketTs: undefined,
+        signStreak: 0,
+        dispersionStreak: 0,
+        lastDetected: false,
+    };
+    const shouldUpdate = hardState.lastBucketTs !== bucketTs;
+
     if (venueDeltas.length < 2) {
+        if (shouldUpdate) {
+            hardState.lastBucketTs = bucketTs;
+            hardState.signStreak = 0;
+            hardState.dispersionStreak = 0;
+            hardState.lastDetected = false;
+            hardStateByKey.set(key, hardState);
+        }
         return { mismatchType: 'NONE', mismatchDetected: false, confidencePenalty: 1 };
     }
 
@@ -454,6 +503,13 @@ export function evaluateCvdMismatchV1(
         .filter((value) => Number.isFinite(value));
     const medianAbs = median(absScaledValues) ?? 0;
     if (medianAbs < policy.minAbsScaled) {
+        if (shouldUpdate) {
+            hardState.lastBucketTs = bucketTs;
+            hardState.signStreak = 0;
+            hardState.dispersionStreak = 0;
+            hardState.lastDetected = false;
+            hardStateByKey.set(key, hardState);
+        }
         return {
             mismatchType: 'NONE',
             mismatchDetected: false,
@@ -469,6 +525,13 @@ export function evaluateCvdMismatchV1(
         ([, value]) => Number.isFinite(value) && Math.abs(value) >= policy.minAbsScaled
     );
     if (signCandidates.length < 2) {
+        if (shouldUpdate) {
+            hardState.lastBucketTs = bucketTs;
+            hardState.signStreak = 0;
+            hardState.dispersionStreak = 0;
+            hardState.lastDetected = false;
+            hardStateByKey.set(key, hardState);
+        }
         return {
             mismatchType: 'NONE',
             mismatchDetected: false,
@@ -518,6 +581,22 @@ export function evaluateCvdMismatchV1(
         }
     }
 
+    const hardSign = mismatchType === 'SIGN' && signAgreementRatio !== null && signAgreementRatio <= policy.signHardThreshold;
+    const hardDispersion =
+        mismatchType === 'DISPERSION' &&
+        ((maxAbsZ >= policy.dispersionHardZ && policy.dispersionHardZ > 0) ||
+            (ratioToMedian >= policy.dispersionHardRatio && policy.dispersionHardRatio > 0));
+
+    if (shouldUpdate) {
+        hardState.lastBucketTs = bucketTs;
+        hardState.signStreak = hardSign ? hardState.signStreak + 1 : 0;
+        hardState.dispersionStreak = hardDispersion ? hardState.dispersionStreak + 1 : 0;
+        hardState.lastDetected =
+            (hardState.signStreak >= policy.hardBuckets && hardSign) ||
+            (hardState.dispersionStreak >= policy.hardBuckets && hardDispersion);
+        hardStateByKey.set(key, hardState);
+    }
+
     let dispersionSeverity = 0;
     if (absMedian >= policy.minAbsScaled) {
         if (maxAbsZ > 0 && policy.zMax > policy.zThresh) {
@@ -543,7 +622,7 @@ export function evaluateCvdMismatchV1(
     return {
         mismatchType,
         mismatchReason: mismatchType === 'NONE' ? undefined : mismatchType,
-        mismatchDetected: mismatchType !== 'NONE',
+        mismatchDetected: hardState.lastDetected,
         confidencePenalty,
         scaleFactors,
         scaledVenueBreakdown,
@@ -580,10 +659,14 @@ function resolveCvdMismatchPolicy(overrides: Partial<CvdMismatchPolicy> = {}): C
     assignEnv('minScale', 'BOT_CVD_MISMATCH_MIN_SCALE');
     assignEnv('maxScale', 'BOT_CVD_MISMATCH_MAX_SCALE');
     assignEnv('signAgreementThreshold', 'BOT_CVD_MISMATCH_SIGN_AGREEMENT_THRESHOLD');
+    assignEnv('signHardThreshold', 'BOT_CVD_MISMATCH_SIGN_HARD_THRESHOLD');
     assignEnv('zThresh', 'BOT_CVD_MISMATCH_Z_THRESH');
     assignEnv('zMax', 'BOT_CVD_MISMATCH_Z_MAX');
     assignEnv('ratioThresh', 'BOT_CVD_MISMATCH_RATIO_THRESH');
     assignEnv('ratioMax', 'BOT_CVD_MISMATCH_RATIO_MAX');
+    assignEnv('dispersionHardZ', 'BOT_CVD_MISMATCH_DISPERSION_HARD_Z');
+    assignEnv('dispersionHardRatio', 'BOT_CVD_MISMATCH_DISPERSION_HARD_RATIO');
+    assignEnv('hardBuckets', 'BOT_CVD_MISMATCH_HARD_BUCKETS');
     assignEnv('penaltySign', 'BOT_CVD_MISMATCH_PENALTY_SIGN');
     assignEnv('penaltyDispersion', 'BOT_CVD_MISMATCH_PENALTY_DISPERSION');
 
@@ -601,10 +684,14 @@ function resolveCvdMismatchPolicy(overrides: Partial<CvdMismatchPolicy> = {}): C
         minScale: Math.max(0.01, merged.minScale),
         maxScale: Math.max(merged.maxScale, merged.minScale),
         signAgreementThreshold: clamp(merged.signAgreementThreshold, 0.5, 1),
+        signHardThreshold: clamp(merged.signHardThreshold, 0, 1),
         zThresh: Math.max(0, merged.zThresh),
         zMax: Math.max(merged.zMax, merged.zThresh),
         ratioThresh: Math.max(1, merged.ratioThresh),
         ratioMax: Math.max(merged.ratioMax, merged.ratioThresh),
+        dispersionHardZ: Math.max(0, merged.dispersionHardZ),
+        dispersionHardRatio: Math.max(1, merged.dispersionHardRatio),
+        hardBuckets: Math.max(1, Math.floor(merged.hardBuckets)),
         penaltySign: clamp01(merged.penaltySign),
         penaltyDispersion: clamp01(merged.penaltyDispersion),
     };
