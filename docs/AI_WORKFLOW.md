@@ -21,6 +21,13 @@ AI must learn from previous attempts inside this repository.
 
 ---
 
+## 1.1) Operational Guardrails
+
+- Codex must not run `npm run dev`, live bot modes, or network-connected validation workflows.
+- This applies to Codex-run validation only; runtime networking is user-executed.
+
+---
+
 ## 2) Mandatory Testing Loop
 
 For any non-trivial change, AI must follow this cycle:

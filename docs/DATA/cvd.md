@@ -19,6 +19,13 @@ The pipeline is additive across venues and deterministic for replay.
 - Bucket boundaries use `event.meta.ts` (no `Date.now`).
 - Aggregation drops stale sources using `BOT_CVD_TTL_MS` (fallback: `BOT_GLOBAL_TTL_MS`).
 
+## Mismatch detection (CVD)
+- Per-venue scale calibration uses EWMA of absolute bucket deltas.
+- `mismatchType`: `NONE` | `SIGN` | `DISPERSION` (observation only).
+- `mismatchDetected`: HARD sustained divergence (policy-driven thresholds + window), not every mismatchType.
+- `signAgreementRatio` is reported when enough non-zero venues exist; near-zero buckets suppress mismatch.
+- Thresholds and penalties are policy-driven (CvdMismatchPolicy defaults, env/config overrides).
+
 ## Payload notes
 Raw bucket (`market:cvd_*`) fields:
 - `bucketStartTs`, `bucketEndTs`, `cvdDelta`, `cvdTotal`, `streamId`, `marketType`.

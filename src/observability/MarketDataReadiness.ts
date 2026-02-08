@@ -79,6 +79,76 @@ export interface MarketDataReadinessOptions {
     marketStatusJson?: boolean;
 }
 
+export type GapTelemetryMarker =
+    | 'onGap'
+    | 'onSequenceGap'
+    | 'detectTickerQuality'
+    | 'detectOrderbookQuality'
+    | 'detectOiQuality'
+    | 'detectFundingQuality';
+
+export interface GapTelemetryMarkers {
+    onGap: number;
+    onSequenceGap: number;
+    detectTickerQuality: number;
+    detectOrderbookQuality: number;
+    detectOiQuality: number;
+    detectFundingQuality: number;
+}
+
+export interface InputGapStats {
+    samples: number;
+    maxMs: number | null;
+    p95Ms: number | null;
+    overThresholdCount: number | null;
+    seqGapCount: number | null;
+}
+
+export interface GapTelemetry {
+    markersCountBySource: GapTelemetryMarkers;
+    markersTop: Array<{ marker: GapTelemetryMarker; count: number }>;
+    inputGapStats: InputGapStats;
+}
+
+export interface PriceStaleTelemetry {
+    bucketTs: number;
+    priceTsEvent?: number;
+    priceBucketTs?: number;
+    bucketDeltaMs?: number;
+    ageMs?: number;
+    staleMs?: number;
+    priceTypeUsed?: MarketPriceCanonicalEvent['priceTypeUsed'];
+    fallbackReason?: MarketPriceCanonicalEvent['fallbackReason'];
+    sourcesUsed?: string[];
+    staleSourcesDropped?: string[];
+    freshSourcesCount?: number;
+}
+
+export interface RefPriceTelemetry {
+    bucketTs: number;
+    hasPriceEvent: boolean;
+    priceTsEvent?: number;
+    priceBucketTs?: number;
+    bucketDeltaMs?: number;
+    ageMs?: number;
+    staleMs?: number;
+    priceBucketMatch: boolean;
+    priceConfidence?: number;
+    criticalThreshold?: number;
+    priceTypeUsed?: MarketPriceCanonicalEvent['priceTypeUsed'];
+    fallbackReason?: MarketPriceCanonicalEvent['fallbackReason'];
+    sourcesUsed?: string[];
+    staleSourcesDropped?: string[];
+    sourceCounts?: {
+        expected?: number;
+        used: number;
+        staleDropped: number;
+        missing?: number;
+    };
+    suppressionReasons?: Record<string, number>;
+    mismatchBlocks?: ReadinessBlock[];
+}
+
 export interface MarketReadinessSnapshot {
     symbol: string;
     marketType: MarketType;
@@ -86,10 +156,39 @@ export interface MarketReadinessSnapshot {
     conf: number;
     warnings: string[];
     degradedReasons: string[];
+    gapTelemetry?: GapTelemetry;
+    priceStaleTelemetry?: PriceStaleTelemetry;
+    refPriceTelemetry?: RefPriceTelemetry;
     lagExP95?: number;
     lagExEwma?: number;
     lagPrP95?: number;
     lagPrEwma?: number;
+}
+
+export function buildMarketReadinessSnapshot(
+    payload: MarketDataStatusPayload,
+    symbol: string,
+    marketType: MarketType,
+    gapTelemetry?: GapTelemetry,
+    priceStaleTelemetry?: PriceStaleTelemetry,
+    refPriceTelemetry?: RefPriceTelemetry
+): MarketReadinessSnapshot {
+    const readiness = payload.warmingUp ? 'WARMING' : payload.degraded ? 'DEGRADED' : 'READY';
+    return {
+        symbol,
+        marketType,
+        status: readiness,
+        conf: payload.overallConfidence,
+        warnings: capArray(payload.warnings ?? [], 20),
+        degradedReasons: capArray(payload.degradedReasons ?? [], 20),
+        gapTelemetry,
+        priceStaleTelemetry,
+        refPriceTelemetry,
+        lagExP95: payload.exchangeLagP95Ms,
+        lagExEwma: payload.exchangeLagEwmaMs,
+        lagPrP95: payload.processingLagP95Ms,
+        lagPrEwma: payload.processingLagEwmaMs,
+    };
 }
 
 type AggregatedWithMeta = {
@@ -100,6 +199,23 @@ type AggregatedWithMeta = {
     sourcesUsed?: string[];
     staleSourcesDropped?: string[];
     mismatchDetected?: boolean;
+};
+
+type GapEvidenceSample = {
+    tsEvent: number;
+    kind: 'TIME_GAP' | 'SEQ_GAP';
+    topic:
+        | 'market:ticker'
+        | 'market:kline'
+        | 'market:trade'
+        | 'market:orderbook_l2_snapshot'
+        | 'market:orderbook_l2_delta'
+        | 'market:oi'
+        | 'market:funding';
+    gapMs?: number;
+    prevSeq?: number;
+    currSeq?: number;
+    markers: GapTelemetryMarker[];
 };
 
 type Reason =
@@ -117,7 +233,11 @@ type Reason =
     | 'NO_REF_PRICE'
     | 'WS_DISCONNECTED';
 
-type WarningReason = 'TIMEBASE_QUALITY_WARN' | 'NON_MONOTONIC_TIMEBASE' | 'EXCHANGE_LAG_TOO_HIGH';
+type WarningReason =
+    | 'TIMEBASE_QUALITY_WARN'
+    | 'NON_MONOTONIC_TIMEBASE'
+    | 'EXCHANGE_LAG_TOO_HIGH'
+    | 'GAP_ATTRIBUTION_MISSING';
 
 const DEFAULT_BUCKET_MS = 1_000;
 const DEFAULT_WARMUP_MS = 30 * 60_000;
@@ -128,6 +248,12 @@ const DEFAULT_LAG_WINDOW_MS = 30_000;
 const DEFAULT_LAG_THRESHOLD_MS = 2_000;
 const DEFAULT_LAG_EWMA_ALPHA = 0.2;
 const DEFAULT_TIMEBASE_PENALTY_WINDOW_MS = 10_000;
+const GAP_TELEMETRY_INTERVAL_MS = 10_000;
+const GAP_TELEMETRY_WINDOW_MS = 60_000;
+const GAP_TELEMETRY_SAMPLE_LIMIT = 200;
+const GAP_MS_THRESHOLD_DEFAULT = 5_000;
+const GAP_MS_THRESHOLD_OI = 120_000;
+const GAP_MS_THRESHOLD_FUNDING = 300_000;
 const EXCHANGE_LAG_MAX_EVENT_AGE_MS = 10 * 60 * 1000;
 const CRITICAL_BLOCK_THRESHOLD = 0.55;
 const OVERALL_THRESHOLD = 0.65;
@@ -156,11 +282,27 @@ const REASON_ORDER: Reason[] = [
     'NO_REF_PRICE',
 ];
 
-const WARNING_ORDER: WarningReason[] = ['TIMEBASE_QUALITY_WARN', 'NON_MONOTONIC_TIMEBASE', 'EXCHANGE_LAG_TOO_HIGH'];
+const WARNING_ORDER: WarningReason[] = [
+    'TIMEBASE_QUALITY_WARN',
+    'NON_MONOTONIC_TIMEBASE',
+    'EXCHANGE_LAG_TOO_HIGH',
+    'GAP_ATTRIBUTION_MISSING',
+];
 
 function capArray<T>(items: T[], limit: number): T[] {
     if (items.length <= limit) return items;
     return items.slice(0, limit);
+}
+
+function percentile(values: number[], p: number): number {
+    if (!values.length) return NaN;
+    const sorted = [...values].sort((a, b) => a - b);
+    const index = (sorted.length - 1) * p;
+    const low = Math.floor(index);
+    const high = Math.ceil(index);
+    if (low === high) return sorted[low];
+    const weight = index - low;
+    return sorted[low] + (sorted[high] - sorted[low]) * weight;
 }
 
 export class MarketDataReadiness {
@@ -206,6 +348,9 @@ export class MarketDataReadiness {
     private readonly timebaseIssueByBlock = new Map<ReadinessBlock, number>();
     private readonly lastTimeOutOfOrderByBlock = new Map<ReadinessBlock, DataTimeOutOfOrder>();
     private readonly lastSequenceIssueByBlock = new Map<ReadinessBlock, DataSequenceGapOrOutOfOrder>();
+    private readonly lastGapEventByKey = new Map<string, DataGapDetected>();
+    private readonly lastSeqEventByKey = new Map<string, DataSequenceGapOrOutOfOrder>();
+    private readonly gapSamplesByKey = new Map<string, GapEvidenceSample[]>();
 
     private readonly dataConfidenceByTopic = new Map<string, DataConfidence>();
 
@@ -226,11 +371,16 @@ export class MarketDataReadiness {
     private firstBucketTs?: number;
     private lastBucketTs?: number;
     private lastStatus?: MarketDataStatusPayload;
+    private lastHealthSnapshot?: MarketReadinessSnapshot;
+    private lastGapTelemetry?: GapTelemetry;
+    private lastPriceStaleTelemetry?: PriceStaleTelemetry;
+    private lastRefPriceTelemetry?: RefPriceTelemetry;
     private lastSnapshot?: SourceRegistrySnapshot;
     private lastLogTs?: number;
     private lastLogSignature?: string;
     private readonly lastFlowDebugByKey = new Map<string, number>();
     private readonly lastNoRefPriceDebugByKey = new Map<string, number>();
+    private readonly lastGapTelemetryByKey = new Map<string, number>();
     private readonly missingExpectedLogged = new Set<string>();
 
     private wsDegraded = false;
@@ -372,23 +522,19 @@ export class MarketDataReadiness {
     }
 
     getHealthSnapshot(): MarketReadinessSnapshot | undefined {
+        if (this.lastHealthSnapshot) return this.lastHealthSnapshot;
         const status = this.lastStatus;
         if (!status) return undefined;
         const symbol = this.lastSymbol ?? 'UNKNOWN';
         const marketType = this.lastMarketType ?? 'unknown';
-        const readiness = status.warmingUp ? 'WARMING' : status.degraded ? 'DEGRADED' : 'READY';
-        return {
+        return buildMarketReadinessSnapshot(
+            status,
             symbol,
             marketType,
-            status: readiness,
-            conf: status.overallConfidence,
-            warnings: capArray(status.warnings ?? [], 20),
-            degradedReasons: capArray(status.degradedReasons ?? [], 20),
-            lagExP95: status.exchangeLagP95Ms,
-            lagExEwma: status.exchangeLagEwmaMs,
-            lagPrP95: status.processingLagP95Ms,
-            lagPrEwma: status.processingLagEwmaMs,
-        };
+            this.lastGapTelemetry,
+            this.lastPriceStaleTelemetry,
+            this.lastRefPriceTelemetry
+        );
     }
 
     seedExpectedSources(input: { symbol: string; marketType: MarketType }): void {
@@ -437,6 +583,24 @@ export class MarketDataReadiness {
     private onGap(evt: DataGapDetected): void {
         const block = this.mapTopicToBlock(evt.topic);
         if (!block) return;
+        const marketType = normalizeMarketType(inferMarketTypeFromStreamId(evt.streamId));
+        const key = this.gapEventKey(block, evt.symbol, marketType);
+        this.lastGapEventByKey.set(key, evt);
+        const telemetryKey = this.gapTelemetryKey(evt.symbol, marketType);
+        const markers = this.buildGapMarkers('TIME_GAP', evt.topic);
+        const gapMs =
+            typeof evt.deltaMs === 'number'
+                ? evt.deltaMs
+                : evt.prevTsExchange !== undefined && evt.currTsExchange !== undefined
+                  ? evt.currTsExchange - evt.prevTsExchange
+                  : undefined;
+        this.recordGapSample(telemetryKey, {
+            tsEvent: evt.meta.tsEvent,
+            kind: 'TIME_GAP',
+            topic: evt.topic,
+            gapMs,
+            markers,
+        });
         this.gapByBlock.set(block, true);
         if (this.gapDebug) {
             this.logGapDebug('data:gapDetected', evt, block);
@@ -446,6 +610,19 @@ export class MarketDataReadiness {
     private onSequenceGap(evt: DataSequenceGapOrOutOfOrder): void {
         const block = this.mapTopicToBlock(evt.topic);
         if (!block) return;
+        const marketType = normalizeMarketType(inferMarketTypeFromStreamId(evt.streamId));
+        const key = this.gapEventKey(block, evt.symbol, marketType);
+        this.lastSeqEventByKey.set(key, evt);
+        const telemetryKey = this.gapTelemetryKey(evt.symbol, marketType);
+        const markers = this.buildGapMarkers('SEQ_GAP', evt.topic);
+        this.recordGapSample(telemetryKey, {
+            tsEvent: evt.meta.tsEvent,
+            kind: 'SEQ_GAP',
+            topic: evt.topic,
+            prevSeq: evt.prevSeq,
+            currSeq: evt.currSeq,
+            markers,
+        });
         this.gapByBlock.set(block, true);
         this.lastSequenceIssueByBlock.set(block, evt);
         if (this.gapDebug) {
@@ -589,6 +766,16 @@ export class MarketDataReadiness {
         }
         const payload = this.buildStatus(bucketTs);
         this.lastStatus = payload;
+        const symbol = this.lastSymbol ?? 'UNKNOWN';
+        const marketType = this.lastMarketType ?? 'unknown';
+        this.lastHealthSnapshot = buildMarketReadinessSnapshot(
+            payload,
+            symbol,
+            marketType,
+            this.lastGapTelemetry,
+            this.lastPriceStaleTelemetry,
+            this.lastRefPriceTelemetry
+        );
         this.bus.publish('system:market_data_status', payload);
         this.maybeLog(payload);
         this.resetFlags();
@@ -612,8 +799,17 @@ export class MarketDataReadiness {
         const rawUnexpectedSources = seenRawSources.filter((source) => !expectedRawSet.has(source));
         const activeSourcesAgg = aggUsedSources.length;
         const activeSourcesRaw = rawUsedSources.length;
-        const { degradedReasons, warnings, exchangeLagP95Ms, exchangeLagEwmaMs, processingLagP95Ms, processingLagEwmaMs } =
-            this.computeDegradedReasons(
+        const {
+            degradedReasons,
+            warnings,
+            gapTelemetry,
+            priceStaleTelemetry,
+            refPriceTelemetry,
+            exchangeLagP95Ms,
+            exchangeLagEwmaMs,
+            processingLagP95Ms,
+            processingLagEwmaMs,
+        } = this.computeDegradedReasons(
             blockConfidence,
             overallConfidence,
             activeSourcesAgg,
@@ -622,6 +818,9 @@ export class MarketDataReadiness {
             snapshot,
             bucketTs
         );
+        this.lastGapTelemetry = gapTelemetry;
+        this.lastPriceStaleTelemetry = priceStaleTelemetry;
+        this.lastRefPriceTelemetry = refPriceTelemetry;
         const degraded = degradedReasons.length > 0;
         const warmingWindowMs = this.warmingWindowMs;
         const startTs = this.firstBucketTs ?? bucketTs;
@@ -725,6 +924,9 @@ export class MarketDataReadiness {
     ): {
         degradedReasons: Reason[];
         warnings: WarningReason[];
+        gapTelemetry?: GapTelemetry;
+        priceStaleTelemetry?: PriceStaleTelemetry;
+        refPriceTelemetry?: RefPriceTelemetry;
         exchangeLagP95Ms?: number;
         exchangeLagEwmaMs?: number;
         processingLagP95Ms?: number;
@@ -824,7 +1026,25 @@ export class MarketDataReadiness {
         ) {
             reasons.add('LAG_TOO_HIGH');
         }
-        if (Array.from(this.gapByBlock.values()).some(Boolean)) reasons.add('GAPS_DETECTED');
+        const hasGap = Array.from(this.gapByBlock.values()).some(Boolean);
+        let gapTelemetry: GapTelemetry | undefined;
+        if (hasGap) {
+            reasons.add('GAPS_DETECTED');
+            gapTelemetry = this.buildGapTelemetry(snapshot, bucketTs);
+            const markers = gapTelemetry.markersCountBySource;
+            const hasMarker =
+                markers.onGap > 0 ||
+                markers.onSequenceGap > 0 ||
+                markers.detectTickerQuality > 0 ||
+                markers.detectOrderbookQuality > 0 ||
+                markers.detectOiQuality > 0 ||
+                markers.detectFundingQuality > 0;
+            const gapOver = gapTelemetry.inputGapStats.overThresholdCount ?? 0;
+            if (!hasMarker && gapOver <= 0) {
+                warnings.add('GAP_ATTRIBUTION_MISSING');
+            }
+            this.maybeLogGapTelemetry(snapshot, bucketTs);
+        }
 
         const hasMismatch = Array.from(this.mismatchByBlock.values()).some(Boolean);
         const priceValid = priceBucketMatch && this.confidenceValue(priceEvt?.confidenceScore) >= this.thresholds.criticalBlock;
@@ -849,10 +1069,19 @@ export class MarketDataReadiness {
 
         const stableReasons = this.stabilizeReasons(reasons, bucketTs);
         const stableWarnings = this.stabilizeWarnings(warnings, bucketTs);
+        const priceStaleTelemetry = stableReasons.has('PRICE_STALE')
+            ? this.buildPriceStaleTelemetry(priceEvt, bucketTs)
+            : undefined;
+        const refPriceTelemetry = stableReasons.has('NO_REF_PRICE')
+            ? this.buildRefPriceTelemetry(snapshot, priceEvt, bucketTs, priceBucketMatch)
+            : undefined;
 
         return {
             degradedReasons: this.orderReasons(stableReasons),
             warnings: this.orderWarnings(stableWarnings),
+            gapTelemetry,
+            priceStaleTelemetry,
+            refPriceTelemetry,
             exchangeLagP95Ms: exchangeLagStats.p95,
             exchangeLagEwmaMs: exchangeLagStats.ewma,
             processingLagP95Ms: processingLagStats.p95,
@@ -1493,6 +1722,226 @@ export class MarketDataReadiness {
                 kind: seq.kind,
             })}`
         );
+    }
+
+    private gapEventKey(block: ReadinessBlock, symbol: string, marketType: MarketType): string {
+        return `${block}:${symbol}:${marketType}`;
+    }
+
+    private gapTelemetryKey(symbol: string, marketType: MarketType): string {
+        return `${symbol}:${marketType}`;
+    }
+
+    private buildGapMarkers(kind: GapEvidenceSample['kind'], topic: GapEvidenceSample['topic']): GapTelemetryMarker[] {
+        const markers: GapTelemetryMarker[] = [];
+        markers.push(kind === 'TIME_GAP' ? 'onGap' : 'onSequenceGap');
+        if (topic === 'market:ticker') markers.push('detectTickerQuality');
+        if (topic === 'market:orderbook_l2_snapshot' || topic === 'market:orderbook_l2_delta') {
+            markers.push('detectOrderbookQuality');
+        }
+        if (topic === 'market:oi') markers.push('detectOiQuality');
+        if (topic === 'market:funding') markers.push('detectFundingQuality');
+        return markers;
+    }
+
+    private recordGapSample(key: string, sample: GapEvidenceSample): void {
+        const nowTs = this.now();
+        const list = this.gapSamplesByKey.get(key) ?? [];
+        list.push(sample);
+        const cutoff = nowTs - GAP_TELEMETRY_WINDOW_MS;
+        const filtered = list.filter((entry) => entry.tsEvent >= cutoff);
+        if (filtered.length > GAP_TELEMETRY_SAMPLE_LIMIT) {
+            filtered.splice(0, filtered.length - GAP_TELEMETRY_SAMPLE_LIMIT);
+        }
+        this.gapSamplesByKey.set(key, filtered);
+    }
+
+    private gapThresholdForTopic(topic: GapEvidenceSample['topic']): number {
+        if (topic === 'market:oi') return GAP_MS_THRESHOLD_OI;
+        if (topic === 'market:funding') return GAP_MS_THRESHOLD_FUNDING;
+        return GAP_MS_THRESHOLD_DEFAULT;
+    }
+
+    private buildGapTelemetry(snapshot: SourceRegistrySnapshot, bucketTs: number): GapTelemetry {
+        const key = `${snapshot.symbol}:${snapshot.marketType}`;
+        const windowStart = bucketTs - GAP_TELEMETRY_WINDOW_MS;
+        const samples = (this.gapSamplesByKey.get(key) ?? []).filter((entry) => entry.tsEvent >= windowStart);
+
+        const markers: GapTelemetryMarkers = {
+            onGap: 0,
+            onSequenceGap: 0,
+            detectTickerQuality: 0,
+            detectOrderbookQuality: 0,
+            detectOiQuality: 0,
+            detectFundingQuality: 0,
+        };
+
+        const gapMsValues: number[] = [];
+        const gapMsThresholdHits: number[] = [];
+        const seqDeltas: number[] = [];
+        const samplesCount = samples.length;
+
+        for (const entry of samples) {
+            for (const marker of entry.markers) {
+                markers[marker] += 1;
+            }
+
+            if (entry.kind === 'TIME_GAP') {
+                const gapMs = entry.gapMs;
+                if (typeof gapMs === 'number' && Number.isFinite(gapMs)) {
+                    gapMsValues.push(gapMs);
+                    if (gapMs >= this.gapThresholdForTopic(entry.topic)) {
+                        gapMsThresholdHits.push(gapMs);
+                    }
+                }
+            }
+            if (entry.kind === 'SEQ_GAP' && entry.prevSeq !== undefined && entry.currSeq !== undefined) {
+                seqDeltas.push(Math.abs(entry.currSeq - entry.prevSeq));
+            }
+        }
+
+        const markersTop = (Object.entries(markers) as Array<[GapTelemetryMarker, number]>)
+            .filter(([, count]) => count > 0)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 3)
+            .map(([marker, count]) => ({ marker, count }));
+
+        const inputGapStats: InputGapStats = {
+            samples: samplesCount,
+            maxMs: gapMsValues.length ? Math.max(...gapMsValues) : null,
+            p95Ms: gapMsValues.length ? percentile(gapMsValues, 0.95) : null,
+            overThresholdCount: gapMsValues.length ? gapMsThresholdHits.length : null,
+            seqGapCount: seqDeltas.length ? seqDeltas.length : null,
+        };
+
+        return { markersCountBySource: markers, markersTop, inputGapStats };
+    }
+
+    private buildPriceStaleTelemetry(priceEvt: AggregatedWithMeta | undefined, bucketTs: number): PriceStaleTelemetry {
+        const price = priceEvt as MarketPriceCanonicalEvent | undefined;
+        const priceTsEvent = priceEvt?.meta.tsEvent;
+        const priceBucketTs = priceTsEvent !== undefined ? this.bucketEndTs(priceTsEvent) : undefined;
+        const bucketDeltaMs = priceBucketTs !== undefined ? bucketTs - priceBucketTs : undefined;
+        const ageMs = priceTsEvent !== undefined ? Math.max(0, bucketTs - priceTsEvent) : undefined;
+        return {
+            bucketTs,
+            priceTsEvent,
+            priceBucketTs,
+            bucketDeltaMs,
+            ageMs,
+            staleMs: this.bucketMs,
+            priceTypeUsed: price?.priceTypeUsed,
+            fallbackReason: price?.fallbackReason,
+            sourcesUsed: price?.sourcesUsed,
+            staleSourcesDropped: price?.staleSourcesDropped,
+            freshSourcesCount: price?.freshSourcesCount,
+        };
+    }
+
+    private buildRefPriceTelemetry(
+        snapshot: SourceRegistrySnapshot,
+        priceEvt: AggregatedWithMeta | undefined,
+        bucketTs: number,
+        priceBucketMatch: boolean
+    ): RefPriceTelemetry {
+        const price = priceEvt as MarketPriceCanonicalEvent | undefined;
+        const priceTsEvent = priceEvt?.meta.tsEvent;
+        const priceBucketTs = priceTsEvent !== undefined ? this.bucketEndTs(priceTsEvent) : undefined;
+        const bucketDeltaMs = priceBucketTs !== undefined ? bucketTs - priceBucketTs : undefined;
+        const ageMs = priceTsEvent !== undefined ? Math.max(0, bucketTs - priceTsEvent) : undefined;
+        const mismatchBlocks = Array.from(this.mismatchByBlock.entries())
+            .filter(([, value]) => value)
+            .map(([block]) => block)
+            .sort();
+        const suppression = snapshot.suppressions.price;
+        const suppressionReasons = suppression.count ? suppression.reasons : undefined;
+        const sourcesUsed = price?.sourcesUsed ?? [];
+        const staleSourcesDropped = price?.staleSourcesDropped ?? [];
+        const expectedCount = snapshot.expected.price.length;
+        const expected = expectedCount > 0 ? expectedCount : undefined;
+        const used = sourcesUsed.length;
+        const staleDropped = staleSourcesDropped.length;
+        const missing = expected !== undefined ? Math.max(0, expected - used) : undefined;
+        return {
+            bucketTs,
+            hasPriceEvent: Boolean(priceEvt),
+            priceTsEvent,
+            priceBucketTs,
+            bucketDeltaMs,
+            ageMs,
+            staleMs: this.bucketMs,
+            priceBucketMatch,
+            priceConfidence: this.confidenceValue(priceEvt?.confidenceScore),
+            criticalThreshold: this.thresholds.criticalBlock,
+            priceTypeUsed: price?.priceTypeUsed,
+            fallbackReason: price?.fallbackReason,
+            sourcesUsed: sourcesUsed.length ? sourcesUsed : undefined,
+            staleSourcesDropped: staleSourcesDropped.length ? staleSourcesDropped : undefined,
+            sourceCounts: {
+                expected,
+                used,
+                staleDropped,
+                missing,
+            },
+            suppressionReasons,
+            mismatchBlocks: mismatchBlocks.length ? mismatchBlocks : undefined,
+        };
+    }
+
+    private maybeLogGapTelemetry(snapshot: SourceRegistrySnapshot, bucketTs: number): void {
+        const nowTs = this.now();
+        if (!Number.isFinite(nowTs)) return;
+        const key = `${snapshot.symbol}:${snapshot.marketType}`;
+        const lastLogged = this.lastGapTelemetryByKey.get(key);
+        if (lastLogged !== undefined && nowTs - lastLogged < GAP_TELEMETRY_INTERVAL_MS) return;
+
+        const candidates: Array<{
+            kind: 'TIME_GAP' | 'SEQ_GAP';
+            ts: number;
+            evt: DataGapDetected | DataSequenceGapOrOutOfOrder;
+        }> = [];
+
+        for (const [block, hasGap] of this.gapByBlock.entries()) {
+            if (!hasGap) continue;
+            const eventKey = this.gapEventKey(block, snapshot.symbol, snapshot.marketType);
+            const timeEvt = this.lastGapEventByKey.get(eventKey);
+            if (timeEvt) {
+                candidates.push({ kind: 'TIME_GAP', ts: timeEvt.meta.tsEvent ?? bucketTs, evt: timeEvt });
+            }
+            const seqEvt = this.lastSeqEventByKey.get(eventKey);
+            if (seqEvt) {
+                candidates.push({ kind: 'SEQ_GAP', ts: seqEvt.meta.tsEvent ?? bucketTs, evt: seqEvt });
+            }
+        }
+
+        if (!candidates.length) return;
+        candidates.sort((a, b) => b.ts - a.ts);
+        const chosen = candidates[0];
+        const runId = logger.getRunId() ?? process.env.BOT_RUN_ID;
+        const payload: Record<string, unknown> = {
+            runId,
+            ts: bucketTs,
+            symbol: snapshot.symbol,
+            marketType: snapshot.marketType,
+            gapKind: chosen.kind,
+            stream: chosen.evt.streamId,
+        };
+
+        if (chosen.kind === 'TIME_GAP') {
+            const gapEvt = chosen.evt as DataGapDetected;
+            let gapMs = gapEvt.deltaMs;
+            if (gapMs === undefined && gapEvt.prevTsExchange !== undefined && gapEvt.currTsExchange !== undefined) {
+                gapMs = gapEvt.currTsExchange - gapEvt.prevTsExchange;
+            }
+            if (gapMs !== undefined) payload.gapMs = gapMs;
+        } else {
+            const seqEvt = chosen.evt as DataSequenceGapOrOutOfOrder;
+            payload.seqPrev = seqEvt.prevSeq;
+            payload.seqNow = seqEvt.currSeq;
+        }
+
+        logger.info(`[GapTelemetry] ${JSON.stringify(payload)}`);
+        this.lastGapTelemetryByKey.set(key, nowTs);
     }
 
     private mapTopicToBlock(topic: string): ReadinessBlock | undefined {

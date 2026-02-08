@@ -66,6 +66,12 @@ Rules:
 - Spot and futures are emitted separately.
 - USD normalization must be explicit via `unit`.
 - For aggregated CVD, `venueBreakdown` reflects normalized totals (after per-source unit/sign normalization when configured).
+- Aggregated CVD may include mismatch diagnostics:
+  - `mismatchType`: `NONE` | `SIGN` | `DISPERSION`
+  - `mismatchReason`: `SIGN` | `DISPERSION`
+  - `signAgreementRatio` (number | null)
+  - `scaleFactors` / `scaledVenueBreakdown` (per-venue scaling diagnostics)
+ - `mismatchDetected` is reserved for HARD sustained divergence (policy-driven), not every mismatchType.
 
 ## Liquidations
 
@@ -155,3 +161,8 @@ Rules:
 - Exchange/transport lag (tsIngest - tsEvent) must never degrade readiness; it is surfaced as warning `EXCHANGE_LAG_TOO_HIGH` only.
 - Exchange lag stats ignore events older than 10 minutes to avoid backfill contaminating lag warnings.
 - Lag stats are expressed in milliseconds.
+
+Health snapshots (`logs/health.jsonl`) may include optional telemetry when reasons are present:
+- `gapTelemetry` (GAPS_DETECTED attribution: markers + input gap stats)
+- `priceStaleTelemetry` (PRICE_STALE attribution: age/bucket + sources)
+- `refPriceTelemetry` (NO_REF_PRICE attribution: price validity + source/suppression summary)

@@ -7,6 +7,13 @@ Documentation is part of the system state.
 
 ---
 
+## 0) Execution boundaries
+
+- Codex must not run `npm run dev`, live bot modes, or network-connected validation workflows.
+- These constraints apply to Codex execution only (not to user-run runtime services).
+
+---
+
 ## 1) When AI MUST update documentation
 
 AI must update documentation when:
