@@ -19,6 +19,11 @@ AI must follow:
 
 If any document conflicts with `CANON.md`, `CANON.md` wins.
 
+### 0.1 Codex execution constraints
+- These constraints apply to Codex execution only.
+- Runtime networking is allowed when the user runs the platform.
+- Codex must not run `npm run dev`, live bot modes, or networked validation workflows.
+
 ---
 
 ## 1) Reality: Exchange Access Is Not Stable

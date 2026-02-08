@@ -4,7 +4,8 @@
 
 - `AGENTS.md` lives in the repository root (./AGENTS.md), not under `/docs`.
 - If any instruction conflicts, **`docs/CANON.md` wins** (project constitution / конституция проекта).
-- This file + `docs/DOCS_INDEX.md` are the **single source of truth (единый источник истины)** for AI agent (ИИ-агент) rules and reading order (порядок чтения).
+- `docs/DOCS_INDEX.md` is the authoritative source for reading order (LEVEL 0–5).
+- This file defines operational AI-agent rules and must not override `docs/CANON.md`.
 
 ## Repository Structure Sanity Check (проверка структуры репозитория)
 
@@ -40,44 +41,14 @@ You MUST:
 - prefer robust, production-grade patterns over simplistic code
 
 However:
-- Do NOT run network calls
-- Do NOT depend on live external services
+- For Codex execution only: do NOT run live/dev/network validation workflows.
+- Runtime networking (WebSocket/REST) is allowed and expected when the user runs the platform.
 - All conclusions must still compile and pass local tests
 
 ## 0) Mandatory reading order (обязательный порядок чтения)
 
-Before making any changes, read in this order:
-
-LEVEL 0:
-1. `docs/SYSTEM_OVERVIEW.md`
-2. `docs/CANON.md`
-
-LEVEL 1:
-3. `docs/AI_ENVIRONMENT_CANON.md`
-4. `docs/DECISIONS.md`
-
-LEVEL 2:
-5. `docs/DATA/event-topics-map.md`
-
-LEVEL 3:
-6. `docs/DATA/data-contracts.md`
-7. `docs/DATA/normalization-policy.md`
-8. `docs/DATA/market-data-ingestion.md`
-
-LEVEL 4:
-9. `docs/DATA/global-data-plan.md`
-10. `docs/DATA/cvd.md`
-11. `docs/DATA/liquidity.md`
-12. `docs/DATA/liquidations.md`
-13. `docs/DATA/open-interest.md`
-
-LEVEL 5:
-14. `docs/AI_START_HERE.md`
-15. `docs/AI_WORKFLOW.md`
-16. `docs/CONTRIBUTING_AI.md`
-17. `AGENTS.md` (repo root)
-
-No code edits before completing this reading.
+Before making any changes, follow the LEVEL 0–5 reading order in `docs/DOCS_INDEX.md`.
+No code edits before completing this reading gate.
 
 ### Supplemental (non-authoritative)
 - `docs/AI_COMMON_ERRORS.md` — quick “do not do” checklist; does not override CANON/DOCS_INDEX.
