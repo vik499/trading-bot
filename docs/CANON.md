@@ -242,3 +242,36 @@ It must NOT include:
 	•	phase plans
 Those live in ROADMAP.md.
 If roadmap conflicts with Canon, Canon wins.
+
+10) Trading & Decision Canon (Non-Negotiable)
+
+10.1 Market ≠ Chart
+	•	Рынок — это процесс потоков и ликвидности, а не визуальный паттерн.
+	•	Свечи — производная, не первоисточник.
+
+10.2 Decisions are probabilistic
+	•	Любое решение — ставка с распределением исходов.
+	•	Одиночный результат не валидирует и не опровергает систему.
+
+10.3 Regime-first law
+	•	Любая стратегия валидна только внутри режима рынка.
+	•	Универсальных стратегий не существует.
+
+10.4 Edge must survive costs
+	•	Любое преимущество считается после комиссий, спреда и проскальзывания.
+	•	Если edge исчезает после costs → его нет.
+
+10.5 Risk defines the business
+	•	Risk Plane определяет, существует ли система как бизнес.
+	•	Стратегия не имеет права “пробивать” риск-контур.
+
+10.6 Good decision ≠ profitable outcome
+	•	Хорошее решение может закончиться убытком.
+	•	Плохое решение может закончиться прибылью.
+	•	Оценка идёт по decision quality, не по PnL.
+
+10.7 Capital is a load test
+	•	Деньги — не источник интеллекта.
+	•	Деньги — нагрузка на систему.
+
+“Progress evaluation is defined in DEFINITION_OF_SUCCESS.md.”

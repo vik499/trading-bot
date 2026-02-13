@@ -7,31 +7,33 @@ This index is the authoritative map of docs and their locations.
 LEVEL 0:
 1. `docs/SYSTEM_OVERVIEW.md`
 2. `docs/CANON.md`
+3. `docs/DEFINITION_OF_SUCCESS.md`
 
 LEVEL 1:
-3. `docs/AI_ENVIRONMENT_CANON.md`
-4. `docs/DECISIONS.md`
+4. `docs/AI_ENVIRONMENT_CANON.md`
+5. `docs/DECISIONS.md`
 
 LEVEL 2:
-5. `docs/DATA/event-topics-map.md`
+6. `docs/DATA/event-topics-map.md`
 
 LEVEL 3:
-6. `docs/DATA/data-contracts.md`
-7. `docs/DATA/normalization-policy.md`
-8. `docs/DATA/market-data-ingestion.md`
+7. `docs/DATA/data-contracts.md`
+8. `docs/DATA/normalization-policy.md`
+9. `docs/DATA/market-data-ingestion.md`
 
 LEVEL 4:
-9. `docs/DATA/global-data-plan.md`
-10. `docs/DATA/cvd.md`
-11. `docs/DATA/liquidity.md`
-12. `docs/DATA/liquidations.md`
-13. `docs/DATA/open-interest.md`
+10. `docs/DATA/global-data-plan.md`
+11. `docs/DATA/cvd.md`
+12. `docs/DATA/liquidity.md`
+13. `docs/DATA/liquidations.md`
+14. `docs/DATA/open-interest.md`
+15. `docs/DATA/market-data-degradation-policy.md`
 
 LEVEL 5:
-14. `docs/AI_START_HERE.md`
-15. `docs/AI_WORKFLOW.md`
-16. `docs/CONTRIBUTING_AI.md`
-17. `AGENTS.md` (repo root)
+16. `docs/AI_START_HERE.md`
+17. `docs/AI_WORKFLOW.md`
+18. `docs/CONTRIBUTING_AI.md`
+19. `AGENTS.md` (repo root)
 
 ## Deprecated/nonexistent references
 
@@ -50,3 +52,4 @@ The following files are **not** part of this repository and must not be referenc
 ## Supplemental references (non-authoritative)
 
 - `docs/AI_COMMON_ERRORS.md` — quick “do not do” checklist; does not override CANON/DOCS_INDEX.
+- `docs/RUNBOOK_PHASE0.md` — Phase 0 run checklist and runId bundle workflow.
