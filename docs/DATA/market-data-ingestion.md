@@ -86,6 +86,7 @@ Topics:
 
 **Bybit orderbook**
 - Use `u/seq` monotonicity.
+- `u=1` means reset/snapshot boundary: reset local sequence baseline and continue (not a gap by itself).
 - If `sequence` gap -> emit `market:resync_requested` (`reason=gap`).
 
 **OKX books**
@@ -110,6 +111,10 @@ Topics:
 Readiness:
 - до получения валидных данных статус остаётся `degraded` или `warmingUp`
 - на первых валидных payloads (raw/agg) -> восстановление в `ready`
+
+Нормативная связь с деградацией:
+- `GAPS_DETECTED` допускается только при connector-confirmed (подтверждённое коннектором) нарушении venue-native sequencing (биржевая нативная последовательность), которое привело к `market:resync_requested`.
+- `data:sequence_gap_or_out_of_order` — диагностический/debug (отладочный) сигнал и не может сам по себе быть HARD-trigger (жёсткий триггер) для деградации.
 
 ### Book valid criteria
 - Snapshot получен и принят.

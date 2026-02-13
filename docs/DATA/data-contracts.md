@@ -165,7 +165,42 @@ Rules:
 Health snapshots (`logs/health.jsonl`) may include optional telemetry when reasons are present:
 - `gapTelemetry` (GAPS_DETECTED attribution: markers + input gap stats)
 - `priceStaleTelemetry` (PRICE_STALE attribution: age/bucket + sources)
-- `refPriceTelemetry` (NO_REF_PRICE attribution: price validity + source/suppression summary)
+- `refPriceTelemetry` (NO_VALID_REF_PRICE attribution: price validity + source/suppression summary)
+- `sourceCoverage` (truth-loop attribution, emitted in every snapshot):
+  - `expected[price|flow|liquidity|derivatives]`
+  - `active[price|flow|liquidity|derivatives]`
+  - `missing[price|flow|liquidity|derivatives]`
+  - `unexpected[price|flow|liquidity|derivatives]`
+  - `coverageRatio[price|flow|liquidity|derivatives]` (`1` when expected is empty)
+  - `expectedTotal[price|flow|liquidity|derivatives]`
+  - `activeTotal[price|flow|liquidity|derivatives]`
+  - `unexpectedTotal[price|flow|liquidity|derivatives]`
+  - note: `expectedTotal=0` is a ratio convention only; configuration correctness is governed separately by `EXPECTED_SOURCES_MISSING_CONFIG` (HARD-fast).
+- `timebase` (truth-loop timebase integrity, warning-only in Phase 0):
+  - `nowTs` / `windowMs`
+  - `byBlock[price|flow|liquidity|derivatives]` with optional stats:
+    - `samples`, `ageMsP50`, `ageMsP95`, `ageMsMax`
+    - `futureEventCount`, `futureEventMaxSkewMs`
+    - `nonMonotonicCount`, `lastEventTs`
+  - `warnings[]` deterministic sorted union of:
+    - `TIMEBASE_FUTURE_EVENT`
+    - `TIMEBASE_NON_MONOTONIC`
+    - `TIMEBASE_AGE_TOO_HIGH`
+    - `TIMEBASE_DRIFT_SUSPECTED` (reserved/optional)
 - `worstStatusInMinute` (`READY | WARMING | DEGRADED | NO_DATA`) keeps minute worst-case severity.
 - `reasonsUnionInMinute` is the deterministic union of minute reasons (fixed reason order, deduplicated).
 - `warningsUnionInMinute` (optional) is the deterministic union of minute warnings (fixed warning order, deduplicated).
+
+### Phase 0 reason semantics (normative)
+
+- `PRICE_STALE` is emitted **iff** `priceStaleTelemetry.ageMs >= priceStaleTelemetry.staleMs`.
+- Bucket alignment (выравнивание бакета) mismatch (`bucketCloseTs` / expected bucket boundary mismatch) is warning-only (только предупреждение): emit `PRICE_BUCKET_MISMATCH`; do not emit `PRICE_STALE` solely from bucket mismatch.
+- `NO_VALID_REF_PRICE` is the canonical degradation reason (replaces `NO_REF_PRICE`, deprecated (устаревшее) label).
+- `NO_VALID_REF_PRICE` may be emitted only if at least one condition is true:
+  - `refPriceTelemetry.hasPriceEvent == false`
+  - `refPriceTelemetry.ageMs >= refPriceTelemetry.staleMs`
+  - `refPriceTelemetry.confidence < critical threshold`
+  - `refPriceTelemetry.sourcesUsed` is empty
+  - all candidate sources are suppressed/dropped
+- In Phase 0, if `hasPriceEvent == true` and `ageMs < staleMs` and `confidence >= critical threshold`, degradation must not be emitted.
+- `GAPS_DETECTED` may be emitted only after connector-confirmed (подтверждённый коннектором) venue-native continuity failure that triggers `market:resync_requested`; debug (отладочный) topic `data:sequence_gap_or_out_of_order` is non-authoritative for degradation.
