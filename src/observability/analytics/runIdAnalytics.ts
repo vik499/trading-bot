@@ -15,11 +15,11 @@ export type HealthMarketSnapshot = {
   status?: string;
   worstStatusInMinute?: MarketReadinessStatus;
   conf?: number;
-  degradedReasons?: MarketDataDegradedReason[];
-  reasons?: MarketDataDegradedReason[];
-  reasonsUnionInMinute?: MarketDataDegradedReason[];
-  warnings?: MarketDataWarningReason[];
-  warningsUnionInMinute?: MarketDataWarningReason[];
+  degradedReasons?: string[];
+  reasons?: string[];
+  reasonsUnionInMinute?: string[];
+  warnings?: string[];
+  warningsUnionInMinute?: string[];
   gapTelemetry?: GapTelemetry;
   priceStaleTelemetry?: PriceStaleTelemetry;
   refPriceTelemetry?: RefPriceTelemetry;
@@ -137,7 +137,7 @@ export function summarizeDegradedMinutes(entries: HealthMarketEntry[]): Degraded
       conf: entry.conf,
       gapTelemetry: entry.reasons.includes('GAPS_DETECTED') ? entry.gapTelemetry : undefined,
       priceStaleTelemetry: entry.reasons.includes('PRICE_STALE') ? entry.priceStaleTelemetry : undefined,
-      refPriceTelemetry: entry.reasons.includes('NO_REF_PRICE') ? entry.refPriceTelemetry : undefined,
+      refPriceTelemetry: entry.reasons.includes('NO_VALID_REF_PRICE') ? entry.refPriceTelemetry : undefined,
     });
   }
   return rows.sort((a, b) => a.minuteTs - b.minuteTs);
@@ -223,11 +223,18 @@ function normalizeReasonArray(value: unknown): MarketDataDegradedReason[] {
   if (!Array.isArray(value)) return [];
   const reasonSet = new Set<MarketDataDegradedReason>();
   for (const item of value) {
-    if (typeof item === 'string' && DEGRADED_REASON_SET.has(item as MarketDataDegradedReason)) {
-      reasonSet.add(item as MarketDataDegradedReason);
-    }
+    const normalized = normalizeReasonValue(item);
+    if (normalized !== undefined) reasonSet.add(normalized);
   }
   return MARKET_DATA_DEGRADED_REASON_ORDER.filter((reason) => reasonSet.has(reason));
+}
+
+function normalizeReasonValue(value: unknown): MarketDataDegradedReason | undefined {
+  if (value === 'NO_REF_PRICE') return 'NO_VALID_REF_PRICE';
+  if (typeof value === 'string' && DEGRADED_REASON_SET.has(value as MarketDataDegradedReason)) {
+    return value as MarketDataDegradedReason;
+  }
+  return undefined;
 }
 
 function normalizeWarningArray(value: unknown): MarketDataWarningReason[] {

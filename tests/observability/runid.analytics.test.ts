@@ -32,6 +32,37 @@ describe('runId analytics helpers', () => {
     expect(warningCounts.EXCHANGE_LAG_TOO_HIGH).toBe(1);
   });
 
+  it('normalizes legacy NO_REF_PRICE to NO_VALID_REF_PRICE in analytics outputs', () => {
+    const refPriceTelemetry: RefPriceTelemetry = {
+      bucketTs: 60_000,
+      hasPriceEvent: false,
+      priceBucketMatch: false,
+      sourceCounts: { used: 0, staleDropped: 1 },
+    };
+    const logs: HealthLogEntry[] = [
+      {
+        ts: 60_000,
+        market: [
+          {
+            symbol: 'BTCUSDT',
+            marketType: 'futures',
+            status: 'DEGRADED',
+            degradedReasons: ['NO_REF_PRICE'],
+            refPriceTelemetry,
+          },
+        ],
+      },
+    ];
+
+    const entries = extractHealthMarketEntries(logs, { symbol: 'BTCUSDT', marketType: 'futures' });
+    const rows = summarizeDegradedMinutes(entries);
+
+    expect(entries[0]?.reasons).toEqual(['NO_VALID_REF_PRICE']);
+    expect(entries[0]?.reasons).not.toContain('NO_REF_PRICE');
+    expect(rows[0]?.reasons).toEqual(['NO_VALID_REF_PRICE']);
+    expect(rows[0]?.refPriceTelemetry).toBeTruthy();
+  });
+
   it('computes hardPct and softPct per minute for mismatch logs', () => {
     const entries: MismatchLogEntry[] = [
       { tsEvent: 60_000, mismatchDetected: false, mismatchType: 'SIGN' },
@@ -107,7 +138,7 @@ describe('runId analytics helpers', () => {
             symbol: 'BTCUSDT',
             marketType: 'futures',
             status: 'DEGRADED',
-            degradedReasons: ['PRICE_STALE', 'NO_REF_PRICE'],
+            degradedReasons: ['PRICE_STALE', 'NO_VALID_REF_PRICE'],
             priceStaleTelemetry,
             refPriceTelemetry,
           },

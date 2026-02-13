@@ -62,7 +62,7 @@ describe('MarketDataReadiness price telemetry', () => {
     readiness.stop();
   });
 
-  it('attaches refPriceTelemetry when NO_REF_PRICE is emitted', () => {
+  it('attaches refPriceTelemetry when NO_VALID_REF_PRICE is emitted', () => {
     const bus = createTestEventBus();
     const readiness = new MarketDataReadiness(bus, {
       bucketMs: 1000,
@@ -117,7 +117,7 @@ describe('MarketDataReadiness price telemetry', () => {
     bus.publish('market:cvd_futures_agg', flow);
 
     const snapshot = readiness.getHealthSnapshot();
-    expect(snapshot?.degradedReasons).toContain('NO_REF_PRICE');
+    expect(snapshot?.degradedReasons).toContain('NO_VALID_REF_PRICE');
     expect(snapshot?.refPriceTelemetry?.hasPriceEvent).toBe(true);
     expect(snapshot?.refPriceTelemetry?.priceBucketMatch).toBe(false);
     expect(snapshot?.refPriceTelemetry?.sourceCounts?.used).toBe(1);
@@ -171,9 +171,61 @@ describe('MarketDataReadiness price telemetry', () => {
 
     const snapshot = readiness.getHealthSnapshot();
     expect(snapshot?.degradedReasons).not.toContain('PRICE_STALE');
-    expect(snapshot?.degradedReasons).not.toContain('NO_REF_PRICE');
+    expect(snapshot?.degradedReasons).not.toContain('NO_VALID_REF_PRICE');
     expect(snapshot?.priceStaleTelemetry).toBeUndefined();
     expect(snapshot?.refPriceTelemetry).toBeUndefined();
+
+    readiness.stop();
+  });
+
+  it('emits PRICE_BUCKET_MISMATCH warning without PRICE_STALE when age is fresh', () => {
+    const bus = createTestEventBus();
+    const readiness = new MarketDataReadiness(bus, {
+      bucketMs: 1000,
+      warmingWindowMs: 0,
+      startupGraceWindowMs: 0,
+      readinessStabilityWindowMs: 0,
+      expectedFlowTypes: ['futures'],
+      expectedDerivativeKinds: [],
+    });
+
+    readiness.start();
+
+    const price: MarketPriceCanonicalEvent = {
+      symbol: 'BTCUSDT',
+      ts: 1017,
+      marketType: 'futures',
+      indexPrice: 50000,
+      priceTypeUsed: 'index',
+      sourcesUsed: ['binance.usdm.public'],
+      freshSourcesCount: 1,
+      mismatchDetected: false,
+      confidenceScore: 0.95,
+      meta: createMeta('global_data', { tsEvent: 1017, tsIngest: 1017 }),
+    };
+
+    const flow: MarketCvdAggEvent = {
+      symbol: 'BTCUSDT',
+      ts: 2500,
+      cvd: 10,
+      cvdDelta: 1,
+      marketType: 'futures',
+      bucketStartTs: 2000,
+      bucketEndTs: 3000,
+      bucketSizeMs: 1000,
+      sourcesUsed: ['binance.usdm.public'],
+      mismatchDetected: false,
+      confidenceScore: 0.95,
+      meta: createMeta('global_data', { tsEvent: 2500, tsIngest: 2500 }),
+    };
+
+    bus.publish('market:price_canonical', price);
+    bus.publish('market:cvd_futures_agg', flow);
+
+    const snapshot = readiness.getHealthSnapshot();
+    expect(snapshot?.degradedReasons).not.toContain('PRICE_STALE');
+    expect(snapshot?.degradedReasons).not.toContain('NO_VALID_REF_PRICE');
+    expect(snapshot?.warnings).toContain('PRICE_BUCKET_MISMATCH');
 
     readiness.stop();
   });

@@ -60,6 +60,11 @@ export interface MarketDataReadinessOptions {
     confidenceStaleWindowMs?: number;
     derivativesStaleWindowMs?: number;
     readinessStabilityWindowMs?: number;
+    hardReasonEnterWindowMs?: number;
+    hardReasonExitWindowMs?: number;
+    hardFastReasonEnterWindowMs?: number;
+    softReasonEnterWindowMs?: number;
+    softReasonExitWindowMs?: number;
     lagWindowMs?: number;
     lagThresholdMs?: number;
     lagEwmaAlpha?: number;
@@ -149,6 +154,41 @@ export interface RefPriceTelemetry {
     mismatchBlocks?: ReadinessBlock[];
 }
 
+export interface SourceCoverageSnapshot {
+    expected: Record<ReadinessBlock, string[]>;
+    active: Record<ReadinessBlock, string[]>;
+    missing: Record<ReadinessBlock, string[]>;
+    unexpected: Record<ReadinessBlock, string[]>;
+    coverageRatio: Record<ReadinessBlock, number>;
+    expectedTotal: Record<ReadinessBlock, number>;
+    activeTotal: Record<ReadinessBlock, number>;
+    unexpectedTotal: Record<ReadinessBlock, number>;
+}
+
+export type TimebaseWarningReason =
+    | 'TIMEBASE_AGE_TOO_HIGH'
+    | 'TIMEBASE_FUTURE_EVENT'
+    | 'TIMEBASE_NON_MONOTONIC'
+    | 'TIMEBASE_DRIFT_SUSPECTED';
+
+export interface TimebaseBlockIntegrity {
+    ageMsP50?: number;
+    ageMsP95?: number;
+    ageMsMax?: number;
+    samples?: number;
+    futureEventCount?: number;
+    futureEventMaxSkewMs?: number;
+    nonMonotonicCount?: number;
+    lastEventTs?: number;
+}
+
+export interface TimebaseIntegritySnapshot {
+    nowTs: number;
+    windowMs: number;
+    byBlock: Record<ReadinessBlock, TimebaseBlockIntegrity>;
+    warnings: TimebaseWarningReason[];
+}
+
 export type MarketReadinessStatus = 'READY' | 'WARMING' | 'DEGRADED' | 'NO_DATA';
 
 export interface MarketReadinessSnapshot {
@@ -164,6 +204,8 @@ export interface MarketReadinessSnapshot {
     gapTelemetry?: GapTelemetry;
     priceStaleTelemetry?: PriceStaleTelemetry;
     refPriceTelemetry?: RefPriceTelemetry;
+    sourceCoverage?: SourceCoverageSnapshot;
+    timebase?: TimebaseIntegritySnapshot;
     lagExP95?: number;
     lagExEwma?: number;
     lagPrP95?: number;
@@ -190,14 +232,22 @@ export function buildMarketReadinessSnapshot(
     gapTelemetry?: GapTelemetry,
     priceStaleTelemetry?: PriceStaleTelemetry,
     refPriceTelemetry?: RefPriceTelemetry,
+    sourceCoverage?: SourceCoverageSnapshot,
+    timebase?: TimebaseIntegritySnapshot,
     minuteRollup?: MinuteRollupSnapshot
 ): MarketReadinessSnapshot {
     const status = payload.warmingUp ? 'WARMING' : payload.degraded ? 'DEGRADED' : 'READY';
     const degradedReasons = normalizeDegradedReasons(payload.degradedReasons);
     const warnings = normalizeWarningReasons(payload.warnings ?? []);
     const defaultWorstStatus: MarketReadinessStatus = degradedReasons.includes('NO_DATA') ? 'NO_DATA' : status;
-    const reasonsUnionInMinute = minuteRollup?.reasonsUnionInMinute ?? degradedReasons;
-    const warningsUnionInMinute = minuteRollup?.warningsUnionInMinute ?? warnings;
+    const reasonsUnionInMinute =
+        minuteRollup?.reasonsUnionInMinute !== undefined
+            ? normalizeDegradedReasons(minuteRollup.reasonsUnionInMinute)
+            : degradedReasons;
+    const warningsUnionInMinute =
+        minuteRollup?.warningsUnionInMinute !== undefined
+            ? normalizeWarningReasons(minuteRollup.warningsUnionInMinute)
+            : warnings;
     return {
         symbol,
         marketType,
@@ -211,6 +261,8 @@ export function buildMarketReadinessSnapshot(
         gapTelemetry,
         priceStaleTelemetry,
         refPriceTelemetry,
+        sourceCoverage,
+        timebase,
         lagExP95: payload.exchangeLagP95Ms,
         lagExEwma: payload.exchangeLagEwmaMs,
         lagPrP95: payload.processingLagP95Ms,
@@ -245,6 +297,12 @@ type GapEvidenceSample = {
     markers: GapTelemetryMarker[];
 };
 
+type TimebaseBlockState = {
+    samples: Array<{ ts: number; ageMs: number; futureSkewMs?: number }>;
+    nonMonotonicTs: number[];
+    lastEventTs?: number;
+};
+
 export type MarketDataDegradedReason =
     | 'PRICE_STALE'
     | 'PRICE_LOW_CONF'
@@ -257,30 +315,50 @@ export type MarketDataDegradedReason =
     | 'GAPS_DETECTED'
     | 'MISMATCH_DETECTED'
     | 'EXPECTED_SOURCES_MISSING_CONFIG'
-    | 'NO_REF_PRICE'
+    | 'NO_VALID_REF_PRICE'
     | 'WS_DISCONNECTED';
 
 export type MarketDataWarningReason =
     | 'TIMEBASE_QUALITY_WARN'
     | 'NON_MONOTONIC_TIMEBASE'
     | 'EXCHANGE_LAG_TOO_HIGH'
+    | 'PRICE_BUCKET_MISMATCH'
     | 'GAP_ATTRIBUTION_MISSING';
 
 type Reason = MarketDataDegradedReason;
 type WarningReason = MarketDataWarningReason;
+type ReasonSeverity = 'HARD' | 'SOFT';
+type InternalStatusPayload = MarketDataStatusPayload & {
+    rawDegradedReasons: Reason[];
+    rawWarnings: WarningReason[];
+};
+
+const HARD_FAST_REASONS: readonly Reason[] = ['NO_DATA', 'WS_DISCONNECTED', 'EXPECTED_SOURCES_MISSING_CONFIG'];
+const HARD_SUSTAINED_REASONS: readonly Reason[] = ['GAPS_DETECTED', 'PRICE_STALE', 'NO_VALID_REF_PRICE'];
+const HARD_FAST_REASON_SET = new Set<Reason>(HARD_FAST_REASONS);
+const HARD_SUSTAINED_REASON_SET = new Set<Reason>(HARD_SUSTAINED_REASONS);
 
 const DEFAULT_BUCKET_MS = 1_000;
 const DEFAULT_WARMUP_MS = 30 * 60_000;
 const DEFAULT_LOG_INTERVAL_MS = 10_000;
 const DEFAULT_WS_RECOVERY_WINDOW_MS = 15_000;
 const DEFAULT_STABILITY_WINDOW_MS = 10_000;
+const DEFAULT_HARD_FAST_ENTER_MS = 1_000;
+const DEFAULT_HARD_ENTER_MS = 5_000;
+const DEFAULT_HARD_EXIT_MS = 12_000;
+const DEFAULT_SOFT_ENTER_MS = 15_000;
+const DEFAULT_SOFT_EXIT_MS = 5_000;
 const DEFAULT_LAG_WINDOW_MS = 30_000;
 const DEFAULT_LAG_THRESHOLD_MS = 2_000;
 const DEFAULT_LAG_EWMA_ALPHA = 0.2;
 const DEFAULT_TIMEBASE_PENALTY_WINDOW_MS = 10_000;
+const DEFAULT_TIMEBASE_WINDOW_MS = 60_000;
+const FUTURE_TOLERANCE_MS = 2_000;
+const AGE_WARN_P95_MS = 10 * 60_000;
 const GAP_TELEMETRY_INTERVAL_MS = 10_000;
 const GAP_TELEMETRY_WINDOW_MS = 60_000;
 const GAP_TELEMETRY_SAMPLE_LIMIT = 200;
+const TIMEBASE_SAMPLE_LIMIT = 200;
 const GAP_MS_THRESHOLD_DEFAULT = 5_000;
 const GAP_MS_THRESHOLD_OI = 120_000;
 const GAP_MS_THRESHOLD_FUNDING = 300_000;
@@ -288,6 +366,7 @@ const EXCHANGE_LAG_MAX_EVENT_AGE_MS = 10 * 60 * 1000;
 const CRITICAL_BLOCK_THRESHOLD = 0.55;
 const OVERALL_THRESHOLD = 0.65;
 const TIMEBASE_CONFIDENCE_PENALTY = 0.9;
+const READINESS_BUCKET_LABEL_TOLERANCE_MS = 1;
 
 const WEIGHTS: Record<ReadinessBlock, number> = {
     price: 0.35,
@@ -309,13 +388,14 @@ const REASON_ORDER: Reason[] = [
     'LAG_TOO_HIGH',
     'GAPS_DETECTED',
     'MISMATCH_DETECTED',
-    'NO_REF_PRICE',
+    'NO_VALID_REF_PRICE',
 ];
 
 const WARNING_ORDER: WarningReason[] = [
     'TIMEBASE_QUALITY_WARN',
     'NON_MONOTONIC_TIMEBASE',
     'EXCHANGE_LAG_TOO_HIGH',
+    'PRICE_BUCKET_MISMATCH',
     'GAP_ATTRIBUTION_MISSING',
 ];
 
@@ -324,6 +404,7 @@ export const MARKET_DATA_WARNING_REASON_ORDER: readonly MarketDataWarningReason[
 
 const DEGRADED_REASON_SET = new Set<MarketDataDegradedReason>(MARKET_DATA_DEGRADED_REASON_ORDER);
 const WARNING_REASON_SET = new Set<MarketDataWarningReason>(MARKET_DATA_WARNING_REASON_ORDER);
+const SOURCE_COVERAGE_BLOCKS: ReadinessBlock[] = ['price', 'flow', 'liquidity', 'derivatives'];
 
 function capArray<T>(items: T[], limit: number): T[] {
     if (items.length <= limit) return items;
@@ -339,6 +420,15 @@ function percentile(values: number[], p: number): number {
     if (low === high) return sorted[low];
     const weight = index - low;
     return sorted[low] + (sorted[high] - sorted[low]) * weight;
+}
+
+export function bucketLabelTsForReadiness(ts: number, bucketMs: number): number {
+    const safeBucketMs = Math.max(1, bucketMs);
+    const safeTs = Math.max(0, ts);
+    // bucketCloseTs is end-exclusive; shift by (tolerance + 1) to keep exact-boundary
+    // timestamps and +1ms jitter in the same just-closed readiness bucket label.
+    const shiftedTs = Math.max(0, safeTs - (READINESS_BUCKET_LABEL_TOLERANCE_MS + 1));
+    return bucketCloseTs(shiftedTs, safeBucketMs);
 }
 
 export class MarketDataReadiness {
@@ -359,10 +449,16 @@ export class MarketDataReadiness {
     private readonly confidenceStaleWindowMs: number;
     private readonly derivativesStaleWindowMs: number;
     private readonly readinessStabilityWindowMs: number;
+    private readonly hardReasonEnterWindowMs: number;
+    private readonly hardReasonExitWindowMs: number;
+    private readonly hardFastReasonEnterWindowMs: number;
+    private readonly softReasonEnterWindowMs: number;
+    private readonly softReasonExitWindowMs: number;
     private readonly lagWindowMs: number;
     private readonly lagThresholdMs: number;
     private readonly lagEwmaAlpha: number;
     private readonly timebasePenaltyWindowMs: number;
+    private readonly timebaseWindowMs: number;
     private readonly thresholds: { criticalBlock: number; overall: number };
     private readonly weights: Record<ReadinessBlock, number>;
     private readonly criticalBlocks: Set<ReadinessBlock>;
@@ -389,6 +485,7 @@ export class MarketDataReadiness {
     private readonly gapSamplesByKey = new Map<string, GapEvidenceSample[]>();
 
     private readonly dataConfidenceByTopic = new Map<string, DataConfidence>();
+    private readonly timebaseByKeyBlock = new Map<string, TimebaseBlockState>();
 
     private readonly exchangeLagSamples: Array<{ ts: number; lagMs: number }> = [];
     private exchangeLagEwma?: number;
@@ -399,6 +496,9 @@ export class MarketDataReadiness {
     private lastProcessingLagIngestTs?: number;
 
     private readonly reasonSince = new Map<Reason, number>();
+    private readonly reasonLastSeen = new Map<Reason, number>();
+    private readonly activeReasons = new Set<Reason>();
+    private readonly expectedSourcesMissingLatchedByKey = new Set<string>();
     private readonly warningSince = new Map<WarningReason, number>();
     private readonly minuteRollupByKey = new Map<string, MinuteRollupState>();
 
@@ -412,6 +512,8 @@ export class MarketDataReadiness {
     private lastGapTelemetry?: GapTelemetry;
     private lastPriceStaleTelemetry?: PriceStaleTelemetry;
     private lastRefPriceTelemetry?: RefPriceTelemetry;
+    private lastSourceCoverage?: SourceCoverageSnapshot;
+    private lastTimebase?: TimebaseIntegritySnapshot;
     private lastSnapshot?: SourceRegistrySnapshot;
     private lastLogTs?: number;
     private lastLogSignature?: string;
@@ -424,6 +526,7 @@ export class MarketDataReadiness {
     private wsLastDisconnectTs?: number;
     private wsRecoveryStartTs?: number;
     private startedAtTs?: number;
+    private connectorGapDetected = false;
 
     constructor(bus: EventBus = defaultEventBus, options: MarketDataReadinessOptions = {}) {
         this.bus = bus;
@@ -449,10 +552,42 @@ export class MarketDataReadiness {
             0,
             options.readinessStabilityWindowMs ?? (isTestEnv ? 0 : DEFAULT_STABILITY_WINDOW_MS)
         );
+        const legacyWindowMs = options.readinessStabilityWindowMs;
+        this.hardFastReasonEnterWindowMs = Math.max(
+            0,
+            options.hardFastReasonEnterWindowMs ??
+                legacyWindowMs ??
+                (isTestEnv ? 0 : DEFAULT_HARD_FAST_ENTER_MS)
+        );
+        this.hardReasonEnterWindowMs = Math.max(
+            0,
+            options.hardReasonEnterWindowMs ??
+                legacyWindowMs ??
+                (isTestEnv ? 0 : DEFAULT_HARD_ENTER_MS)
+        );
+        this.hardReasonExitWindowMs = Math.max(
+            0,
+            options.hardReasonExitWindowMs ??
+                legacyWindowMs ??
+                (isTestEnv ? 0 : DEFAULT_HARD_EXIT_MS)
+        );
+        this.softReasonEnterWindowMs = Math.max(
+            0,
+            options.softReasonEnterWindowMs ??
+                legacyWindowMs ??
+                (isTestEnv ? 0 : DEFAULT_SOFT_ENTER_MS)
+        );
+        this.softReasonExitWindowMs = Math.max(
+            0,
+            options.softReasonExitWindowMs ??
+                legacyWindowMs ??
+                (isTestEnv ? 0 : DEFAULT_SOFT_EXIT_MS)
+        );
         this.lagWindowMs = Math.max(1_000, options.lagWindowMs ?? DEFAULT_LAG_WINDOW_MS);
         this.lagThresholdMs = Math.max(0, options.lagThresholdMs ?? DEFAULT_LAG_THRESHOLD_MS);
         this.lagEwmaAlpha = Math.min(1, Math.max(0.01, options.lagEwmaAlpha ?? DEFAULT_LAG_EWMA_ALPHA));
         this.timebasePenaltyWindowMs = Math.max(0, options.timebasePenaltyWindowMs ?? DEFAULT_TIMEBASE_PENALTY_WINDOW_MS);
+        this.timebaseWindowMs = Math.max(this.bucketMs, DEFAULT_TIMEBASE_WINDOW_MS);
         this.thresholds = {
             criticalBlock: Math.max(0, options.thresholds?.criticalBlock ?? CRITICAL_BLOCK_THRESHOLD),
             overall: Math.max(0, options.thresholds?.overall ?? OVERALL_THRESHOLD),
@@ -570,7 +705,9 @@ export class MarketDataReadiness {
             marketType,
             this.lastGapTelemetry,
             this.lastPriceStaleTelemetry,
-            this.lastRefPriceTelemetry
+            this.lastRefPriceTelemetry,
+            this.lastSourceCoverage,
+            this.lastTimebase
         );
     }
 
@@ -685,6 +822,11 @@ export class MarketDataReadiness {
     }
 
     private onWsDisconnected(evt: MarketDisconnected): void {
+        if (typeof evt.reason === 'string' && evt.reason.startsWith('resync:')) {
+            // Connector-confirmed continuity failure marker used for GAPS_DETECTED.
+            this.connectorGapDetected = true;
+            return;
+        }
         this.wsDegraded = true;
         this.wsLastDisconnectTs = evt.meta.tsEvent;
         this.wsRecoveryStartTs = undefined;
@@ -771,6 +913,7 @@ export class MarketDataReadiness {
         const normalizedMarketType = normalizeMarketType((evt as { marketType?: MarketType }).marketType);
         if (!this.shouldTrackMarketType(normalizedMarketType)) return;
         const normalizedSymbol = normalizeSymbol(evt.symbol);
+        this.recordTimebaseSample(block, normalizedSymbol, normalizedMarketType, evt.meta.tsEvent, evt.meta.tsIngest);
         this.registerExpectedSources(block, normalizedSymbol, normalizedMarketType);
         this.registry.markAggEmitted(
             { symbol: normalizedSymbol, marketType: normalizedMarketType, metric: block },
@@ -801,27 +944,33 @@ export class MarketDataReadiness {
         if (this.startedAtTs === undefined) {
             this.startedAtTs = bucketTs;
         }
-        const payload = this.buildStatus(bucketTs);
-        this.lastStatus = payload;
+        const internalPayload = this.buildStatus(bucketTs);
+        const { rawDegradedReasons, rawWarnings, ...payload } = internalPayload;
+        const statusPayload: MarketDataStatusPayload = payload;
+        this.lastStatus = statusPayload;
         const symbol = this.lastSymbol ?? 'UNKNOWN';
         const marketType = this.lastMarketType ?? 'unknown';
-        const minuteRollup = this.updateMinuteRollup(symbol, marketType, payload);
+        const minuteRollup = this.updateMinuteRollup(symbol, marketType, statusPayload, rawDegradedReasons, rawWarnings);
         this.lastHealthSnapshot = buildMarketReadinessSnapshot(
-            payload,
+            statusPayload,
             symbol,
             marketType,
             this.lastGapTelemetry,
             this.lastPriceStaleTelemetry,
             this.lastRefPriceTelemetry,
+            this.lastSourceCoverage,
+            this.lastTimebase,
             minuteRollup
         );
-        this.bus.publish('system:market_data_status', payload);
-        this.maybeLog(payload);
+        this.bus.publish('system:market_data_status', statusPayload);
+        this.maybeLog(statusPayload);
         this.resetFlags();
     }
 
-    private buildStatus(bucketTs: number): MarketDataStatusPayload {
+    private buildStatus(bucketTs: number): InternalStatusPayload {
         const snapshot = this.buildSnapshot(bucketTs);
+        this.lastSourceCoverage = this.buildSourceCoverage(snapshot);
+        this.lastTimebase = this.buildTimebaseSnapshot(snapshot, bucketTs);
         const blockConfidence = this.computeBlockConfidence(bucketTs, snapshot);
         const overallConfidence = this.computeOverallConfidence(blockConfidence);
         const derivedSources = this.deriveExpectedSources(snapshot);
@@ -841,6 +990,8 @@ export class MarketDataReadiness {
         const {
             degradedReasons,
             warnings,
+            rawDegradedReasons,
+            rawWarnings,
             gapTelemetry,
             priceStaleTelemetry,
             refPriceTelemetry,
@@ -874,6 +1025,8 @@ export class MarketDataReadiness {
             degraded,
             degradedReasons,
             warnings,
+            rawDegradedReasons,
+            rawWarnings,
             exchangeLagP95Ms,
             exchangeLagEwmaMs,
             processingLagP95Ms,
@@ -963,6 +1116,8 @@ export class MarketDataReadiness {
     ): {
         degradedReasons: Reason[];
         warnings: WarningReason[];
+        rawDegradedReasons: Reason[];
+        rawWarnings: WarningReason[];
         gapTelemetry?: GapTelemetry;
         priceStaleTelemetry?: PriceStaleTelemetry;
         refPriceTelemetry?: RefPriceTelemetry;
@@ -983,8 +1138,15 @@ export class MarketDataReadiness {
         const expectedDerivatives = !this.expectedBlockEmpty(snapshot, 'derivatives');
 
         const priceEvt = this.lastByBlock.get('price');
+        const priceStaleTelemetryNow = this.buildPriceStaleTelemetry(priceEvt, bucketTs);
         const priceBucketMatch = priceEvt ? this.bucketEndTs(priceEvt.meta.tsEvent) === bucketTs : false;
-        if (!priceEvt || !priceBucketMatch) {
+        const priceAgeMs = priceStaleTelemetryNow.ageMs;
+        const priceStaleMs = priceStaleTelemetryNow.staleMs ?? this.bucketMs;
+        const priceIsStale = !priceEvt || priceAgeMs === undefined || priceAgeMs >= priceStaleMs;
+        if (priceEvt && !priceBucketMatch) {
+            warnings.add('PRICE_BUCKET_MISMATCH');
+        }
+        if (priceIsStale) {
             if (!withinStartupGrace && this.isCriticalBlock('price')) {
                 reasons.add('PRICE_STALE');
             }
@@ -1012,7 +1174,7 @@ export class MarketDataReadiness {
             }
         }
 
-        if (missingConfig && activeSourcesAgg > 0) {
+        if (this.isExpectedSourcesMissingConfigActive(snapshot, missingConfig, activeSourcesAgg)) {
             reasons.add('EXPECTED_SOURCES_MISSING_CONFIG');
         }
 
@@ -1065,13 +1227,19 @@ export class MarketDataReadiness {
         ) {
             reasons.add('LAG_TOO_HIGH');
         }
-        const hasGap = Array.from(this.gapByBlock.values()).some(Boolean);
+        const hasJournalGap = Array.from(this.gapByBlock.values()).some(Boolean);
+        const hasConnectorGap = this.connectorGapDetected;
         let gapTelemetry: GapTelemetry | undefined;
-        if (hasGap) {
-            reasons.add('GAPS_DETECTED');
+        if (hasJournalGap || hasConnectorGap) {
+            // Journal/ordering gaps are observability-only in Phase 0.
+            // HARD degradation is allowed only for connector-confirmed resync continuity failures.
+            if (hasConnectorGap) {
+                reasons.add('GAPS_DETECTED');
+            }
             gapTelemetry = this.buildGapTelemetry(snapshot, bucketTs);
             const markers = gapTelemetry.markersCountBySource;
             const hasMarker =
+                hasConnectorGap ||
                 markers.onGap > 0 ||
                 markers.onSequenceGap > 0 ||
                 markers.detectTickerQuality > 0 ||
@@ -1079,21 +1247,35 @@ export class MarketDataReadiness {
                 markers.detectOiQuality > 0 ||
                 markers.detectFundingQuality > 0;
             const gapOver = gapTelemetry.inputGapStats.overThresholdCount ?? 0;
-            if (!hasMarker && gapOver <= 0) {
+            if (!hasConnectorGap && !hasMarker && gapOver <= 0) {
                 warnings.add('GAP_ATTRIBUTION_MISSING');
             }
             this.maybeLogGapTelemetry(snapshot, bucketTs);
         }
 
         const hasMismatch = Array.from(this.mismatchByBlock.values()).some(Boolean);
-        const priceValid = priceBucketMatch && this.confidenceValue(priceEvt?.confidenceScore) >= this.thresholds.criticalBlock;
+        const refPriceTelemetryNow = this.buildRefPriceTelemetry(snapshot, priceEvt, bucketTs, priceBucketMatch);
+        const hasPriceEvent = refPriceTelemetryNow.hasPriceEvent;
+        const refAgeMs = refPriceTelemetryNow.ageMs;
+        const refStaleMs = refPriceTelemetryNow.staleMs ?? this.bucketMs;
+        const refFresh = hasPriceEvent && refAgeMs !== undefined && refAgeMs < refStaleMs;
+        const refConfidence = refPriceTelemetryNow.priceConfidence ?? 0;
+        const refThreshold = refPriceTelemetryNow.criticalThreshold ?? this.thresholds.criticalBlock;
+        const refConfidenceOk = refConfidence >= refThreshold;
+        const usedSources = refPriceTelemetryNow.sourcesUsed?.length ?? refPriceTelemetryNow.sourceCounts?.used ?? 0;
+        const hasSources = usedSources > 0;
+        const suppressionReasons = refPriceTelemetryNow.suppressionReasons
+            ? Object.keys(refPriceTelemetryNow.suppressionReasons).length
+            : 0;
+        const allCandidateSourcesSuppressed = usedSources === 0 && suppressionReasons > 0;
+        const validRefPrice = hasPriceEvent && refFresh && refConfidenceOk && hasSources && !allCandidateSourcesSuppressed;
         if (hasMismatch) {
-            if (priceValid) reasons.add('MISMATCH_DETECTED');
-            else {
-                reasons.add('NO_REF_PRICE');
-                if (this.readinessDebug) {
-                    this.logNoRefPriceDebug(bucketTs, snapshot, priceEvt, priceBucketMatch);
-                }
+            reasons.add('MISMATCH_DETECTED');
+        }
+        if (!validRefPrice && !withinStartupGrace) {
+            reasons.add('NO_VALID_REF_PRICE');
+            if (this.readinessDebug) {
+                this.logNoRefPriceDebug(bucketTs, snapshot, priceEvt, priceBucketMatch);
             }
         }
 
@@ -1106,18 +1288,25 @@ export class MarketDataReadiness {
         );
         if (timebaseWarnActive) warnings.add('TIMEBASE_QUALITY_WARN');
 
+        const rawDegradedReasons = this.orderReasons(reasons);
+        const rawWarnings = this.orderWarnings(warnings);
         const stableReasons = this.stabilizeReasons(reasons, bucketTs);
         const stableWarnings = this.stabilizeWarnings(warnings, bucketTs);
+        if (!gapTelemetry && stableReasons.has('GAPS_DETECTED')) {
+            gapTelemetry = this.lastGapTelemetry;
+        }
         const priceStaleTelemetry = stableReasons.has('PRICE_STALE')
-            ? this.buildPriceStaleTelemetry(priceEvt, bucketTs)
+            ? priceStaleTelemetryNow ?? this.lastPriceStaleTelemetry
             : undefined;
-        const refPriceTelemetry = stableReasons.has('NO_REF_PRICE')
-            ? this.buildRefPriceTelemetry(snapshot, priceEvt, bucketTs, priceBucketMatch)
+        const refPriceTelemetry = stableReasons.has('NO_VALID_REF_PRICE')
+            ? refPriceTelemetryNow ?? this.lastRefPriceTelemetry
             : undefined;
 
         return {
             degradedReasons: this.orderReasons(stableReasons),
             warnings: this.orderWarnings(stableWarnings),
+            rawDegradedReasons,
+            rawWarnings,
             gapTelemetry,
             priceStaleTelemetry,
             refPriceTelemetry,
@@ -1144,6 +1333,29 @@ export class MarketDataReadiness {
         if (!this.targetMarketType) return true;
         return marketType === this.targetMarketType;
     }
+
+    private isExpectedSourcesMissingConfigActive(
+        snapshot: SourceRegistrySnapshot,
+        missingConfig: boolean,
+        activeSourcesAgg: number
+    ): boolean {
+        // SourceRegistry.snapshot already returns normalized symbol/marketType, so this key is stable.
+        const key = `${snapshot.symbol}:${snapshot.marketType}`;
+        const observedNow = missingConfig && activeSourcesAgg > 0;
+
+        if (observedNow) {
+            this.expectedSourcesMissingLatchedByKey.add(key);
+            return true;
+        }
+
+        if (!missingConfig) {
+            this.expectedSourcesMissingLatchedByKey.delete(key);
+            return false;
+        }
+
+        return this.expectedSourcesMissingLatchedByKey.has(key);
+    }
+
     private maybeLogMissingExpectedConfig(snapshot: SourceRegistrySnapshot, missingConfig: boolean): void {
         if (!missingConfig) return;
         const key = `${snapshot.symbol}:${snapshot.marketType}`;
@@ -1202,6 +1414,140 @@ export class MarketDataReadiness {
         };
     }
 
+    private buildSourceCoverage(snapshot: SourceRegistrySnapshot): SourceCoverageSnapshot {
+        const expected = {} as Record<ReadinessBlock, string[]>;
+        const active = {} as Record<ReadinessBlock, string[]>;
+        const missing = {} as Record<ReadinessBlock, string[]>;
+        const unexpected = {} as Record<ReadinessBlock, string[]>;
+        const coverageRatio = {} as Record<ReadinessBlock, number>;
+        const expectedTotal = {} as Record<ReadinessBlock, number>;
+        const activeTotal = {} as Record<ReadinessBlock, number>;
+        const unexpectedTotal = {} as Record<ReadinessBlock, number>;
+
+        for (const block of SOURCE_COVERAGE_BLOCKS) {
+            const expectedSources = this.sortedUniqueSources(snapshot.expected[block]);
+            const activeSources = this.sortedUniqueSources(snapshot.usedAgg[block]);
+            const activeSet = new Set(activeSources);
+            const expectedSet = new Set(expectedSources);
+            const missingSources = expectedSources.filter((source) => !activeSet.has(source));
+            const unexpectedSources = activeSources.filter((source) => !expectedSet.has(source));
+            const covered = expectedSources.length - missingSources.length;
+            const expectedCount = expectedSources.length;
+            const activeCount = activeSources.length;
+
+            expected[block] = expectedSources;
+            active[block] = activeSources;
+            missing[block] = missingSources;
+            unexpected[block] = unexpectedSources;
+            expectedTotal[block] = expectedCount;
+            activeTotal[block] = activeCount;
+            unexpectedTotal[block] = unexpectedSources.length;
+            coverageRatio[block] = expectedCount === 0 ? 1 : covered / expectedCount;
+        }
+
+        return {
+            expected,
+            active,
+            missing,
+            unexpected,
+            coverageRatio,
+            expectedTotal,
+            activeTotal,
+            unexpectedTotal,
+        };
+    }
+
+    private timebaseKey(block: ReadinessBlock, symbol: string, marketType: MarketType): string {
+        return `${symbol}:${marketType}:${block}`;
+    }
+
+    private pruneTimebaseState(state: TimebaseBlockState, nowTs: number): void {
+        const cutoff = nowTs - this.timebaseWindowMs;
+        state.samples = state.samples.filter((sample) => sample.ts >= cutoff);
+        state.nonMonotonicTs = state.nonMonotonicTs.filter((ts) => ts >= cutoff);
+
+        if (state.samples.length > TIMEBASE_SAMPLE_LIMIT) {
+            state.samples.sort((a, b) => a.ts - b.ts);
+            state.samples = state.samples.slice(-TIMEBASE_SAMPLE_LIMIT);
+        }
+        if (state.nonMonotonicTs.length > TIMEBASE_SAMPLE_LIMIT) {
+            state.nonMonotonicTs.sort((a, b) => a - b);
+            state.nonMonotonicTs = state.nonMonotonicTs.slice(-TIMEBASE_SAMPLE_LIMIT);
+        }
+    }
+
+    private recordTimebaseSample(
+        block: ReadinessBlock,
+        symbol: string,
+        marketType: MarketType,
+        tsEvent: number,
+        tsIngest?: number
+    ): void {
+        if (!Number.isFinite(tsEvent)) return;
+        const key = this.timebaseKey(block, symbol, marketType);
+        const state = this.timebaseByKeyBlock.get(key) ?? { samples: [], nonMonotonicTs: [] };
+        const referenceTs = typeof tsIngest === 'number' && Number.isFinite(tsIngest) ? tsIngest : tsEvent;
+
+        if (state.lastEventTs !== undefined && tsEvent < state.lastEventTs) {
+            state.nonMonotonicTs.push(referenceTs);
+        }
+        state.lastEventTs = state.lastEventTs === undefined ? tsEvent : Math.max(state.lastEventTs, tsEvent);
+
+        if (typeof tsIngest === 'number' && Number.isFinite(tsIngest)) {
+            const ageMs = Math.max(0, tsIngest - tsEvent);
+            const futureSkewMs = tsEvent > tsIngest + FUTURE_TOLERANCE_MS ? tsEvent - tsIngest : undefined;
+            state.samples.push({ ts: tsIngest, ageMs, futureSkewMs });
+        }
+
+        this.pruneTimebaseState(state, referenceTs);
+        this.timebaseByKeyBlock.set(key, state);
+    }
+
+    private buildTimebaseSnapshot(snapshot: SourceRegistrySnapshot, bucketTs: number): TimebaseIntegritySnapshot {
+        const nowTs = this.now();
+        const safeNowTs = Number.isFinite(nowTs) ? nowTs : bucketTs;
+        const byBlock = {} as Record<ReadinessBlock, TimebaseBlockIntegrity>;
+        const warnings = new Set<TimebaseWarningReason>();
+
+        for (const block of SOURCE_COVERAGE_BLOCKS) {
+            const key = this.timebaseKey(block, snapshot.symbol, snapshot.marketType);
+            const state = this.timebaseByKeyBlock.get(key);
+            if (state) {
+                this.pruneTimebaseState(state, safeNowTs);
+            }
+
+            const samples = state?.samples ?? [];
+            const ages = samples.map((sample) => sample.ageMs);
+            const futureSkews = samples
+                .map((sample) => sample.futureSkewMs)
+                .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+            const nonMonotonicCount = state?.nonMonotonicTs.length ?? 0;
+            const ageMsP95 = ages.length ? percentile(ages, 0.95) : undefined;
+
+            if (futureSkews.length > 0) warnings.add('TIMEBASE_FUTURE_EVENT');
+            if (nonMonotonicCount > 0) warnings.add('TIMEBASE_NON_MONOTONIC');
+            if (ageMsP95 !== undefined && ageMsP95 > AGE_WARN_P95_MS) warnings.add('TIMEBASE_AGE_TOO_HIGH');
+
+            byBlock[block] = {
+                samples: ages.length,
+                ageMsP50: ages.length ? percentile(ages, 0.5) : undefined,
+                ageMsP95,
+                ageMsMax: ages.length ? Math.max(...ages) : undefined,
+                futureEventCount: futureSkews.length,
+                futureEventMaxSkewMs: futureSkews.length ? Math.max(...futureSkews) : undefined,
+                nonMonotonicCount,
+                lastEventTs: state?.lastEventTs,
+            };
+        }
+
+        return {
+            nowTs: safeNowTs,
+            windowMs: this.timebaseWindowMs,
+            byBlock,
+            warnings: stableSortStrings(Array.from(warnings)) as TimebaseWarningReason[],
+        };
+    }
+
     private countSources(record: Record<string, string[]>): number {
         return this.unionSources(record).length;
     }
@@ -1214,6 +1560,14 @@ export class MarketDataReadiness {
             }
         }
         return Array.from(union);
+    }
+
+    private sortedUniqueSources(sources: string[] | undefined): string[] {
+        if (!sources || !sources.length) return [];
+        const normalized = sources
+            .map((source) => source.trim())
+            .filter((source) => source.length > 0);
+        return stableSortStrings(Array.from(new Set(normalized)));
     }
 
     private maxLastRawTs(record: Record<string, number | null>): number | null {
@@ -1234,27 +1588,79 @@ export class MarketDataReadiness {
     }
 
     private stabilizeReasons(reasons: Set<Reason>, ts: number): Set<Reason> {
-        if (this.readinessStabilityWindowMs === 0) return reasons;
         const stable = new Set<Reason>();
-        const exempt = new Set<Reason>(['EXPECTED_SOURCES_MISSING_CONFIG']);
-        for (const reason of reasons) {
-            if (exempt.has(reason)) {
+        for (const reason of MARKET_DATA_DEGRADED_REASON_ORDER) {
+            const present = reasons.has(reason);
+            const windows = this.reasonWindows(reason);
+            if (present) {
+                const since = this.reasonSince.get(reason);
+                if (since === undefined) {
+                    this.reasonSince.set(reason, ts);
+                }
+                this.reasonLastSeen.set(reason, ts);
+
+                if (this.activeReasons.has(reason)) {
+                    stable.add(reason);
+                    continue;
+                }
+
+                const firstSeen = this.reasonSince.get(reason) ?? ts;
+                if (ts - firstSeen >= windows.enterMs) {
+                    this.activeReasons.add(reason);
+                    stable.add(reason);
+                }
+                continue;
+            }
+
+            if (!this.activeReasons.has(reason)) {
+                this.reasonSince.delete(reason);
+                this.reasonLastSeen.delete(reason);
+                continue;
+            }
+
+            const lastSeen = this.reasonLastSeen.get(reason);
+            if (lastSeen !== undefined && ts - lastSeen < windows.exitMs) {
                 stable.add(reason);
                 continue;
             }
-            const since = this.reasonSince.get(reason);
-            if (since === undefined) {
-                this.reasonSince.set(reason, ts);
-                continue;
-            }
-            if (ts - since >= this.readinessStabilityWindowMs) {
-                stable.add(reason);
-            }
-        }
-        for (const reason of Array.from(this.reasonSince.keys())) {
-            if (!reasons.has(reason)) this.reasonSince.delete(reason);
+
+            this.activeReasons.delete(reason);
+            this.reasonSince.delete(reason);
+            this.reasonLastSeen.delete(reason);
         }
         return stable;
+    }
+
+    private reasonSeverity(reason: Reason): ReasonSeverity {
+        if (HARD_FAST_REASON_SET.has(reason) || HARD_SUSTAINED_REASON_SET.has(reason)) return 'HARD';
+        return 'SOFT';
+    }
+
+    private reasonWindows(reason: Reason): { enterMs: number; exitMs: number } {
+        if (this.reasonSeverity(reason) === 'SOFT') {
+            return {
+                enterMs: this.softReasonEnterWindowMs,
+                exitMs: this.softReasonExitWindowMs,
+            };
+        }
+        if (HARD_FAST_REASON_SET.has(reason)) {
+            if (reason === 'EXPECTED_SOURCES_MISSING_CONFIG') {
+                // Time-based exit is intentionally disabled here: latch + config validation
+                // (isExpectedSourcesMissingConfigActive) is the only clear path.
+                return {
+                    enterMs: this.hardFastReasonEnterWindowMs,
+                    exitMs: 0,
+                };
+            }
+            return {
+                enterMs: this.hardFastReasonEnterWindowMs,
+                exitMs: this.hardReasonExitWindowMs,
+            };
+        }
+        return {
+            enterMs: this.hardReasonEnterWindowMs,
+            exitMs: this.hardReasonExitWindowMs,
+        };
     }
 
     private stabilizeWarnings(warnings: Set<WarningReason>, ts: number): Set<WarningReason> {
@@ -1487,6 +1893,7 @@ export class MarketDataReadiness {
 
     private reasonToBlock(reason: Reason): ReadinessBlock | undefined {
         if (reason.startsWith('PRICE')) return 'price';
+        if (reason === 'NO_VALID_REF_PRICE') return 'price';
         if (reason.startsWith('FLOW')) return 'flow';
         if (reason.startsWith('LIQUIDITY')) return 'liquidity';
         if (reason.startsWith('DERIVATIVES')) return 'derivatives';
@@ -1541,6 +1948,7 @@ export class MarketDataReadiness {
     private resetFlags(): void {
         this.gapByBlock.clear();
         this.mismatchByBlock.clear();
+        this.connectorGapDetected = false;
     }
 
     private recordExchangeLagSample(tsEvent: number, tsIngest?: number): void {
@@ -1616,7 +2024,7 @@ export class MarketDataReadiness {
     }
 
     private bucketEndTs(ts: number): number {
-        return bucketCloseTs(ts, this.bucketMs);
+        return bucketLabelTsForReadiness(ts, this.bucketMs);
     }
 
     private confidenceValue(value?: number): number {
@@ -1861,7 +2269,8 @@ export class MarketDataReadiness {
         const priceTsEvent = priceEvt?.meta.tsEvent;
         const priceBucketTs = priceTsEvent !== undefined ? this.bucketEndTs(priceTsEvent) : undefined;
         const bucketDeltaMs = priceBucketTs !== undefined ? bucketTs - priceBucketTs : undefined;
-        const ageMs = priceTsEvent !== undefined ? Math.max(0, bucketTs - priceTsEvent) : undefined;
+        // Age is measured as elapsed time beyond the event's own bucket close.
+        const ageMs = priceTsEvent !== undefined ? Math.max(0, bucketTs - priceTsEvent - this.bucketMs) : undefined;
         return {
             bucketTs,
             priceTsEvent,
@@ -1887,7 +2296,8 @@ export class MarketDataReadiness {
         const priceTsEvent = priceEvt?.meta.tsEvent;
         const priceBucketTs = priceTsEvent !== undefined ? this.bucketEndTs(priceTsEvent) : undefined;
         const bucketDeltaMs = priceBucketTs !== undefined ? bucketTs - priceBucketTs : undefined;
-        const ageMs = priceTsEvent !== undefined ? Math.max(0, bucketTs - priceTsEvent) : undefined;
+        // Keep ref-price freshness aligned with PRICE_STALE age semantics.
+        const ageMs = priceTsEvent !== undefined ? Math.max(0, bucketTs - priceTsEvent - this.bucketMs) : undefined;
         const mismatchBlocks = Array.from(this.mismatchByBlock.entries())
             .filter(([, value]) => value)
             .map(([block]) => block)
@@ -2072,17 +2482,20 @@ export class MarketDataReadiness {
     private updateMinuteRollup(
         symbol: string,
         marketType: MarketType,
-        payload: MarketDataStatusPayload
+        payload: MarketDataStatusPayload,
+        rawDegradedReasons: readonly string[],
+        rawWarnings: readonly string[]
     ): MinuteRollupSnapshot {
         const minuteTs = Math.floor(payload.lastBucketTs / 60_000) * 60_000;
         const key = `${symbol}:${marketType}`;
-        const reasons = normalizeDegradedReasons(payload.degradedReasons);
-        const warnings = normalizeWarningReasons(payload.warnings ?? []);
+        const reasons = normalizeDegradedReasons(rawDegradedReasons);
+        const warnings = normalizeWarningReasons(rawWarnings);
+        const rawDegraded = reasons.length > 0;
         const instantStatus: MarketReadinessStatus = reasons.includes('NO_DATA')
             ? 'NO_DATA'
             : payload.warmingUp
               ? 'WARMING'
-              : payload.degraded
+              : rawDegraded
                 ? 'DEGRADED'
                 : 'READY';
 
@@ -2150,11 +2563,17 @@ function orderWarningReasons(warnings: Iterable<MarketDataWarningReason>): Marke
 function normalizeDegradedReasons(reasons: readonly string[]): MarketDataDegradedReason[] {
     const known = new Set<MarketDataDegradedReason>();
     for (const reason of reasons) {
-        if (isDegradedReason(reason)) {
-            known.add(reason);
-        }
+        const normalized = normalizeDegradedReason(reason);
+        if (normalized !== undefined) known.add(normalized);
     }
     return orderDegradedReasons(known);
+}
+
+function normalizeDegradedReason(reason: string): MarketDataDegradedReason | undefined {
+    // Legacy alias is accepted only as input and normalized before any emitted output.
+    if (reason === 'NO_REF_PRICE') return 'NO_VALID_REF_PRICE';
+    if (isDegradedReason(reason)) return reason;
+    return undefined;
 }
 
 function normalizeWarningReasons(warnings: readonly string[]): MarketDataWarningReason[] {

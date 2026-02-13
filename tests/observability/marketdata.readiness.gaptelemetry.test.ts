@@ -53,7 +53,7 @@ describe('MarketDataReadiness gap telemetry', () => {
 
     const snapshot = readiness.getHealthSnapshot();
     expect(snapshot).toBeTruthy();
-    expect(snapshot?.degradedReasons).toContain('GAPS_DETECTED');
+    expect(snapshot?.degradedReasons).not.toContain('GAPS_DETECTED');
     expect(snapshot?.gapTelemetry?.markersCountBySource.onGap).toBeGreaterThan(0);
     expect(snapshot?.gapTelemetry?.markersCountBySource.detectOrderbookQuality).toBeGreaterThan(0);
     expect(snapshot?.gapTelemetry?.markersTop.some((entry) => entry.marker === 'detectOrderbookQuality')).toBe(true);
@@ -107,7 +107,7 @@ describe('MarketDataReadiness gap telemetry', () => {
     bus.publish('market:cvd_futures_agg', flow);
 
     const snapshot = readiness.getHealthSnapshot();
-    expect(snapshot?.degradedReasons).toContain('GAPS_DETECTED');
+    expect(snapshot?.degradedReasons).not.toContain('GAPS_DETECTED');
     expect(snapshot?.warnings).toContain('GAP_ATTRIBUTION_MISSING');
     expect(snapshot?.gapTelemetry?.inputGapStats.samples).toBe(0);
 
